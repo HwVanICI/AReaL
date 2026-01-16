@@ -437,7 +437,7 @@ class MegatronEngine(TrainEngine):
             rollout_engine=engine, train_engine=self
         )
 
-        if meta.type == "xccl" and not self.weight_update_group_initialized:
+        if meta.type in ("xccl", "gloo") and not self.weight_update_group_initialized:
             self._init_weight_update_from_distributed(meta)
             self.weight_update_group_initialized = True
 
@@ -480,7 +480,7 @@ class MegatronEngine(TrainEngine):
 
     def update_weights(self, meta: WeightUpdateMeta):
         self._check_rollout_engine_connected()
-        if meta.type == "xccl":
+        if meta.type in ("xccl", "gloo"):
             assert self.weight_update_group_initialized
             # In offload mode, wakes up parameters as needed to perform the update.
             tms_context = (
@@ -995,12 +995,22 @@ class MegatronEngine(TrainEngine):
         fut = self.rollout_engine.update_weights_from_distributed(meta, param_specs)
 
         handles = []
+        use_gloo = meta.type == "gloo"
         for _, param in converted_named_tensors:
-            handles.append(
-                dist.broadcast(
-                    param.data, 0, group=self.weight_update_group, async_op=True
+            tensor = param.data
+            if use_gloo and tensor.device.type != "cpu":
+                cpu_tensor = tensor.detach().to("cpu")
+                handles.append(
+                    dist.broadcast(
+                        cpu_tensor, 0, group=self.weight_update_group, async_op=True
+                    )
                 )
-            )
+            else:
+                handles.append(
+                    dist.broadcast(
+                        tensor, 0, group=self.weight_update_group, async_op=True
+                    )
+                )
         for handle in handles:
             handle.wait()
 
@@ -1167,7 +1177,7 @@ class MegatronEngine(TrainEngine):
         return buffer_size
 
     def _init_weight_update_from_distributed(self, meta: WeightUpdateMeta) -> None:
-        assert meta.type == "xccl"
+        assert meta.type in ("xccl", "gloo")
         # Reset weight weight meta with local info
         meta.nccl_master_address = self.weight_update_master_addr = gethostip()
         meta.nccl_master_port = self.weight_update_master_port = find_free_ports(1)[0]
@@ -1186,8 +1196,13 @@ class MegatronEngine(TrainEngine):
                 f"init_method=tcp://{meta.nccl_master_address}:{meta.nccl_master_port} "
                 f"group={self.weight_update_group_name}"
             )
+            backend = (
+                "gloo"
+                if meta.type == "gloo"
+                else current_platform.communication_backend
+            )
             self.weight_update_group = init_custom_process_group(
-                backend=current_platform.communication_backend,
+                backend=backend,
                 world_size=meta.alloc_mode.gen.world_size + 1,
                 init_method=f"tcp://{meta.nccl_master_address}:{meta.nccl_master_port}",
                 rank=0,

@@ -170,7 +170,11 @@ class SGLangBackend:
             "master_port": str(meta.nccl_master_port),
             "rank_offset": rank_offset,
             "world_size": meta.alloc_mode.gen.world_size + 1,
-            "backend": current_platform.communication_backend,
+            "backend": (
+                "gloo"
+                if meta.type == "gloo"
+                else current_platform.communication_backend
+            ),
             "group_name": meta.nccl_group_name,
         }
         return HttpRequest(endpoint="/init_weights_update_group", payload=payload)

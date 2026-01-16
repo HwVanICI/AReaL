@@ -90,7 +90,13 @@ def get_model_update_meta(config: BaseExperimentConfig) -> WeightUpdateMeta:
         return WeightUpdateMeta.from_disk(
             config.experiment_name, config.trial_name, config.cluster.fileroot
         )
-    else:
+    elif weight_update_mode == "xccl":
         return WeightUpdateMeta.from_fsdp_xccl(
             AllocationMode.from_str(config.allocation_mode)
         )
+    elif weight_update_mode == "gloo":
+        return WeightUpdateMeta.from_fsdp_gloo(
+            AllocationMode.from_str(config.allocation_mode)
+        )
+    else:
+        raise ValueError(f"Unknown weight update mode: {weight_update_mode}")

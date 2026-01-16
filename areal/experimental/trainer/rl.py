@@ -152,12 +152,17 @@ class PPOTrainer:
                     }
                 )
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
-        elif self.config.actor.weight_update_mode == "xccl":
-            # NCCL/XCCL weight update
+        elif self.config.actor.weight_update_mode in ("xccl", "gloo"):
+            # Distributed weight update
             if self.allocation_mode.train_backend == "megatron":
-                self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(
-                    self.allocation_mode
-                )
+                if self.config.actor.weight_update_mode == "gloo":
+                    self.weight_update_meta = WeightUpdateMeta.from_megatron_gloo(
+                        self.allocation_mode
+                    )
+                else:
+                    self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(
+                        self.allocation_mode
+                    )
             else:
                 xccl_kwargs = {"allocation_mode": self.allocation_mode}
                 if config.actor.use_lora:
@@ -168,7 +173,14 @@ class PPOTrainer:
                             "base_model_name": config.actor.path,
                         }
                     )
-                self.weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(**xccl_kwargs)
+                if self.config.actor.weight_update_mode == "gloo":
+                    self.weight_update_meta = WeightUpdateMeta.from_fsdp_gloo(
+                        **xccl_kwargs
+                    )
+                else:
+                    self.weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(
+                        **xccl_kwargs
+                    )
         else:
             raise ValueError(
                 f"Invalid weight update mode: {self.config.actor.weight_update_mode}"

@@ -830,7 +830,7 @@ class RemoteInfEngine(InferenceEngine):
         Future[None]
             A future object representing the asynchronous initialization operation
         """
-        assert meta.type == "xccl"
+        assert meta.type in ("xccl", "gloo")
 
         fut = get_executor().submit(
             _init_weights_update_group_remote,
@@ -842,9 +842,14 @@ class RemoteInfEngine(InferenceEngine):
         )
 
         def callback(fut):
+            backend = (
+                "gloo"
+                if meta.type == "gloo"
+                else current_platform.communication_backend
+            )
             self.logger.info(
-                f"Initialized {current_platform.communication_backend.upper()} group "
-                f"for distributed weight update for {meta.nccl_group_name}."
+                f"Initialized {backend.upper()} group for distributed weight update "
+                f"for {meta.nccl_group_name}."
             )
 
         fut.add_done_callback(callback)
@@ -867,7 +872,7 @@ class RemoteInfEngine(InferenceEngine):
         Future[None]
             A future object representing the asynchronous weight update operation
         """
-        assert meta.type == "xccl"
+        assert meta.type in ("xccl", "gloo")
 
         fut = get_executor().submit(
             _update_weights_from_distributed,

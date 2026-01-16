@@ -121,7 +121,7 @@ class ParamSpec:
 
 @dataclass
 class WeightUpdateMeta:
-    type: Literal["disk", "nccl"]
+    type: Literal["disk", "xccl", "gloo"]
     path: str | None = None
     alloc_mode: AllocationMode | None = None
 
@@ -180,6 +180,18 @@ class WeightUpdateMeta:
         )
 
     @classmethod
+    def from_megatron_gloo(
+        cls,
+        allocation_mode: AllocationMode,
+        weight_chunked_mem_mb: int = 1024,
+    ):
+        return cls(
+            type="gloo",
+            alloc_mode=allocation_mode,
+            weight_chunked_mem_mb=weight_chunked_mem_mb,
+        )
+
+    @classmethod
     def from_fsdp_xccl(
         cls,
         allocation_mode: AllocationMode,
@@ -191,6 +203,26 @@ class WeightUpdateMeta:
     ):
         return cls(
             type="xccl",
+            alloc_mode=allocation_mode,
+            weight_chunked_mem_mb=weight_chunked_mem_mb,
+            use_lora=use_lora,
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            base_model_name=base_model_name,
+        )
+
+    @classmethod
+    def from_fsdp_gloo(
+        cls,
+        allocation_mode: AllocationMode,
+        weight_chunked_mem_mb: int = 1024,
+        use_lora: bool = False,
+        lora_name: str = "",
+        lora_int_id: int = 1,
+        base_model_name: str = "",
+    ):
+        return cls(
+            type="gloo",
             alloc_mode=allocation_mode,
             weight_chunked_mem_mb=weight_chunked_mem_mb,
             use_lora=use_lora,

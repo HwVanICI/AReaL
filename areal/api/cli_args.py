@@ -774,7 +774,10 @@ class TrainEngineConfig:
 
     weight_update_mode: str = field(
         default="xccl",
-        metadata={"help": "Weight update backend type.", "choices": ["disk", "xccl"]},
+        metadata={
+            "help": "Weight update backend type.",
+            "choices": ["disk", "xccl", "gloo"],
+        },
     )
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     archon: ArchonEngineConfig = field(default_factory=ArchonEngineConfig)

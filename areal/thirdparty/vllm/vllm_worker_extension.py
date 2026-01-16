@@ -128,19 +128,30 @@ class VLLMWorkerExtension:
                 f"Weight update group named `{self.areal_weight_meta_group_name}` not found"
             )
         try:
+            backend = dist.get_backend(group)
             for name, dtype, shape in zip(names, dtypes, shapes):
                 target_dtype = (
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
-                tensor = torch.empty(
-                    shape, dtype=target_dtype, device=self.model_runner.device
-                )
-                torch.distributed.broadcast(
-                    tensor,
-                    src=0,
-                    group=group,
-                    async_op=False,
-                )
+                if backend == "gloo":
+                    cpu_tensor = torch.empty(shape, dtype=target_dtype, device="cpu")
+                    torch.distributed.broadcast(
+                        cpu_tensor,
+                        src=0,
+                        group=group,
+                        async_op=False,
+                    )
+                    tensor = cpu_tensor.to(self.model_runner.device)
+                else:
+                    tensor = torch.empty(
+                        shape, dtype=target_dtype, device=self.model_runner.device
+                    )
+                    torch.distributed.broadcast(
+                        tensor,
+                        src=0,
+                        group=group,
+                        async_op=False,
+                    )
                 self.model_runner.model.load_weights(weights=[(name, tensor)])
             self.sync()
             return True, "Success"
@@ -169,6 +180,7 @@ class VLLMWorkerExtension:
         lora_int_id = self.areal_lora_int_id
 
         try:
+            backend = dist.get_backend(group)
             # Check if LoRA manager and adapter exist
             if self.model_runner.lora_manager is None:
                 raise RuntimeError("LoRA manager is not initialized")
@@ -196,16 +208,25 @@ class VLLMWorkerExtension:
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
 
-                tensor = torch.empty(
-                    shape, dtype=target_dtype, device=self.model_runner.device
-                )
-
-                torch.distributed.broadcast(
-                    tensor,
-                    src=0,
-                    group=group,
-                    async_op=False,
-                )
+                if backend == "gloo":
+                    cpu_tensor = torch.empty(shape, dtype=target_dtype, device="cpu")
+                    torch.distributed.broadcast(
+                        cpu_tensor,
+                        src=0,
+                        group=group,
+                        async_op=False,
+                    )
+                    tensor = cpu_tensor.to(self.model_runner.device)
+                else:
+                    tensor = torch.empty(
+                        shape, dtype=target_dtype, device=self.model_runner.device
+                    )
+                    torch.distributed.broadcast(
+                        tensor,
+                        src=0,
+                        group=group,
+                        async_op=False,
+                    )
 
                 received_weights[name] = tensor
 
