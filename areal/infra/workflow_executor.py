@@ -7,7 +7,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, TypeVar, Generic, Protocol
 from collections.abc import Generator
 from collections import deque
 import torch
@@ -250,7 +250,11 @@ class WithTaskID(Protocol):
     task_id: int
 
 
-class BatchTaskDispatcher[TInput: WithTaskID, TResult]:
+TInput = TypeVar("TInput", bound=WithTaskID)
+TResult = TypeVar("TResult")
+
+
+class BatchTaskDispatcher(Generic[TInput, TResult]):
     """Generic dispatcher for asynchronous task execution with staleness control.
 
     Manages background threads for task submission and result collection.
