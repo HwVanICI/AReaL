@@ -743,6 +743,16 @@ class SchedulingSpec:
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
     )
+    ray_placement_strategy: str = field(
+        default="shared",
+        metadata={
+            "help": "Which placement strategy to use for Ray scheduling. "
+            "Shared will produce 1 placement group for all workers in the role (training). "
+            "Separate will 1 placement group per worker (rollout). "
+            "Deferred (WIP) will do the same as separate but defers accelerator scheduling (multinode rollout). ",
+            "choices": ["shared", "separate", "deferred"],
+        },
+    )
 
 
 @dataclass
@@ -1967,7 +1977,7 @@ def to_structured_cfg(cfg, config_cls):
     return cfg
 
 
-def load_expr_config(argv: list[str], config_cls: type[ConfigT]) -> tuple[ConfigT, str]:
+def load_expr_config(argv: list[str], config_cls: type[ConfigT]) -> tuple[ConfigT, str]:  # noqa: UP047
     cfg, config_file = parse_cli_args(argv)
     cfg = to_structured_cfg(cfg, config_cls=config_cls)
     cfg = OmegaConf.to_object(cfg)
