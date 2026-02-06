@@ -352,6 +352,20 @@ def finish_request(self, req_state: "RequestState"):
         lora_stats.running_requests.remove(req_state.request_id)
 
 
+def patch_ascend_fused_moe_method():
+    from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+
+    orig = AscendUnquantizedFusedMoEMethod.process_weights_after_loading
+
+    def patched(self, layer):
+        #  layer is the module instance being processed
+        orig(self, layer)
+        layer.w13_weight.weight_loader = layer.weight_loader
+        layer.w2_weight.weight_loader = layer.weight_loader
+
+    AscendUnquantizedFusedMoEMethod.process_weights_after_loading = patched
+
+
 def hook():
     setattr(EngineCore, "abort_all_reqs", abort_all_reqs)
     setattr(EngineCore, "areal_injected_update_weight", areal_injected_update_weight)
@@ -381,6 +395,9 @@ def hook():
             "finish_request",
             finish_request,
         )
+
+    # Patch for process_weights_after_loading from AscendUnquantizedFusedMoEMethod to add weight_loader
+    patch_ascend_fused_moe_method()
 
 
 hook()

@@ -650,6 +650,25 @@ class MegatronEngineConfig:
     fp8_config: FP8EngineConfig | None = None
 
 
+@dataclass
+class MindSpeedEngineConfig:
+    """Additional config options for MindSpeed's Megatron adapter
+    Any Megatron-specific settings will be taken from the MegatronEngineConfig
+    Any MindSpeed-exclusive features will be supported here
+    Other MindSpeed parameters can be added below
+    """
+
+    # should always be true in mindspeed
+    use_flash_attn: bool = True
+    context_parallel_algo: str = "megatron_cp_algo"
+    sequence_parallel: bool = False
+    use_legacy_models: bool = False
+    gemm_gradient_accumulation_fusion: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
     colocation = "colocation"
@@ -743,6 +762,16 @@ class SchedulingSpec:
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
     )
+    ray_placement_strategy: str = field(
+        default="shared",
+        metadata={
+            "help": "Which placement strategy to use for Ray scheduling. "
+            "Shared will produce 1 placement group for all workers in the role (training). "
+            "Separate will 1 placement group per worker (rollout). "
+            "Deferred (WIP) will do the same as separate but defers accelerator scheduling (multinode rollout). ",
+            "choices": ["shared", "separate", "deferred"],
+        },
+    )
 
 
 @dataclass
@@ -804,6 +833,7 @@ class TrainEngineConfig:
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     archon: ArchonEngineConfig = field(default_factory=ArchonEngineConfig)
     megatron: MegatronEngineConfig = field(default_factory=MegatronEngineConfig)
+    mindspeed: MindSpeedEngineConfig = field(default_factory=MindSpeedEngineConfig)
 
     # Lora
     use_lora: bool = field(
@@ -1105,6 +1135,11 @@ class vLLMConfig:
     uvicorn_log_level: str = "warning"
     enable_lora: bool = False
     lora_modules: str = ""
+    data_parallel_size: int = 1
+    # will use explicit vllm config tp and pp if specified otherwise use allocmode
+    tensor_parallel_size: int | None = None
+    pipeline_parallel_size: int | None = None
+    enable_expert_parallel: bool = False
 
     @staticmethod
     def build_args(
@@ -1121,10 +1156,13 @@ class vLLMConfig:
             tokenizer=vllm_config.model,
             load_format="auto",
             trust_remote_code=True,
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
             **args,
         )
+        if args["tensor_parallel_size"] is None:
+            args["tensor_parallel_size"] = tp_size
+        if args["pipeline_parallel_size"] is None:
+            args["pipeline_parallel_size"] = pp_size
+
         if port is not None:
             args["port"] = port
         if host is not None:
@@ -1967,7 +2005,7 @@ def to_structured_cfg(cfg, config_cls):
     return cfg
 
 
-def load_expr_config(argv: list[str], config_cls: type[ConfigT]) -> tuple[ConfigT, str]:
+def load_expr_config(argv: list[str], config_cls: type[ConfigT]) -> tuple[ConfigT, str]:  # noqa: UP047
     cfg, config_file = parse_cli_args(argv)
     cfg = to_structured_cfg(cfg, config_cls=config_cls)
     cfg = OmegaConf.to_object(cfg)
