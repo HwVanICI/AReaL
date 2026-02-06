@@ -27,7 +27,11 @@ def _init_platform() -> Platform:
     Returns:
         An instance of a subclass of Platform corresponding to the detected hardware.
     """
-    if torch.cuda.is_available():
+
+    if is_npu_available:
+        logger.info("Initializing NPU platform (NPU).")
+        return NPUPlatform()
+    elif torch.cuda.is_available():
         device_name = torch.cuda.get_device_name().upper()
         logger.info(f"Detected CUDA device: {device_name}")
         if "NVIDIA" in device_name:
