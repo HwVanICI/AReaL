@@ -2,6 +2,7 @@ import traceback
 
 import torch
 import torch.distributed as dist
+from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
@@ -13,6 +14,15 @@ from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
 from areal.utils.distributed import init_custom_process_group
 
 logger = init_logger("vllm_worker_extension")
+
+
+def undo_moe_postprocess_for_reload(model):
+    for name, p in model.named_parameters():
+        if "mlp.experts.w13_weight" in name:
+            p.data = p.data.transpose(1, 2).contiguous()
+
+        elif "mlp.experts.w2_weight" in name:
+            p.data = p.data.transpose(1, 2).contiguous()
 
 
 class VLLMWorkerExtension:
@@ -28,11 +38,17 @@ class VLLMWorkerExtension:
         logger.info(f"start update weights, {model_path}", flush=True)
         try:
             # load weight
+            undo_moe_postprocess_for_reload(self.model_runner.model)
             self.model_runner.model_config.model = model_path
             model_loader = get_model_loader(self.model_runner.vllm_config.load_config)
             logger.info("Reloading weights inplace...")
             model_loader.load_weights(
                 self.model_runner.model, model_config=self.model_runner.model_config
+            )
+            process_weights_after_loading(
+                self.model_runner.model,
+                self.model_runner.model_config,
+                self.model_runner.device,
             )
             self.sync()
 
@@ -118,6 +134,7 @@ class VLLMWorkerExtension:
 
     def update_weight_xccl(self):
         logger.info("start update weights by nccl or hccl", flush=True)
+        undo_moe_postprocess_for_reload(self.model_runner.model)
         names = self.areal_weight_meta_names
         dtypes = self.areal_weight_meta_dtypes
         shapes = self.areal_weight_meta_shapes
@@ -142,6 +159,11 @@ class VLLMWorkerExtension:
                     async_op=False,
                 )
                 self.model_runner.model.load_weights(weights=[(name, tensor)])
+            process_weights_after_loading(
+                self.model_runner.model,
+                self.model_runner.model_config,
+                self.model_runner.device,
+            )
             self.sync()
             return True, "Success"
         except Exception as e:
@@ -273,7 +295,7 @@ class VLLMWorkerExtension:
                 backend=backend,
                 world_size=world_size,
                 init_method=f"tcp://{master_address}:{master_port}",
-                rank=self.rank + rank_offset,
+                rank=get_world_group().rank + rank_offset,
                 group_name=group_name,
                 timeout=DIST_GROUP_DEFAULT_TIMEOUT,
             )
