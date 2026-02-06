@@ -27,6 +27,12 @@ from areal.infra.scheduler.exceptions import (
     WorkerNotFoundError,
     WorkerTimeoutError,
 )
+from areal.infra.scheduler.ray_placement_group import (
+    RayPlacementStrategy,
+    SeparatedRayPlacementStrategy,
+    SharedRayPlacementStrategy,
+    ray_resource_type,
+)
 from areal.infra.utils.launcher import get_env_vars, get_thread_env_vars
 from areal.infra.utils.ray import get_placement_group_master_ip_and_port
 from areal.infra.utils.ray_placement_group import (
