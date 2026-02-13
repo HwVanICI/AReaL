@@ -252,7 +252,7 @@ class ModelAllocation:
     Parameters
     ----------
     backend : str
-        Backend type ("sglang", "vllm", "fsdp", "megatron", "archon")
+        Backend type ("sglang", "vllm", "fsdp", "megatron", "archon", "mindspeed_llm")
     name : str, optional
         Component name for referencing via allocation_mode[name]
     parallel : ParallelStrategy
@@ -265,7 +265,9 @@ class ModelAllocation:
     >>> ModelAllocation("sglang", "rollout", ParallelStrategy(dp=2), SchedulingStrategy("separation"))
     """
 
-    backend: Literal["fsdp", "megatron", "archon", "vllm", "sglang", "cpu"]
+    backend: Literal[
+        "fsdp", "megatron", "archon", "mindspeed_llm", "vllm", "sglang", "cpu"
+    ]
     name: str | None
     parallel: ParallelStrategy | None
     scheduling_strategy: SchedulingStrategy
@@ -450,9 +452,11 @@ class AllocationMode:
         return [a for a in self.allocations if a.backend in ("sglang", "vllm")]
 
     def _get_training_allocations(self) -> list[ModelAllocation]:
-        """Get all training allocations (fsdp, megatron, archon backends)."""
+        """Get all training allocations (fsdp, megatron, archon, mindspeed_llm backends)."""
         return [
-            a for a in self.allocations if a.backend in ("fsdp", "megatron", "archon")
+            a
+            for a in self.allocations
+            if a.backend in ("fsdp", "megatron", "archon", "mindspeed_llm")
         ]
 
     ########### Legacy Attributes for Backward Compatiblity ###########
@@ -596,7 +600,7 @@ ALLOCATION_GRAMMAR = """
 
     EVAL: "cpu" | "eval"
     INFER_BACKEND: "sglang" | "vllm"
-    TRAIN_BACKEND: "fsdp" | "megatron" | "archon"
+    TRAIN_BACKEND: "fsdp" | "megatron" | "archon" | "mindspeed_llm"
 
     NAME: /[a-zA-Z_][a-zA-Z0-9_]*/
     NUMBER: /[1-9][0-9]*/

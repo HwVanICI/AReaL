@@ -36,6 +36,7 @@ from areal.utils.stats_logger import StatsLogger
 
 if TYPE_CHECKING:
     from areal.engine.fsdp_engine import FSDPLMEngine
+    from areal.engine.mindspeed_llm_engine import MindSpeedLLMLMEngine
     from areal.engine.megatron_engine import MegatronLMEngine
     from areal.engine.sft.lm_engine import LMController
     from areal.experimental.engine.archon_engine import ArchonLMEngine
@@ -278,7 +279,9 @@ class SFTTrainer:
 
     def _create_actor(
         self, actor_config: TrainEngineConfig
-    ) -> FSDPLMEngine | MegatronLMEngine | ArchonLMEngine | LMController:
+    ) -> (
+        FSDPLMEngine | MegatronLMEngine | MindSpeedLLMLMEngine | ArchonLMEngine | LMController
+    ):
         if self.allocation_mode.train_backend == "fsdp":
             from areal.engine.fsdp_engine import FSDPLMEngine
 
@@ -287,6 +290,10 @@ class SFTTrainer:
             from areal.engine.megatron_engine import MegatronLMEngine
 
             actor_cls = MegatronLMEngine
+        elif self.allocation_mode.train_backend == "mindspeed_llm":
+            from areal.engine.mindspeed_llm_engine import MindSpeedLLMLMEngine
+
+            actor_cls = MindSpeedLLMLMEngine
         elif self.allocation_mode.train_backend == "archon":
             from areal.experimental.engine.archon_engine import ArchonLMEngine
 
@@ -294,7 +301,7 @@ class SFTTrainer:
         else:
             raise ValueError(
                 f"Invalid backend: {self.allocation_mode.train_backend}, "
-                f"expected fsdp, megatron, or archon"
+                f"expected fsdp, megatron, mindspeed_llm, or archon"
             )
         if is_single_controller():
             actor = actor_cls.as_controller(actor_config, self.scheduler)

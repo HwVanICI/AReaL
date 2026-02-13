@@ -45,6 +45,10 @@ from areal.utils.stats_logger import StatsLogger
 if TYPE_CHECKING:
     from areal.engine.fsdp_engine import FSDPPPOActor, FSDPPPOCritic
     from areal.engine.megatron_engine import MegatronPPOActor, MegatronPPOCritic
+    from areal.engine.mindspeed_llm_engine import (
+        MindSpeedLLMPPOActor,
+        MindSpeedLLMPPOCritic,
+    )
     from areal.engine.ppo.actor import PPOActorController
     from areal.engine.ppo.critic import PPOCriticController
     from areal.experimental.engine.archon_engine import ArchonPPOActor, ArchonPPOCritic
@@ -154,7 +158,7 @@ class PPOTrainer:
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
         elif self.config.actor.weight_update_mode == "xccl":
             # NCCL/XCCL weight update
-            if self.allocation_mode.train_backend == "megatron":
+            if self.allocation_mode.train_backend in ("megatron", "mindspeed_llm"):
                 self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(
                     self.allocation_mode
                 )
@@ -487,7 +491,13 @@ class PPOTrainer:
 
     def _create_actor(
         self, actor_config: PPOActorConfig
-    ) -> FSDPPPOActor | MegatronPPOActor | ArchonPPOActor | PPOActorController:
+    ) -> (
+        FSDPPPOActor
+        | MegatronPPOActor
+        | MindSpeedLLMPPOActor
+        | ArchonPPOActor
+        | PPOActorController
+    ):
         if self.allocation_mode.train_backend == "fsdp":
             from areal.engine.fsdp_engine import FSDPPPOActor
 
@@ -496,13 +506,17 @@ class PPOTrainer:
             from areal.engine.megatron_engine import MegatronPPOActor
 
             actor_cls = MegatronPPOActor
+        elif self.allocation_mode.train_backend == "mindspeed_llm":
+            from areal.engine.mindspeed_llm_engine import MindSpeedLLMPPOActor
+
+            actor_cls = MindSpeedLLMPPOActor
         elif self.allocation_mode.train_backend == "archon":
             from areal.experimental.engine.archon_engine import ArchonPPOActor
 
             actor_cls = ArchonPPOActor
         else:
             raise ValueError(
-                f"Invalid backend: {self.allocation_mode.train_backend}, expected fsdp, megatron or archon"
+                f"Invalid backend: {self.allocation_mode.train_backend}, expected fsdp, megatron, mindspeed_llm or archon"
             )
         if is_single_controller():
             actor = actor_cls.as_controller(actor_config, self.scheduler)
@@ -513,7 +527,13 @@ class PPOTrainer:
 
     def _create_critic(
         self, critic_config: PPOCriticConfig
-    ) -> FSDPPPOCritic | MegatronPPOCritic | ArchonPPOCritic | PPOCriticController:
+    ) -> (
+        FSDPPPOCritic
+        | MegatronPPOCritic
+        | MindSpeedLLMPPOCritic
+        | ArchonPPOCritic
+        | PPOCriticController
+    ):
         if self.allocation_mode.train_backend == "fsdp":
             from areal.engine.fsdp_engine import FSDPPPOCritic
 
@@ -522,13 +542,17 @@ class PPOTrainer:
             from areal.engine.megatron_engine import MegatronPPOCritic
 
             critic_cls = MegatronPPOCritic
+        elif self.allocation_mode.train_backend == "mindspeed_llm":
+            from areal.engine.mindspeed_llm_engine import MindSpeedLLMPPOCritic
+
+            critic_cls = MindSpeedLLMPPOCritic
         elif self.allocation_mode.train_backend == "archon":
             from areal.experimental.engine.archon_engine import ArchonPPOCritic
 
             critic_cls = ArchonPPOCritic
         else:
             raise ValueError(
-                f"Invalid backend: {self.allocation_mode.train_backend}, expected fsdp, megatron or archon"
+                f"Invalid backend: {self.allocation_mode.train_backend}, expected fsdp, megatron, mindspeed_llm or archon"
             )
         if is_single_controller():
             critic = critic_cls.as_controller(critic_config, self.scheduler)

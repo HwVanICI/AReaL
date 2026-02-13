@@ -669,6 +669,51 @@ class MindSpeedEngineConfig:
         return asdict(self)
 
 
+@dataclass
+class MindSpeedLLMEngineConfig:
+    """MindSpeed-LLM (mcore-only) backend configuration."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable MindSpeed-LLM backend specific behavior."},
+    )
+    modeling_mode: str = field(
+        default="spec",
+        metadata={
+            "help": "Model construction mode for MindSpeed-LLM backend.",
+            "choices": ["spec", "mbridge"],
+        },
+    )
+    stage: str = field(
+        default="sft",
+        metadata={
+            "help": "MindSpeed-LLM stage selector. Only sft is supported in AReaL backend.",
+            "choices": ["sft", "dpo"],
+        },
+    )
+    extra_cli_args: str = field(
+        default="",
+        metadata={
+            "help": "Multi-line or single-line extra Megatron/MindSpeed-LLM CLI args to be parsed via shlex."
+        },
+    )
+    strict_arg_validation: bool = field(
+        default=True,
+        metadata={
+            "help": "Validate key arguments and allocation consistency strictly for MindSpeed-LLM backend."
+        },
+    )
+    set_megatron_global_args: bool = field(
+        default=True,
+        metadata={
+            "help": "Set Megatron global args before applying MindSpeed-LLM patches."
+        },
+    )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
     colocation = "colocation"
@@ -834,6 +879,9 @@ class TrainEngineConfig:
     archon: ArchonEngineConfig = field(default_factory=ArchonEngineConfig)
     megatron: MegatronEngineConfig = field(default_factory=MegatronEngineConfig)
     mindspeed: MindSpeedEngineConfig = field(default_factory=MindSpeedEngineConfig)
+    mindspeed_llm: MindSpeedLLMEngineConfig = field(
+        default_factory=MindSpeedLLMEngineConfig
+    )
 
     # Lora
     use_lora: bool = field(

@@ -1,0 +1,185 @@
+experiment_name: gsm8k-sft-mindspeed-llm
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+total_train_epochs: 1
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 2
+  n_gpus_per_node: 8
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+# world_size=16, tp=4, pp=2, ep=2 => dp=1
+allocation_mode: mindspeed_llm:d1p2t4e2
+
+scheduler:
+  type: null
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-30B-A3B
+  init_from_scratch: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 4096
+  optimizer:
+    type: adam
+    lr: 1.25e-5
+    weight_decay: 0.1
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1e-8
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.01
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.scheduler.rpc.rpc_server
+      env_vars:
+        HCCL_CONNECT_TIMEOUT: "1800"
+        CUDA_DEVICE_MAX_CONNECTIONS: "1"
+        PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+  mindspeed_llm:
+    enabled: true
+    modeling_mode: spec
+    stage: sft
+    strict_arg_validation: true
+    set_megatron_global_args: true
+    extra_cli_args: |
+      --use-mcore-models
+      --stage sft
+      --finetune
+      --is-instruction-dataset
+      --tokenizer-not-use-fast
+      --prompt-type qwen3
+      --no-pad-to-seq-lengths
+      --spec mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec
+      --num-experts 128
+      --moe-router-topk 8
+      --moe-ffn-hidden-size 768
+      --moe-grouped-gemm
+      --moe-permutation-async-comm
+      --moe-token-dispatcher-type alltoall_seq
+      --moe-router-load-balancing-type aux_loss
+      --moe-layer-freq -1
+      --first-k-dense-replace -1
+      --moe-aux-loss-coeff 0.001
+      --use-flash-attn
+      --use-fused-rotary-pos-emb
+      --sequence-parallel
+      --use-rotary-position-embeddings
+      --use-fused-swiglu
+      --use-fused-rmsnorm
+      --no-masked-softmax-fusion
+      --use-distributed-optimizer
+      --micro-batch-size 4
+      --global-batch-size 64
+      --lr 1.25e-5
+      --lr-decay-style cosine
+      --min-lr 1.25e-7
+      --weight-decay 1e-1
+      --lr-warmup-fraction 0.01
+      --attention-dropout 0.0
+      --init-method-std 0.01
+      --hidden-dropout 0.0
+      --clip-grad 1.0
+      --adam-beta1 0.9
+      --adam-beta2 0.95
+      --initial-loss-scale 4096
+      --seed 42
+      --bf16
+      --train-iters 2000
+      --seq-length 4096
+      --no-shared-storage
+      --tensor-model-parallel-size 4
+      --pipeline-model-parallel-size 2
+      --expert-model-parallel-size 2
+      --kv-channels 128
+      --qk-layernorm
+      --norm-topk-prob
+      --tokenizer-name-or-path your_tokenizer_path
+      --max-position-embeddings 4096
+      --num-layers 48
+      --hidden-size 2048
+      --ffn-hidden-size 6144
+      --num-attention-heads 32
+      --tokenizer-type PretrainedFromHF
+      --make-vocab-size-divisible-by 1
+      --padded-vocab-size 151936
+      --rotary-base 1000000
+      --untie-embeddings-and-output-weights
+      --disable-bias-linear
+      --position-embedding-type rope
+      --normalization RMSNorm
+      --swiglu
+      --attention-softmax-in-fp32
+      --no-gradient-accumulation-fusion
+      --group-query-attention
+      --num-query-groups 4
+      --split 100,0,0
+      --log-interval 1
+      --save-interval 2000
+      --eval-interval 2000
+      --eval-iters 0
+      --no-load-optim
+      --no-load-rng
+      --distributed-backend nccl
+      --transformer-impl local
+
+train_dataset:
+  batch_size: 128
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: openai/gsm8k
+  type: sft
+
+valid_dataset:
+  batch_size: 128
+  pin_memory: true
+  num_workers: 4
+  path: openai/gsm8k
+  type: sft
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
