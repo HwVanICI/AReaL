@@ -69,17 +69,14 @@ def parse_extra_cli_args(
     from megatron.training import get_args
     from megatron.training.global_vars import unset_global_variables
     from megatron.training.initialize import initialize_megatron
-    from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
-    from mindspeed_llm.features_manager import create_features_list
-
-    MindSpeedFeaturesManager.remove_patches()
-    MindSpeedFeaturesManager.set_features_list(create_features_list())
 
     old_argv = sys.argv
     old_parse_args = megatron_arguments.parse_args
     try:
         megatron_arguments.parse_args = _unwrap_function(old_parse_args)
         sys.argv = argv
+        from mindspeed_llm import megatron_adaptor  # noqa: F401
+
         # Make this parser path idempotent in long-lived processes.
         unset_global_variables()
         initialize_megatron(
@@ -181,18 +178,8 @@ def apply_mindspeed_llm_patches(
         parallel_strategy=parallel_strategy,
     )
 
-    from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
-    from mindspeed_llm.features_manager import create_features_list
-
-    # Ensure a clean patch manager state before applying MindSpeed-LLM patches.
-    MindSpeedFeaturesManager.remove_patches()
-    MindSpeedFeaturesManager.set_features_list(create_features_list())
-
-    MindSpeedFeaturesManager.apply_features_pre_patches(args)
-    MindSpeedFeaturesManager.apply_features_patches(args)
-
     logger.info(
-        "Applied MindSpeed-LLM patches (stage=%s, modeling_mode=%s, use_mcore_models=%s).",
+        "MindSpeed-LLM adaptor initialized (stage=%s, modeling_mode=%s, use_mcore_models=%s).",
         getattr(args, "stage", None),
         backend_cfg.modeling_mode,
         getattr(args, "use_mcore_models", None),
