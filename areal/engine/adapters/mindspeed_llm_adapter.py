@@ -18,7 +18,6 @@ class ParsedCLIArgs:
     namespace: argparse.Namespace
     explicit_keys: set[str]
 
-
 def _add_unknown_args(args: dict[str, Any], key: str | None, value: list[str] | None):
     if key is None:
         return
@@ -69,25 +68,20 @@ def _extract_explicit_keys(tokens: list[str]) -> set[str]:
 def parse_extra_cli_args(extra_cli_args: str) -> ParsedCLIArgs:
     tokens = shlex.split(extra_cli_args or "", posix=True)
     explicit_keys = _extract_explicit_keys(tokens)
-    if not tokens:
-        return ParsedCLIArgs(namespace=argparse.Namespace(), explicit_keys=set())
-
-    # Parse MindSpeed-LLM feature arguments first, then absorb unknown args.
-    parser = argparse.ArgumentParser(
-        description="MindSpeed-LLM extra args", allow_abbrev=False
-    )
+    # Parse args through the same registration path as MindSpeed-LLM launcher:
+    # Megatron native args + MindSpeed args + MindSpeed-LLM args.
     try:
-        from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
-        from mindspeed_llm.features_manager import create_features_list
-
-        MindSpeedFeaturesManager.set_features_list(create_features_list())
-        MindSpeedFeaturesManager.register_features_args(parser)
+        from mindspeed_llm.training.arguments import process_args_v2
     except Exception as e:  # pragma: no cover - covered by dependency checks
         raise RuntimeError(
             "Failed to load MindSpeed-LLM argument registry. "
             "Please ensure mindspeed and mindspeed_llm are installed correctly."
         ) from e
 
+    parser = argparse.ArgumentParser(
+        description="MindSpeed-LLM extra args", allow_abbrev=False
+    )
+    parser = process_args_v2(parser)
     known_args, unknown = parser.parse_known_args(tokens)
     merged = vars(known_args)
     merged.update(_parse_unknown_tokens(unknown))
@@ -166,7 +160,13 @@ def build_mindspeed_llm_args(
         "recompute_granularity": megatron_cfg.recompute_granularity,
         "recompute_num_layers": megatron_cfg.recompute_num_layers,
     }
-    base.update(vars(parsed.namespace))
+    parsed_dict = vars(parsed.namespace)
+    for key, value in parsed_dict.items():
+        if key not in base:
+            base[key] = value
+    for key in parsed.explicit_keys:
+        if key in parsed_dict:
+            base[key] = parsed_dict[key]
     return argparse.Namespace(**base)
 
 
