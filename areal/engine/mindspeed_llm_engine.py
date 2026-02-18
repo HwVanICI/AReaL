@@ -17,10 +17,7 @@ from transformers import AutoConfig
 
 from areal.api.alloc_mode import ParallelStrategy
 from areal.api.cli_args import TrainEngineConfig
-from areal.engine.adapters.mindspeed_llm_adapter import (
-    apply_mindspeed_llm_patches,
-    namespace_to_dict,
-)
+from areal.engine.adapters.mindspeed_llm_adapter import apply_mindspeed_llm_patches
 from areal.engine.megatron_engine import MegatronEngine
 from areal.platforms import current_platform
 from areal.utils import logging
@@ -91,7 +88,6 @@ class MindSpeedLLMEngine(MegatronEngine):
     def _patch_mindspeed(self, parallel_strategy: ParallelStrategy):
         self.mindspeed_llm_args = apply_mindspeed_llm_patches(
             backend_cfg=self.mindspeed_llm_config,
-            megatron_cfg=self.mcore_config,
             parallel_strategy=parallel_strategy,
         )
 
@@ -107,8 +103,7 @@ class MindSpeedLLMEngine(MegatronEngine):
                 "reuses AReaL Megatron model construction."
             )
             if self.mindspeed_llm_args is not None:
-                # A compact snapshot helps diff against script-style args.
-                effective = namespace_to_dict(self.mindspeed_llm_args)
+                effective = vars(self.mindspeed_llm_args)
                 self.logger.info(
                     "MindSpeed-LLM effective args snapshot: %s",
                     {
@@ -169,7 +164,10 @@ class MindSpeedLLMEngine(MegatronEngine):
             pretrained_model_name_or_path=self.config.path,
             trust_remote_code=True,
         )
-        self.tf_config = self._build_tf_config_from_megatron_args()
+        from megatron.training import get_args
+        from megatron.training.arguments import core_transformer_config_from_args
+
+        self.tf_config = core_transformer_config_from_args(get_args())
         self.tf_config = configure_pipeline_layer_splits(
             self.parallel_strategy, self.hf_config, self.tf_config
         )
@@ -273,27 +271,6 @@ class MindSpeedLLMEngine(MegatronEngine):
         self._create_optimizer(ft_spec)
         self._initialized = True
 
-    def _build_tf_config_from_megatron_args(self):
-        from megatron.training import get_args
-        from megatron.training.arguments import core_transformer_config_from_args
-
-        args = get_args()
-        return core_transformer_config_from_args(args)
-
-    def _is_hf_dir(self, path: str) -> bool:
-        if not os.path.isdir(path):
-            return False
-        try:
-            files = os.listdir(path)
-        except OSError:
-            return False
-        has_config = "config.json" in files
-        has_weight = any(
-            name.endswith((".bin", ".safetensors")) and "model" in name.lower()
-            for name in files
-        )
-        return has_config and has_weight
-
     def _load_model_from_hf_via_hf2mg(self, path: str) -> None:
         assert self.model is not None, "Model is not initialized."
         from megatron.training.checkpointing import load_checkpoint
@@ -304,7 +281,20 @@ class MindSpeedLLMEngine(MegatronEngine):
         if ms_args is None:
             raise RuntimeError("MindSpeed-LLM args are not initialized.")
 
-        if self._is_hf_dir(path):
+        is_hf_dir = False
+        if os.path.isdir(path):
+            try:
+                files = os.listdir(path)
+            except OSError:
+                files = []
+            has_config = "config.json" in files
+            has_weight = any(
+                name.endswith((".bin", ".safetensors")) and "model" in name.lower()
+                for name in files
+            )
+            is_hf_dir = has_config and has_weight
+
+        if is_hf_dir:
             setattr(ms_args, "enable_hf2mg_convert", True)
             setattr(ms_args, "load", path)
             if not getattr(ms_args, "model_type_hf", None):
