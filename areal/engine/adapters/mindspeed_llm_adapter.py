@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import shlex
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,42 +19,6 @@ class ParsedCLIArgs:
     namespace: argparse.Namespace
     explicit_keys: set[str]
 
-def _add_unknown_args(args: dict[str, Any], key: str | None, value: list[str] | None):
-    if key is None:
-        return
-    name = key[2:].replace("-", "_")
-    if value is None:
-        args[name] = True
-    elif len(value) == 1:
-        args[name] = value[0]
-    else:
-        args[name] = value
-
-
-def _parse_unknown_tokens(tokens: list[str]) -> dict[str, Any]:
-    parsed: dict[str, Any] = {}
-    key: str | None = None
-    value: list[str] | None = None
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok.startswith("--"):
-            _add_unknown_args(parsed, key, value)
-            splits = tok.split("=", maxsplit=1)
-            if len(splits) == 2:
-                key, value = splits[0], [splits[1]]
-            else:
-                key, value = tok, None
-        else:
-            if value is None:
-                value = [tok]
-            else:
-                value.append(tok)
-        i += 1
-    _add_unknown_args(parsed, key, value)
-    return parsed
-
-
 def _extract_explicit_keys(tokens: list[str]) -> set[str]:
     keys: set[str] = set()
     for tok in tokens:
@@ -65,27 +30,71 @@ def _extract_explicit_keys(tokens: list[str]) -> set[str]:
     return keys
 
 
-def parse_extra_cli_args(extra_cli_args: str) -> ParsedCLIArgs:
+def _build_base_cli_tokens(
+    *,
+    backend_cfg: MindSpeedLLMEngineConfig,
+    megatron_cfg: MegatronEngineConfig,
+    parallel_strategy: ParallelStrategy,
+) -> list[str]:
+    tokens = [
+        "--use-mcore-models",
+        "--stage",
+        str(backend_cfg.stage),
+        "--tensor-model-parallel-size",
+        str(parallel_strategy.tensor_parallel_size),
+        "--pipeline-model-parallel-size",
+        str(parallel_strategy.pipeline_parallel_size),
+        "--expert-model-parallel-size",
+        str(parallel_strategy.expert_parallel_size),
+        "--context-parallel-size",
+        str(parallel_strategy.context_parallel_size),
+    ]
+    if megatron_cfg.recompute_method is not None:
+        tokens.extend(["--recompute-method", str(megatron_cfg.recompute_method)])
+    if megatron_cfg.recompute_granularity is not None:
+        tokens.extend(
+            ["--recompute-granularity", str(megatron_cfg.recompute_granularity)]
+        )
+    if megatron_cfg.recompute_num_layers is not None:
+        tokens.extend(["--recompute-num-layers", str(megatron_cfg.recompute_num_layers)])
+    return tokens
+
+
+def parse_extra_cli_args(
+    *,
+    extra_cli_args: str,
+    backend_cfg: MindSpeedLLMEngineConfig,
+    megatron_cfg: MegatronEngineConfig,
+    parallel_strategy: ParallelStrategy,
+) -> ParsedCLIArgs:
     tokens = shlex.split(extra_cli_args or "", posix=True)
     explicit_keys = _extract_explicit_keys(tokens)
-    # Parse args through the same registration path as MindSpeed-LLM launcher:
-    # Megatron native args + MindSpeed args + MindSpeed-LLM args.
+    base_tokens = _build_base_cli_tokens(
+        backend_cfg=backend_cfg,
+        megatron_cfg=megatron_cfg,
+        parallel_strategy=parallel_strategy,
+    )
+    argv = ["areal-mindspeed-llm"] + base_tokens + tokens
+
+    # Parse through the same chain as posttrain_gpt.py:
+    # Megatron parse_args + MindSpeed/MindSpeed-LLM extra args provider.
     try:
-        from mindspeed_llm.training.arguments import process_args_v2
+        from megatron.training import arguments as megatron_arguments
+        from mindspeed_llm.training.arguments import parse_args_decorator
     except Exception as e:  # pragma: no cover - covered by dependency checks
         raise RuntimeError(
             "Failed to load MindSpeed-LLM argument registry. "
             "Please ensure mindspeed and mindspeed_llm are installed correctly."
         ) from e
 
-    parser = argparse.ArgumentParser(
-        description="MindSpeed-LLM extra args", allow_abbrev=False
-    )
-    parser = process_args_v2(parser)
-    known_args, unknown = parser.parse_known_args(tokens)
-    merged = vars(known_args)
-    merged.update(_parse_unknown_tokens(unknown))
-    return ParsedCLIArgs(namespace=argparse.Namespace(**merged), explicit_keys=explicit_keys)
+    old_argv = sys.argv
+    try:
+        sys.argv = argv
+        parse_args = parse_args_decorator(megatron_arguments.parse_args)
+        args = parse_args(extra_args_provider=None, ignore_unknown_args=False)
+    finally:
+        sys.argv = old_argv
+    return ParsedCLIArgs(namespace=args, explicit_keys=explicit_keys)
 
 
 def _maybe_cast_int(value: Any) -> int | None:
@@ -139,7 +148,12 @@ def build_mindspeed_llm_args(
     megatron_cfg: MegatronEngineConfig,
     parallel_strategy: ParallelStrategy,
 ) -> argparse.Namespace:
-    parsed = parse_extra_cli_args(backend_cfg.extra_cli_args)
+    parsed = parse_extra_cli_args(
+        extra_cli_args=backend_cfg.extra_cli_args,
+        backend_cfg=backend_cfg,
+        megatron_cfg=megatron_cfg,
+        parallel_strategy=parallel_strategy,
+    )
 
     validate_parallel_consistency(
         extra_args=parsed.namespace,
@@ -148,26 +162,11 @@ def build_mindspeed_llm_args(
         strict=backend_cfg.strict_arg_validation,
     )
 
-    base = {
-        "use_mcore_models": True,
-        "use_legacy_models": False,
-        "stage": backend_cfg.stage,
-        "tensor_model_parallel_size": parallel_strategy.tensor_parallel_size,
-        "pipeline_model_parallel_size": parallel_strategy.pipeline_parallel_size,
-        "expert_model_parallel_size": parallel_strategy.expert_parallel_size,
-        "context_parallel_size": parallel_strategy.context_parallel_size,
-        "recompute_method": megatron_cfg.recompute_method,
-        "recompute_granularity": megatron_cfg.recompute_granularity,
-        "recompute_num_layers": megatron_cfg.recompute_num_layers,
-    }
-    parsed_dict = vars(parsed.namespace)
-    for key, value in parsed_dict.items():
-        if key not in base:
-            base[key] = value
-    for key in parsed.explicit_keys:
-        if key in parsed_dict:
-            base[key] = parsed_dict[key]
-    return argparse.Namespace(**base)
+    args = parsed.namespace
+    # Keep explicit semantic alignment with mcore path in MindSpeed-LLM.
+    args.use_mcore_models = True
+    args.use_legacy_models = False
+    return args
 
 
 def apply_mindspeed_llm_patches(
