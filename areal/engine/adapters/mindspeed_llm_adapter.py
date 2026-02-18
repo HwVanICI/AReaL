@@ -75,36 +75,27 @@ def parse_extra_cli_args(
         parallel_strategy=parallel_strategy,
     )
     argv = ["areal-mindspeed-llm"] + base_tokens + tokens
+    from megatron.training import get_args
+    from megatron.training.global_vars import unset_global_variables
+    from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
+    from mindspeed_llm.features_manager import create_features_list
+    from mindspeed_llm.training.initialize import initialize_megatron
 
-    # Parse through the same chain as posttrain_gpt.py:
-    # Megatron parse_args + MindSpeed/MindSpeed-LLM extra args provider.
-    try:
-        from megatron.training import arguments as megatron_arguments
-        from megatron.training.arguments import validate_args as megatron_validate_args
-        from megatron.training.yaml_arguments import validate_yaml
-        from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
-        from mindspeed_llm.features_manager import create_features_list
-    except Exception as e:  # pragma: no cover - covered by dependency checks
-        raise RuntimeError(
-            "Failed to load MindSpeed-LLM argument registry. "
-            "Please ensure mindspeed and mindspeed_llm are installed correctly."
-        ) from e
-
-    # Align current parser feature registry with MindSpeed-LLM feature set.
-    # Then use the existing runtime parse_args chain as-is to avoid double registration.
     MindSpeedFeaturesManager.set_features_list(create_features_list())
-    parse_args_fn = megatron_arguments.parse_args
 
     old_argv = sys.argv
     try:
         sys.argv = argv
-        args = parse_args_fn(extra_args_provider=None, ignore_unknown_args=False)
-        # Keep behavior aligned with MindSpeed-LLM initialize_megatron:
-        # params_dtype and many derived fields are populated in validate_args.
-        if getattr(args, "yaml_cfg", None) is not None:
-            args = validate_yaml(args, {})
-        else:
-            args = megatron_validate_args(args, {})
+        # Make this parser path idempotent in long-lived processes.
+        unset_global_variables()
+        initialize_megatron(
+            extra_args_provider=None,
+            args_defaults={},
+            ignore_unknown_args=False,
+            allow_no_cuda=True,
+            skip_mpu_initialization=True,
+        )
+        args = get_args()
     finally:
         sys.argv = old_argv
     return ParsedCLIArgs(namespace=args, explicit_keys=explicit_keys)
@@ -205,26 +196,9 @@ def apply_mindspeed_llm_patches(
     from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
     from mindspeed_llm.features_manager import create_features_list
 
-    # MegatronEngine imports mindspeed.megatron_adaptor at module load time,
-    # which may already register/apply a patch set. Clear it before applying
-    # MindSpeed-LLM feature patches to avoid duplicate registration errors
-    # (e.g. "the patch of compile exist !").
-    try:
-        MindSpeedFeaturesManager.remove_patches()
-    except Exception:
-        logger.warning("Failed to remove existing MindSpeed patches before re-patching.")
-
+    # Ensure a clean patch manager state before applying MindSpeed-LLM patches.
+    MindSpeedFeaturesManager.remove_patches()
     MindSpeedFeaturesManager.set_features_list(create_features_list())
-
-    if backend_cfg.set_megatron_global_args:
-        try:
-            from megatron.training.global_vars import set_args
-
-            set_args(args)
-        except Exception:
-            logger.warning(
-                "Failed to set megatron global args before applying MindSpeed-LLM patches."
-            )
 
     MindSpeedFeaturesManager.apply_features_pre_patches(args)
     MindSpeedFeaturesManager.apply_features_patches(args)
