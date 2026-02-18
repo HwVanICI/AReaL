@@ -193,6 +193,15 @@ def apply_mindspeed_llm_patches(
     from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
     from mindspeed_llm.features_manager import create_features_list
 
+    # MegatronEngine imports mindspeed.megatron_adaptor at module load time,
+    # which may already register/apply a patch set. Clear it before applying
+    # MindSpeed-LLM feature patches to avoid duplicate registration errors
+    # (e.g. "the patch of compile exist !").
+    try:
+        MindSpeedFeaturesManager.remove_patches()
+    except Exception:
+        logger.warning("Failed to remove existing MindSpeed patches before re-patching.")
+
     MindSpeedFeaturesManager.set_features_list(create_features_list())
 
     if backend_cfg.set_megatron_global_args:
