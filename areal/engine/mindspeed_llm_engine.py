@@ -184,14 +184,16 @@ class MindSpeedLLMEngine(MegatronEngine):
         from megatron.core.transformer.spec_utils import import_module
 
         transformer_layer_spec = import_module(spec)
+        pre_process = mpu.is_pipeline_first_stage()
+        post_process = mpu.is_pipeline_last_stage()
         with self.device:
             model = GPTModel(
                 config=self.tf_config,
                 transformer_layer_spec=transformer_layer_spec,
                 vocab_size=self.hf_config.vocab_size,
                 max_sequence_length=self.hf_config.max_position_embeddings,
-                pre_process=True,
-                post_process=True,
+                pre_process=pre_process,
+                post_process=post_process,
                 share_embeddings_and_output_weights=False,
                 position_embedding_type="rope",
                 rotary_base=getattr(self.hf_config, "rope_theta", 10000.0),
@@ -280,6 +282,7 @@ class MindSpeedLLMEngine(MegatronEngine):
         ms_args = self.mindspeed_llm_args
         if ms_args is None:
             raise RuntimeError("MindSpeed-LLM args are not initialized.")
+        self._validate_runtime_parallel_alignment(ms_args)
 
         is_hf_dir = False
         if os.path.isdir(path):
@@ -302,10 +305,13 @@ class MindSpeedLLMEngine(MegatronEngine):
                 model_type_hf = model_type_hf.replace("_", "-")
                 setattr(ms_args, "model_type_hf", model_type_hf)
             if not getattr(ms_args, "mg_save_dir", None):
-                tp = self.parallel_strategy.tensor_parallel_size
-                pp = self.parallel_strategy.pipeline_parallel_size
-                ep = self.parallel_strategy.expert_parallel_size
-                mg_dir = os.path.join(path, f"areal_hf2mg_tp{tp}pp{pp}ep{ep}")
+                tp = int(getattr(ms_args, "tensor_model_parallel_size", 1))
+                pp = int(getattr(ms_args, "pipeline_model_parallel_size", 1))
+                ep = int(getattr(ms_args, "expert_model_parallel_size", 1))
+                etp = int(getattr(ms_args, "expert_tensor_parallel_size", 1))
+                mg_dir = os.path.join(
+                    path, f"areal_hf2mg_tp{tp}pp{pp}ep{ep}etp{etp}"
+                )
                 setattr(ms_args, "mg_save_dir", mg_dir)
             if self._is_readable_hf2mg_cache(ms_args.mg_save_dir):
                 self.logger.info(
@@ -322,6 +328,46 @@ class MindSpeedLLMEngine(MegatronEngine):
         setattr(ms_args, "load", load_path)
         iteration = load_checkpoint(self.model, None, None, strict=True)
         self.logger.info("Loaded MindSpeed-LLM Megatron checkpoint, iteration=%s", iteration)
+
+    def _validate_runtime_parallel_alignment(self, ms_args) -> None:
+        checks = [
+            (
+                "tensor_model_parallel_size",
+                self.parallel_strategy.tensor_parallel_size,
+                "tp",
+            ),
+            (
+                "pipeline_model_parallel_size",
+                self.parallel_strategy.pipeline_parallel_size,
+                "pp",
+            ),
+            (
+                "expert_model_parallel_size",
+                self.parallel_strategy.expert_parallel_size,
+                "ep",
+            ),
+            (
+                "expert_tensor_parallel_size",
+                self.parallel_strategy.expert_tensor_parallel_size,
+                "etp",
+            ),
+            ("context_parallel_size", self.parallel_strategy.context_parallel_size, "cp"),
+        ]
+        mismatches: list[str] = []
+        for key, expected, short in checks:
+            raw = getattr(ms_args, key, None)
+            try:
+                parsed = int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed in (None, expected):
+                continue
+            mismatches.append(f"{short}: allocation_mode={expected}, megatron_args={parsed}")
+        if mismatches:
+            raise ValueError(
+                "MindSpeed-LLM runtime parallel args mismatch with allocation_mode: "
+                + "; ".join(mismatches)
+            )
 
     def _is_readable_hf2mg_cache(self, cache_root: str) -> bool:
         if not os.path.isdir(cache_root):

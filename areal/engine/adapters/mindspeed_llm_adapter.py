@@ -44,6 +44,8 @@ def _build_base_cli_tokens(
         str(parallel_strategy.pipeline_parallel_size),
         "--expert-model-parallel-size",
         str(parallel_strategy.expert_parallel_size),
+        "--expert-tensor-parallel-size",
+        str(parallel_strategy.expert_tensor_parallel_size),
         "--context-parallel-size",
         str(parallel_strategy.context_parallel_size),
     ]
@@ -57,6 +59,7 @@ def parse_extra_cli_args(
 ) -> tuple[argparse.Namespace, set[str]]:
     tokens = shlex.split(extra_cli_args or "", posix=True)
     explicit_keys = _extract_explicit_keys(tokens)
+
     base_tokens = _build_base_cli_tokens(
         backend_cfg=backend_cfg,
         parallel_strategy=parallel_strategy,
@@ -69,6 +72,7 @@ def parse_extra_cli_args(
     from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
     from mindspeed_llm.features_manager import create_features_list
 
+    MindSpeedFeaturesManager.remove_patches()
     MindSpeedFeaturesManager.set_features_list(create_features_list())
 
     old_argv = sys.argv
@@ -106,6 +110,11 @@ def validate_parallel_consistency(
         ("tensor_model_parallel_size", parallel_strategy.tensor_parallel_size, "tp"),
         ("pipeline_model_parallel_size", parallel_strategy.pipeline_parallel_size, "pp"),
         ("expert_model_parallel_size", parallel_strategy.expert_parallel_size, "ep"),
+        (
+            "expert_tensor_parallel_size",
+            parallel_strategy.expert_tensor_parallel_size,
+            "etp",
+        ),
         ("context_parallel_size", parallel_strategy.context_parallel_size, "cp"),
     ]
     mismatches: list[str] = []
