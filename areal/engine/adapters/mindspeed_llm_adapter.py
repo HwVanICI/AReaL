@@ -23,6 +23,12 @@ def _extract_explicit_keys(tokens: list[str]) -> set[str]:
     return keys
 
 
+def _unwrap_function(func):
+    while hasattr(func, "__wrapped__"):
+        func = func.__wrapped__
+    return func
+
+
 def _build_base_cli_tokens(
     *,
     backend_cfg: MindSpeedLLMEngineConfig,
@@ -56,6 +62,7 @@ def parse_extra_cli_args(
         parallel_strategy=parallel_strategy,
     )
     argv = ["areal-mindspeed-llm"] + base_tokens + tokens
+    import megatron.training.arguments as megatron_arguments
     from megatron.training import get_args
     from megatron.training.global_vars import unset_global_variables
     from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
@@ -65,7 +72,9 @@ def parse_extra_cli_args(
     MindSpeedFeaturesManager.set_features_list(create_features_list())
 
     old_argv = sys.argv
+    old_parse_args = megatron_arguments.parse_args
     try:
+        megatron_arguments.parse_args = _unwrap_function(old_parse_args)
         sys.argv = argv
         # Make this parser path idempotent in long-lived processes.
         unset_global_variables()
@@ -78,6 +87,7 @@ def parse_extra_cli_args(
         )
         args = get_args()
     finally:
+        megatron_arguments.parse_args = old_parse_args
         sys.argv = old_argv
     return args, explicit_keys
 
