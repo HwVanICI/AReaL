@@ -80,18 +80,18 @@ def parse_extra_cli_args(
     # Megatron parse_args + MindSpeed/MindSpeed-LLM extra args provider.
     try:
         from megatron.training import arguments as megatron_arguments
-        from mindspeed_llm.training.arguments import parse_args_decorator
+        from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
+        from mindspeed_llm.features_manager import create_features_list
     except Exception as e:  # pragma: no cover - covered by dependency checks
         raise RuntimeError(
             "Failed to load MindSpeed-LLM argument registry. "
             "Please ensure mindspeed and mindspeed_llm are installed correctly."
         ) from e
 
+    # Align current parser feature registry with MindSpeed-LLM feature set.
+    # Then use the existing runtime parse_args chain as-is to avoid double registration.
+    MindSpeedFeaturesManager.set_features_list(create_features_list())
     parse_args_fn = megatron_arguments.parse_args
-    # Avoid double-wrapping when parse_args is already patched by MindSpeed
-    # or MindSpeed-LLM (which would register the same option twice).
-    if getattr(parse_args_fn, "__module__", "") == "megatron.training.arguments":
-        parse_args_fn = parse_args_decorator(parse_args_fn)
 
     old_argv = sys.argv
     try:
