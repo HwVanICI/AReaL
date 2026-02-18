@@ -80,6 +80,8 @@ def parse_extra_cli_args(
     # Megatron parse_args + MindSpeed/MindSpeed-LLM extra args provider.
     try:
         from megatron.training import arguments as megatron_arguments
+        from megatron.training.arguments import validate_args as megatron_validate_args
+        from megatron.training.yaml_arguments import validate_yaml
         from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
         from mindspeed_llm.features_manager import create_features_list
     except Exception as e:  # pragma: no cover - covered by dependency checks
@@ -97,6 +99,12 @@ def parse_extra_cli_args(
     try:
         sys.argv = argv
         args = parse_args_fn(extra_args_provider=None, ignore_unknown_args=False)
+        # Keep behavior aligned with MindSpeed-LLM initialize_megatron:
+        # params_dtype and many derived fields are populated in validate_args.
+        if getattr(args, "yaml_cfg", None) is not None:
+            args = validate_yaml(args, {})
+        else:
+            args = megatron_validate_args(args, {})
     finally:
         sys.argv = old_argv
     return ParsedCLIArgs(namespace=args, explicit_keys=explicit_keys)
