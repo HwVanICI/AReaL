@@ -65,9 +65,9 @@ def parse_extra_cli_args(
     import megatron.training.arguments as megatron_arguments
     from megatron.training import get_args
     from megatron.training.global_vars import unset_global_variables
+    from megatron.training.initialize import initialize_megatron
     from mindspeed.features_manager.features_manager import MindSpeedFeaturesManager
     from mindspeed_llm.features_manager import create_features_list
-    from mindspeed_llm.training.initialize import initialize_megatron
 
     MindSpeedFeaturesManager.set_features_list(create_features_list())
 
