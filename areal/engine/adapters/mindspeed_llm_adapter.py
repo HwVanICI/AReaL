@@ -87,11 +87,16 @@ def parse_extra_cli_args(
             "Please ensure mindspeed and mindspeed_llm are installed correctly."
         ) from e
 
+    parse_args_fn = megatron_arguments.parse_args
+    # Avoid double-wrapping when parse_args is already patched by MindSpeed
+    # or MindSpeed-LLM (which would register the same option twice).
+    if getattr(parse_args_fn, "__module__", "") == "megatron.training.arguments":
+        parse_args_fn = parse_args_decorator(parse_args_fn)
+
     old_argv = sys.argv
     try:
         sys.argv = argv
-        parse_args = parse_args_decorator(megatron_arguments.parse_args)
-        args = parse_args(extra_args_provider=None, ignore_unknown_args=False)
+        args = parse_args_fn(extra_args_provider=None, ignore_unknown_args=False)
     finally:
         sys.argv = old_argv
     return ParsedCLIArgs(namespace=args, explicit_keys=explicit_keys)
