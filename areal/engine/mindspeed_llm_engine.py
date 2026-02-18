@@ -307,8 +307,14 @@ class MindSpeedLLMEngine(MegatronEngine):
                 ep = self.parallel_strategy.expert_parallel_size
                 mg_dir = os.path.join(path, f"areal_hf2mg_tp{tp}pp{pp}ep{ep}")
                 setattr(ms_args, "mg_save_dir", mg_dir)
-            os.makedirs(ms_args.mg_save_dir, exist_ok=True)
-            _convert_weights_if_needed(ms_args, is_shared_path(ms_args.mg_save_dir))
+            if self._is_readable_hf2mg_cache(ms_args.mg_save_dir):
+                self.logger.info(
+                    "Found readable HF2MG cache at %s, skipping conversion.",
+                    ms_args.mg_save_dir,
+                )
+            else:
+                os.makedirs(ms_args.mg_save_dir, exist_ok=True)
+                _convert_weights_if_needed(ms_args, is_shared_path(ms_args.mg_save_dir))
             load_path = ms_args.mg_save_dir
         else:
             load_path = path
@@ -316,6 +322,44 @@ class MindSpeedLLMEngine(MegatronEngine):
         setattr(ms_args, "load", load_path)
         iteration = load_checkpoint(self.model, None, None, strict=True)
         self.logger.info("Loaded MindSpeed-LLM Megatron checkpoint, iteration=%s", iteration)
+
+    def _is_readable_hf2mg_cache(self, cache_root: str) -> bool:
+        if not os.path.isdir(cache_root):
+            return False
+
+        tracker = os.path.join(cache_root, "latest_checkpointed_iteration.txt")
+        if not os.path.isfile(tracker):
+            return False
+        try:
+            with open(tracker, encoding="utf-8") as f:
+                iteration = int(f.read().strip())
+        except (OSError, ValueError):
+            return False
+
+        iter_dir = os.path.join(cache_root, f"iter_{iteration:07d}")
+        if not os.path.isdir(iter_dir):
+            return False
+
+        checkpoint_file = None
+        for name in os.listdir(iter_dir):
+            if not name.startswith("mp_rank_"):
+                continue
+            candidate = os.path.join(iter_dir, name, "model_optim_rng.pt")
+            if os.path.isfile(candidate):
+                checkpoint_file = candidate
+                break
+        if checkpoint_file is None:
+            return False
+
+        try:
+            state = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
+        except Exception:
+            return False
+        if not isinstance(state, dict):
+            return False
+        return "args" in state and (
+            "model" in state or any(key.startswith("model") for key in state.keys())
+        )
 
 
 class MindSpeedLLMPPOActor(MindSpeedLLMEngine):
