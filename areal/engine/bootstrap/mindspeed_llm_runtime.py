@@ -16,6 +16,8 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig as MCoreDDPConfig
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.utils import get_model_config
+from megatron.training import get_args
+from megatron.training.arguments import core_transformer_config_from_args
 from transformers import AutoConfig
 
 from areal.api.alloc_mode import ParallelStrategy
@@ -110,8 +112,6 @@ class MindSpeedLLMRuntime(MegatronEngine):
                 setattr(moe_specs_mod, name, getattr(experts_mod, name))
 
     def _validate_grouped_gemm_patch(self) -> None:
-        from megatron.training import get_args
-
         args = get_args()
         if not getattr(args, "moe_grouped_gemm", False):
             return
@@ -130,7 +130,6 @@ class MindSpeedLLMRuntime(MegatronEngine):
             )
 
     def _set_mindspeed_runtime_context(self, mb: dict[str, Any]) -> None:
-        from megatron.training import get_args
         from mindspeed.core.context_parallel.get_batch_utils import set_actual_seq_len
         from mindspeed.utils import set_position_ids
         from mindspeed_llm.training.utils import compute_actual_seq_len
@@ -225,29 +224,8 @@ class MindSpeedLLMRuntime(MegatronEngine):
             )
         if self.mindspeed_llm_config.modeling_mode == "spec":
             self.logger.info(
-                "MindSpeed-LLM modeling_mode=spec is enabled. "
-                "Current implementation applies MindSpeed-LLM mcore patches and "
-                "reuses AReaL Megatron model construction."
+                "MindSpeed-LLM modeling_mode=spec is enabled."
             )
-            if self.mindspeed_llm_args is not None:
-                effective = vars(self.mindspeed_llm_args)
-                self.logger.info(
-                    "MindSpeed-LLM effective args snapshot: %s",
-                    {
-                        k: effective[k]
-                        for k in sorted(effective.keys())
-                        if k
-                        in {
-                            "stage",
-                            "spec",
-                            "use_mcore_models",
-                            "tensor_model_parallel_size",
-                            "pipeline_model_parallel_size",
-                            "expert_model_parallel_size",
-                            "context_parallel_size",
-                        }
-                    },
-                )
             return self._initialize_spec_mode(addr=addr, ft_spec=ft_spec, **kwargs)
         elif self.mindspeed_llm_config.modeling_mode != "mbridge":
             raise ValueError(
@@ -291,9 +269,6 @@ class MindSpeedLLMRuntime(MegatronEngine):
             pretrained_model_name_or_path=self.config.path,
             trust_remote_code=True,
         )
-        from megatron.training import get_args
-        from megatron.training.arguments import core_transformer_config_from_args
-
         args = get_args()
 
         self.tf_config = core_transformer_config_from_args(args)
