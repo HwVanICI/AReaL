@@ -36,7 +36,6 @@ from areal.utils.seeding import get_seed
 
 if TYPE_CHECKING:
     from areal.api.io_struct import FinetuneSpec
-    from areal.api.scheduler_api import Scheduler
     from areal.engine.ppo.actor import PPOActorConfig
     from areal.engine.ppo.critic import PPOCriticConfig
 
@@ -261,8 +260,7 @@ class MindSpeedLLMRuntime(MegatronEngine):
         from megatron.training import get_args
         from megatron.training.arguments import core_transformer_config_from_args
 
-        args = get_args()
-        self.tf_config = core_transformer_config_from_args(args)
+        self.tf_config = core_transformer_config_from_args(get_args())
         self.tf_config = configure_pipeline_layer_splits(
             self.parallel_strategy, self.hf_config, self.tf_config
         )
@@ -507,12 +505,6 @@ class MindSpeedLLMPPOActorRuntime(MindSpeedLLMRuntime):
     def ppo_update(self, *args, **kwargs) -> None:
         self.actor.ppo_update(*args, **kwargs)
 
-    @classmethod
-    def as_controller(cls, config: PPOActorConfig, scheduler: Scheduler):
-        from areal.engine.ppo.actor import PPOActorController
-
-        return PPOActorController(train_engine=cls, config=config, scheduler=scheduler)
-
 
 class MindSpeedLLMPPOCriticRuntime(MindSpeedLLMRuntime):
     """PPO Critic implementation using MindSpeed-LLM backend."""
@@ -530,16 +522,6 @@ class MindSpeedLLMPPOCriticRuntime(MindSpeedLLMRuntime):
     def ppo_update(self, *args, **kwargs) -> None:
         self.critic.ppo_update(*args, **kwargs)
 
-    @classmethod
-    def as_controller(cls, config: PPOCriticConfig, scheduler: Scheduler):
-        from areal.engine.ppo.critic import PPOCriticController
-
-        return PPOCriticController(
-            train_engine=cls,
-            config=config,
-            scheduler=scheduler,
-        )
-
 
 class MindSpeedLLMLMRuntime(MindSpeedLLMRuntime):
     """Language model engine for SFT using MindSpeed-LLM backend."""
@@ -555,9 +537,3 @@ class MindSpeedLLMLMRuntime(MindSpeedLLMRuntime):
 
     def evaluate_lm(self, data):
         return self.lm_engine.evaluate_lm(data)
-
-    @classmethod
-    def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
-        from areal.engine.sft.lm_engine import LMController
-
-        return LMController(train_engine=cls, config=config, scheduler=scheduler)
