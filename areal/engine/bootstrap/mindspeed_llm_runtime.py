@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from mindspeed_llm import megatron_adaptor  # noqa: F401
+import mindspeed.ops.gmm  # noqa: F401
 
 import dataclasses
 import functools
@@ -149,6 +150,46 @@ class MindSpeedLLMRuntime(MegatronEngine):
             )
         except Exception as e:
             self.logger.warning("MindSpeed MoE binding diagnostics failed: %s", e)
+
+    def _log_npu_gmm_dispatch_diagnostics(self) -> None:
+        try:
+            import mindspeed.ops.gmm as gmm_mod
+
+            npu_gmm = getattr(gmm_mod, "npu_gmm", None)
+            self.logger.info(
+                "MindSpeed GMM symbol: mindspeed.ops.gmm=%s ; npu_gmm=%s.%s",
+                getattr(gmm_mod, "__file__", None),
+                getattr(npu_gmm, "__module__", None),
+                getattr(npu_gmm, "__name__", None),
+            )
+        except Exception as e:
+            self.logger.warning("MindSpeed GMM python import diagnostics failed: %s", e)
+
+        try:
+            has_privateuse1_tensor = torch._C._dispatch_has_kernel_for_dispatch_key(
+                "mindspeed::npu_gmm.Tensor", "PrivateUse1"
+            )
+            has_privateuse1_list = torch._C._dispatch_has_kernel_for_dispatch_key(
+                "mindspeed::npu_gmm.List", "PrivateUse1"
+            )
+            has_autograd_privateuse1_tensor = (
+                torch._C._dispatch_has_kernel_for_dispatch_key(
+                    "mindspeed::npu_gmm.Tensor", "AutogradPrivateUse1"
+                )
+            )
+            has_autograd_privateuse1_list = torch._C._dispatch_has_kernel_for_dispatch_key(
+                "mindspeed::npu_gmm.List", "AutogradPrivateUse1"
+            )
+            self.logger.info(
+                "MindSpeed GMM dispatch: npu_gmm.Tensor PrivateUse1=%s AutogradPrivateUse1=%s ; "
+                "npu_gmm.List PrivateUse1=%s AutogradPrivateUse1=%s",
+                has_privateuse1_tensor,
+                has_autograd_privateuse1_tensor,
+                has_privateuse1_list,
+                has_autograd_privateuse1_list,
+            )
+        except Exception as e:
+            self.logger.warning("MindSpeed GMM dispatch diagnostics failed: %s", e)
 
     def _validate_grouped_gemm_patch(self) -> None:
         args = get_args()
@@ -325,6 +366,7 @@ class MindSpeedLLMRuntime(MegatronEngine):
         self.mindspeed_llm_args = args
         self._rebind_preimported_moe_symbols()
         self._log_moe_binding_diagnostics()
+        self._log_npu_gmm_dispatch_diagnostics()
 
         self.tf_config = core_transformer_config_from_args(args)
         self._validate_grouped_gemm_patch()
