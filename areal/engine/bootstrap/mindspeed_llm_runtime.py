@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from mindspeed_llm import megatron_adaptor  # noqa: F401
-import mindspeed.ops.gmm  # noqa: F401
 
 import dataclasses
 import functools
@@ -96,6 +95,14 @@ class MindSpeedLLMRuntime(MegatronEngine):
 
     def _patch_mindspeed(self, parallel_strategy: ParallelStrategy):
         del parallel_strategy
+
+    def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
+        # Align with posttrain_gpt.py initialization chain:
+        # distributed/model-parallel are initialized by initialize_megatron().
+        if parallel_strategy is None:
+            parallel_strategy = ParallelStrategy()
+        self.parallel_strategy = self._make_parallel_strategy(parallel_strategy)
+        self.process_group_initialized = False
 
     def _rebind_preimported_moe_symbols(self) -> None:
         # If Megatron modules were imported before MindSpeed-LLM patching,
@@ -357,13 +364,16 @@ class MindSpeedLLMRuntime(MegatronEngine):
                 args_defaults={},
                 ignore_unknown_args=False,
                 allow_no_cuda=True,
-                skip_mpu_initialization=True,
             )
         finally:
             sys.argv = old_argv
 
         args = get_args()
         self.mindspeed_llm_args = args
+        self.logger = logging.getLogger(f"[MindSpeedLLMRuntime Rank {torch.distributed.get_rank()}]")
+        self._init_context_and_model_parallel_group()
+        self._cpu_group = torch.distributed.new_group(backend="gloo")
+        self.process_group_initialized = True
         self._rebind_preimported_moe_symbols()
         self._log_moe_binding_diagnostics()
         self._log_npu_gmm_dispatch_diagnostics()
