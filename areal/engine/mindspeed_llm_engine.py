@@ -92,10 +92,14 @@ class MindSpeedLLMEngine(TrainEngine):
         return self._rt.cpu_group
 
     def destroy(self):
+        if self._runtime is None:
+            return None
         return self._rt.destroy()
 
     @property
     def initialized(self) -> bool:
+        if self._runtime is None:
+            return False
         return self._rt.initialized
 
     def train(self, mode: bool = True):
