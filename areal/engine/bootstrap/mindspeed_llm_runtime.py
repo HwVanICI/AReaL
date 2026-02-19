@@ -4,7 +4,6 @@ from mindspeed_llm import megatron_adaptor  # noqa: F401
 
 import dataclasses
 import functools
-import importlib
 import os
 import sys
 from collections.abc import Iterator
@@ -96,20 +95,19 @@ class MindSpeedLLMRuntime(MegatronEngine):
             backend_cfg=self.mindspeed_llm_config,
             parallel_strategy=parallel_strategy,
         )
-        self._reload_moe_modules_after_patch()
+        self._rebind_preimported_moe_symbols()
 
-    def _reload_moe_modules_after_patch(self) -> None:
-        # In AReaL process lifecycle, Megatron modules may be imported before
-        # MindSpeed-LLM patches are applied. Reload these modules to avoid stale
-        # references (e.g., GroupedMLP captured before patch).
-        for module_name in (
-            "megatron.core.transformer.moe.experts",
-            "megatron.core.models.gpt.moe_module_specs",
-            "megatron.core.models.gpt.gpt_layer_specs",
-        ):
-            module = sys.modules.get(module_name)
-            if module is not None:
-                importlib.reload(module)
+    def _rebind_preimported_moe_symbols(self) -> None:
+        # If Megatron modules were imported before MindSpeed-LLM patching,
+        # moe_module_specs may hold stale class references. Rebind them in-place.
+        experts_mod = sys.modules.get("megatron.core.transformer.moe.experts")
+        moe_specs_mod = sys.modules.get("megatron.core.models.gpt.moe_module_specs")
+        if experts_mod is None or moe_specs_mod is None:
+            return
+
+        for name in ("GroupedMLP", "SequentialMLP", "TEGroupedMLP"):
+            if hasattr(experts_mod, name):
+                setattr(moe_specs_mod, name, getattr(experts_mod, name))
 
     def _validate_grouped_gemm_patch(self) -> None:
         from megatron.training import get_args
