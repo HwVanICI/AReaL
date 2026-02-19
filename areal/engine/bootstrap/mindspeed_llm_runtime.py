@@ -18,6 +18,7 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.utils import get_model_config
 from megatron.training import get_args
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.initialize import initialize_megatron
 from transformers import AutoConfig
 
 from areal.api.alloc_mode import ParallelStrategy
@@ -89,15 +90,15 @@ class MindSpeedLLMRuntime(MegatronEngine):
     def __init__(self, config: TrainEngineConfig):
         super().__init__(config)
         self.mindspeed_llm_config = config.mindspeed_llm
+        self._mindspeed_llm_argv: list[str] | None = None
         self.mindspeed_llm_args = None
         self.logger = logging.getLogger("MindSpeedLLMRuntime")
 
     def _patch_mindspeed(self, parallel_strategy: ParallelStrategy):
-        self.mindspeed_llm_args = apply_mindspeed_llm_patches(
+        self._mindspeed_llm_argv = apply_mindspeed_llm_patches(
             backend_cfg=self.mindspeed_llm_config,
             parallel_strategy=parallel_strategy,
         )
-        self._rebind_preimported_moe_symbols()
 
     def _rebind_preimported_moe_symbols(self) -> None:
         # If Megatron modules were imported before MindSpeed-LLM patching,
@@ -269,7 +270,24 @@ class MindSpeedLLMRuntime(MegatronEngine):
             pretrained_model_name_or_path=self.config.path,
             trust_remote_code=True,
         )
+        if self._mindspeed_llm_argv is None:
+            raise RuntimeError("MindSpeed-LLM argv is not prepared.")
+        old_argv = sys.argv
+        try:
+            sys.argv = self._mindspeed_llm_argv
+            initialize_megatron(
+                extra_args_provider=None,
+                args_defaults={},
+                ignore_unknown_args=False,
+                allow_no_cuda=True,
+                skip_mpu_initialization=True,
+            )
+        finally:
+            sys.argv = old_argv
+
         args = get_args()
+        self.mindspeed_llm_args = args
+        self._rebind_preimported_moe_symbols()
 
         self.tf_config = core_transformer_config_from_args(args)
         self._validate_grouped_gemm_patch()
