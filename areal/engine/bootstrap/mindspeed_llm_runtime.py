@@ -4,7 +4,9 @@ from mindspeed_llm import megatron_adaptor  # noqa: F401
 
 import dataclasses
 import functools
+import importlib
 import os
+import sys
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -94,6 +96,40 @@ class MindSpeedLLMRuntime(MegatronEngine):
             backend_cfg=self.mindspeed_llm_config,
             parallel_strategy=parallel_strategy,
         )
+        self._reload_moe_modules_after_patch()
+
+    def _reload_moe_modules_after_patch(self) -> None:
+        # In AReaL process lifecycle, Megatron modules may be imported before
+        # MindSpeed-LLM patches are applied. Reload these modules to avoid stale
+        # references (e.g., GroupedMLP captured before patch).
+        for module_name in (
+            "megatron.core.transformer.moe.experts",
+            "megatron.core.models.gpt.moe_module_specs",
+            "megatron.core.models.gpt.gpt_layer_specs",
+        ):
+            module = sys.modules.get(module_name)
+            if module is not None:
+                importlib.reload(module)
+
+    def _validate_grouped_gemm_patch(self) -> None:
+        from megatron.training import get_args
+
+        args = get_args()
+        if not getattr(args, "moe_grouped_gemm", False):
+            return
+        if getattr(args, "transformer_impl", None) != "local":
+            return
+
+        from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+
+        grouped_mlp_cls = get_moe_module_spec.__globals__.get("GroupedMLP", None)
+        grouped_mlp_module = getattr(grouped_mlp_cls, "__module__", "")
+        if not grouped_mlp_module.startswith("mindspeed."):
+            raise RuntimeError(
+                "MindSpeed grouped_gemm patch is not effective: "
+                f"GroupedMLP resolves to {grouped_mlp_module}.{getattr(grouped_mlp_cls, '__name__', 'Unknown')}. "
+                "This usually means Megatron modules were imported before MindSpeed-LLM patching."
+            )
 
     def _set_mindspeed_runtime_context(self, mb: dict[str, Any]) -> None:
         from megatron.training import get_args
@@ -261,6 +297,7 @@ class MindSpeedLLMRuntime(MegatronEngine):
         from megatron.training.arguments import core_transformer_config_from_args
 
         self.tf_config = core_transformer_config_from_args(get_args())
+        self._validate_grouped_gemm_patch()
         self.tf_config = configure_pipeline_layer_splits(
             self.parallel_strategy, self.hf_config, self.tf_config
         )
