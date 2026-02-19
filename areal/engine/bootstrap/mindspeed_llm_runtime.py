@@ -194,7 +194,87 @@ class MindSpeedLLMRuntime(TrainEngine):
                 "MindSpeed-LLM backend currently supports stage='sft' only."
             )
         self.logger.info("MindSpeed-LLM modeling_mode=spec is enabled.")
-        return self._initialize_spec_mode(addr=addr, ft_spec=ft_spec, **kwargs)
+        try:
+            self.seed = get_seed()
+        except ValueError:
+            self.seed = 42
+        assert addr is None
+        if is_tms_enabled():
+            torch_memory_saver.hook_mode = "preload"
+        current_platform.set_device(int(os.environ["LOCAL_RANK"]))
+        self.device = torch.device(int(os.environ["LOCAL_RANK"]))
+        self.rank = int(os.environ["RANK"])
+        self.world_size = int(os.environ["WORLD_SIZE"])
+        self.alloc_mode = kwargs.get("alloc_mode", None)
+
+        old_argv = sys.argv
+        try:
+            sys.argv = self._mindspeed_llm_argv
+            initialize_megatron(
+                extra_args_provider=None,
+                args_defaults={},
+                ignore_unknown_args=False,
+                allow_no_cuda=True,
+            )
+        finally:
+            sys.argv = old_argv
+
+        args = get_args()
+        self.mindspeed_llm_args = args
+        self.is_pp_head = (
+            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+            and mpu.get_tensor_model_parallel_rank() == 0
+        )
+        self.weight_update_group_name = f"update_weight_group_{mpu.get_pipeline_model_parallel_rank()}"
+        self.engine_lock = DistributedLock("train_engine_lock")
+        self.logger = logging.getLogger(f"[MindSpeedLLMRuntime Rank {torch.distributed.get_rank()}]")
+        self._init_context_and_model_parallel_group()
+        self._cpu_group = torch.distributed.new_group(backend="gloo")
+        self.process_group_initialized = True
+        self.tokenizer = load_hf_tokenizer(self.config.path)
+        self.hf_config = AutoConfig.from_pretrained(self.config.path, trust_remote_code=True)
+        self._rebind_preimported_moe_symbols()
+        self._log_moe_binding_diagnostics()
+        self._log_npu_gmm_dispatch_diagnostics()
+
+        self.tf_config = core_transformer_config_from_args(args)
+        self._validate_grouped_gemm_patch()
+        self.tf_config = configure_pipeline_layer_splits(self.parallel_strategy, self.hf_config, self.tf_config)
+
+        pre_process = mpu.is_pipeline_first_stage()
+        post_process = mpu.is_pipeline_last_stage()
+        with self.device:
+            model = create_gpt_model_from_mindspeed_args(
+                pre_process=pre_process,
+                post_process=post_process,
+            )
+            if self.config.is_critic:
+                model.output_layer = _ValueHead(
+                    input_size=self.tf_config.hidden_size,
+                    sequence_parallel=self.tf_config.sequence_parallel,
+                    dtype=self.tf_config.params_dtype,
+                )
+                model.vocab_size = 1
+            if self.mcore_config.wrap_with_ddp:
+                ddp_config = MCoreDDPConfig(**dataclasses.asdict(self.mcore_config.ddp))
+                model = DDP(
+                    config=self.tf_config,
+                    ddp_config=ddp_config,
+                    module=model,
+                    disable_bucketing=False,
+                )
+        self.model = _MegatronModelList([model])
+
+        with self.device:
+            self._load_model_from_hf_via_hf2mg(self.config.path)
+
+        primary_model = self.model[0]
+        model_config = get_model_config(primary_model)
+        if self.mcore_config.use_deterministic_algorithms:
+            set_deterministic_algorithms(model_config)
+        model_config.finalize_model_grads_func = finalize_model_grads
+        self._create_optimizer(ft_spec)
+        self._initialized = True
 
     @property
     def initialized(self) -> bool:
@@ -1169,89 +1249,6 @@ class MindSpeedLLMRuntime(TrainEngine):
             set_position_ids(position_ids.transpose(0, 1).contiguous())
         else:
             set_position_ids(position_ids)
-
-    def _initialize_spec_mode(self, addr: str | None, ft_spec: "FinetuneSpec", **kwargs):
-        try:
-            self.seed = get_seed()
-        except ValueError:
-            self.seed = 42
-        assert addr is None
-        if is_tms_enabled():
-            torch_memory_saver.hook_mode = "preload"
-        current_platform.set_device(int(os.environ["LOCAL_RANK"]))
-        self.device = torch.device(int(os.environ["LOCAL_RANK"]))
-        self.rank = int(os.environ["RANK"])
-        self.world_size = int(os.environ["WORLD_SIZE"])
-        self.alloc_mode = kwargs.get("alloc_mode", None)
-
-        old_argv = sys.argv
-        try:
-            sys.argv = self._mindspeed_llm_argv
-            initialize_megatron(
-                extra_args_provider=None,
-                args_defaults={},
-                ignore_unknown_args=False,
-                allow_no_cuda=True,
-            )
-        finally:
-            sys.argv = old_argv
-
-        args = get_args()
-        self.mindspeed_llm_args = args
-        self.is_pp_head = (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-            and mpu.get_tensor_model_parallel_rank() == 0
-        )
-        self.weight_update_group_name = f"update_weight_group_{mpu.get_pipeline_model_parallel_rank()}"
-        self.engine_lock = DistributedLock("train_engine_lock")
-        self.logger = logging.getLogger(f"[MindSpeedLLMRuntime Rank {torch.distributed.get_rank()}]")
-        self._init_context_and_model_parallel_group()
-        self._cpu_group = torch.distributed.new_group(backend="gloo")
-        self.process_group_initialized = True
-        self.tokenizer = load_hf_tokenizer(self.config.path)
-        self.hf_config = AutoConfig.from_pretrained(self.config.path, trust_remote_code=True)
-        self._rebind_preimported_moe_symbols()
-        self._log_moe_binding_diagnostics()
-        self._log_npu_gmm_dispatch_diagnostics()
-
-        self.tf_config = core_transformer_config_from_args(args)
-        self._validate_grouped_gemm_patch()
-        self.tf_config = configure_pipeline_layer_splits(self.parallel_strategy, self.hf_config, self.tf_config)
-
-        pre_process = mpu.is_pipeline_first_stage()
-        post_process = mpu.is_pipeline_last_stage()
-        with self.device:
-            model = create_gpt_model_from_mindspeed_args(
-                pre_process=pre_process,
-                post_process=post_process,
-            )
-            if self.config.is_critic:
-                model.output_layer = _ValueHead(
-                    input_size=self.tf_config.hidden_size,
-                    sequence_parallel=self.tf_config.sequence_parallel,
-                    dtype=self.tf_config.params_dtype,
-                )
-                model.vocab_size = 1
-            if self.mcore_config.wrap_with_ddp:
-                ddp_config = MCoreDDPConfig(**dataclasses.asdict(self.mcore_config.ddp))
-                model = DDP(
-                    config=self.tf_config,
-                    ddp_config=ddp_config,
-                    module=model,
-                    disable_bucketing=False,
-                )
-        self.model = _MegatronModelList([model])
-
-        with self.device:
-            self._load_model_from_hf_via_hf2mg(self.config.path)
-
-        primary_model = self.model[0]
-        model_config = get_model_config(primary_model)
-        if self.mcore_config.use_deterministic_algorithms:
-            set_deterministic_algorithms(model_config)
-        model_config.finalize_model_grads_func = finalize_model_grads
-        self._create_optimizer(ft_spec)
-        self._initialized = True
 
     def _load_model_from_hf_via_hf2mg(self, path: str) -> None:
         from megatron.training.checkpointing import load_checkpoint
