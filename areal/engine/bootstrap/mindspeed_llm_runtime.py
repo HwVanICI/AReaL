@@ -233,7 +233,6 @@ class MindSpeedLLMRuntime(TrainEngine):
         self.process_group_initialized = True
         self.tokenizer = load_hf_tokenizer(self.config.path)
         self.hf_config = AutoConfig.from_pretrained(self.config.path, trust_remote_code=True)
-        self._rebind_preimported_moe_symbols()
         self._log_moe_binding_diagnostics()
         self._log_npu_gmm_dispatch_diagnostics()
 
@@ -1124,33 +1123,6 @@ class MindSpeedLLMRuntime(TrainEngine):
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
-
-    def _rebind_preimported_moe_symbols(self) -> None:
-        experts_mod = sys.modules.get("megatron.core.transformer.moe.experts")
-        moe_specs_mod = sys.modules.get("megatron.core.models.gpt.moe_module_specs")
-        if experts_mod is None or moe_specs_mod is None:
-            return
-        for name in ("GroupedMLP", "SequentialMLP", "TEGroupedMLP"):
-            if hasattr(experts_mod, name):
-                setattr(moe_specs_mod, name, getattr(experts_mod, name))
-        gg_mod = sys.modules.get("megatron.core.transformer.moe.grouped_gemm_util")
-        if gg_mod is None:
-            return
-        from mindspeed.core.fusions.grouped_matmul import Ops as MindSpeedGroupedMatmulOps
-        from mindspeed.core.fusions.grouped_matmul import (
-            assert_grouped_gemm_is_available as ms_assert_grouped_gemm_is_available,
-        )
-        from mindspeed.core.fusions.grouped_matmul import (
-            grouped_gemm_is_available as ms_grouped_gemm_is_available,
-        )
-
-        setattr(gg_mod, "ops", MindSpeedGroupedMatmulOps)
-        setattr(gg_mod, "grouped_gemm_is_available", ms_grouped_gemm_is_available)
-        setattr(
-            gg_mod,
-            "assert_grouped_gemm_is_available",
-            ms_assert_grouped_gemm_is_available,
-        )
 
     def _log_moe_binding_diagnostics(self) -> None:
         try:
