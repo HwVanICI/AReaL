@@ -108,19 +108,44 @@ class MindSpeedLLMRuntime(MegatronEngine):
             if hasattr(experts_mod, name):
                 setattr(moe_specs_mod, name, getattr(experts_mod, name))
 
+        gg_mod = sys.modules.get("megatron.core.transformer.moe.grouped_gemm_util")
+        if gg_mod is not None:
+            from mindspeed.core.fusions.grouped_matmul import (
+                Ops as MindSpeedGroupedMatmulOps,
+            )
+            from mindspeed.core.fusions.grouped_matmul import (
+                assert_grouped_gemm_is_available as ms_assert_grouped_gemm_is_available,
+            )
+            from mindspeed.core.fusions.grouped_matmul import (
+                grouped_gemm_is_available as ms_grouped_gemm_is_available,
+            )
+
+            setattr(gg_mod, "ops", MindSpeedGroupedMatmulOps)
+            setattr(gg_mod, "grouped_gemm_is_available", ms_grouped_gemm_is_available)
+            setattr(
+                gg_mod,
+                "assert_grouped_gemm_is_available",
+                ms_assert_grouped_gemm_is_available,
+            )
+
     def _log_moe_binding_diagnostics(self) -> None:
         try:
             import megatron.core.transformer.moe.experts as experts_mod
+            import megatron.core.transformer.moe.grouped_gemm_util as gg_mod
             from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 
             grouped_mlp = getattr(experts_mod, "GroupedMLP", None)
             spec_grouped_mlp = get_moe_module_spec.__globals__.get("GroupedMLP", None)
+            gg_ops = getattr(gg_mod, "ops", None)
             self.logger.info(
-                "MindSpeed MoE binding: experts.GroupedMLP=%s.%s ; moe_module_specs.GroupedMLP=%s.%s",
+                "MindSpeed MoE binding: experts.GroupedMLP=%s.%s ; "
+                "moe_module_specs.GroupedMLP=%s.%s ; gg.ops=%s.%s",
                 getattr(grouped_mlp, "__module__", None),
                 getattr(grouped_mlp, "__name__", None),
                 getattr(spec_grouped_mlp, "__module__", None),
                 getattr(spec_grouped_mlp, "__name__", None),
+                getattr(gg_ops, "__module__", None),
+                getattr(gg_ops, "__name__", None),
             )
         except Exception as e:
             self.logger.warning("MindSpeed MoE binding diagnostics failed: %s", e)
