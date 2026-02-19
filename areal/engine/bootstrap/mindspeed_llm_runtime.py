@@ -294,7 +294,9 @@ class MindSpeedLLMRuntime(MegatronEngine):
         from megatron.training import get_args
         from megatron.training.arguments import core_transformer_config_from_args
 
-        self.tf_config = core_transformer_config_from_args(get_args())
+        args = get_args()
+
+        self.tf_config = core_transformer_config_from_args(args)
         self._validate_grouped_gemm_patch()
         self.tf_config = configure_pipeline_layer_splits(
             self.parallel_strategy, self.hf_config, self.tf_config

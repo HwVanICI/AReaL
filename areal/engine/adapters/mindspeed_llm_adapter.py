@@ -67,7 +67,6 @@ def parse_extra_cli_args(
     argv = ["areal-mindspeed-llm"] + base_tokens + tokens
     import megatron.training.arguments as megatron_arguments
     from megatron.training import get_args
-    from megatron.training.global_vars import unset_global_variables
     from megatron.training.initialize import initialize_megatron
 
     old_argv = sys.argv
@@ -75,8 +74,6 @@ def parse_extra_cli_args(
     try:
         megatron_arguments.parse_args = _unwrap_function(old_parse_args)
         sys.argv = argv
-        # Make this parser path idempotent in long-lived processes.
-        unset_global_variables()
         initialize_megatron(
             extra_args_provider=None,
             args_defaults={},

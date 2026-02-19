@@ -35,8 +35,6 @@ class MindSpeedLLMEngine(TrainEngine):
         return ["areal-mindspeed-llm", *tokens]
 
     def _init_runtime_with_patched_argv(self) -> None:
-        if self._runtime is not None:
-            return
         old_argv = sys.argv
         try:
             sys.argv = self._build_runtime_argv()
