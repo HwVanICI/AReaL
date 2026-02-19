@@ -12,7 +12,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from mindspeed_llm import megatron_adaptor  # noqa: F401
-import mbridge
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state as mpu
@@ -57,9 +56,6 @@ from areal.engine.core import (
 from areal.engine.bootstrap.mindspeed_llm_bootstrap import (
     create_gpt_model_from_mindspeed_args,
 )
-from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
-from areal.models.mcore.hf_save import save_weights_to_hf_with_mbridge_fast
-from areal.models.mcore.registry import make_hf_and_mcore_config, make_mcore_model
 from areal.platforms import current_platform
 from areal.utils import logging, name_resolve, names, perf_tracer, stats_tracker
 from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
@@ -177,164 +173,30 @@ class MindSpeedLLMRuntime(TrainEngine):
         self.seed: int = 0
         self.own_global_group: bool = False
         self.is_offload: bool = False
+        self.mindspeed_llm_config = config.mindspeed_llm
+        if self.mindspeed_llm_config.modeling_mode != "spec":
+            raise ValueError(
+                "MindSpeed-LLM backend is spec-only now; "
+                f"got modeling_mode={self.mindspeed_llm_config.modeling_mode!r}."
+            )
+        self._mindspeed_llm_argv = list(sys.argv)
+        self.mindspeed_llm_args = None
+        self.logger = logging.getLogger("MindSpeedLLMRuntime")
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         if parallel_strategy is None:
             parallel_strategy = ParallelStrategy()
         self.parallel_strategy = self._make_parallel_strategy(parallel_strategy)
-        # need to patch mindspeed here as it needs access to parallel strategy to init various internal groups
-        # as well as patch depending on parallelism sizes
-        self._patch_mindspeed(parallel_strategy)
-        backend = current_platform.communication_backend
-        if not dist.is_initialized():
-            # NOTE: device_id **SHOULD NOT** be passed into init_process_group,
-            # otherwise initializing the NCCL weight update group will be wrong!
-            dist.init_process_group(
-                backend=backend,
-                timeout=DIST_GROUP_DEFAULT_TIMEOUT,
-            )
-            # Initialize Megatron parallel states
-            # NOTE: we assume all MegatronEngine has the same parallel strategy.
-            vpp_size = self.parallel_strategy.virtual_pipeline_parallel_size
-            mpu.initialize_model_parallel(
-                tensor_model_parallel_size=self.parallel_strategy.tensor_parallel_size,
-                pipeline_model_parallel_size=self.parallel_strategy.pipeline_parallel_size,
-                virtual_pipeline_model_parallel_size=vpp_size if vpp_size > 1 else None,
-                use_sharp=False,
-                order="tp-cp-ep-dp-pp",
-                context_parallel_size=self.parallel_strategy.context_parallel_size,
-                expert_model_parallel_size=self.parallel_strategy.expert_parallel_size,
-                expert_tensor_parallel_size=self.parallel_strategy.expert_tensor_parallel_size,
-                distributed_timeout_minutes=int(
-                    DIST_GROUP_DEFAULT_TIMEOUT.seconds / 60
-                ),
-            )
-            # Set megatron model parallel seed
-            tensor_parallel.model_parallel_cuda_manual_seed(self.seed)
-            self.own_global_group = True
-        self.logger = logging.getLogger(f"[MegatronEngine Rank {dist.get_rank()}]")
-        self._context_and_model_parallel_group = None
-        self._init_context_and_model_parallel_group()
-        # This is needed for barrier synchronization when models are moved to CPU
-        self._cpu_group = dist.new_group(
-            timeout=DIST_GROUP_DEFAULT_TIMEOUT, backend="gloo"
-        )
-        self.process_group_initialized = True
+        # Spec mode uses initialize_megatron() as single entry; groups are initialized there.
+        self.process_group_initialized = False
 
     def initialize(self, addr: str | None, ft_spec: FinetuneSpec, *args, **kwargs):
-        try:
-            self.seed = get_seed()
-        except ValueError:
-            self.logger.warning("Seed not set, using default seed 42.")
-            self.seed = 42
-
-        assert addr is None, "FSDPEngine does not support remote initialization."
-
-        if is_tms_enabled():
-            torch_memory_saver.hook_mode = "preload"
-
-        current_platform.set_device(int(os.environ["LOCAL_RANK"]))
-        self.device = torch.device(int(os.environ["LOCAL_RANK"]))
-        self.rank = int(os.environ["RANK"])
-        self.world_size = int(os.environ["WORLD_SIZE"])
-        self.is_pp_head = (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-            and mpu.get_tensor_model_parallel_rank() == 0
-        )
-        self.weight_update_group_name = (
-            f"update_weight_group_{mpu.get_pipeline_model_parallel_rank()}"
-        )
-        self.engine_lock = DistributedLock("train_engine_lock")
-        self.alloc_mode: AllocationMode | None = kwargs.get("alloc_mode", None)
-
-        self.tokenizer = load_hf_tokenizer(self.config.path)
-
-        self.bridge = mbridge.AutoBridge.from_pretrained(self.config.path)
-        self.bridge.dtype = self.dtype
-        # Set gradient checkpointing options
-        if self.config.gradient_checkpointing:
-            self.bridge.set_extra_args(
-                recompute_granularity=self.mcore_config.recompute_granularity,
-                recompute_method=self.mcore_config.recompute_method,
-                recompute_num_layers=self.mcore_config.recompute_num_layers,
-                distribute_saved_activations=self.mcore_config.distribute_saved_activations,
-                recompute_modules=self.mcore_config.recompute_modules,
+        if self.mindspeed_llm_config.stage != "sft":
+            raise NotImplementedError(
+                "MindSpeed-LLM backend currently supports stage='sft' only."
             )
-
-        self.logger.info(
-            "Using mbridge to create models and hf model save/load in MegatronEngine."
-        )
-
-        self.hf_config, self.tf_config = make_hf_and_mcore_config(
-            self.config.path, dtype=self.dtype, bridge=self.bridge
-        )
-        self.tf_config = configure_pipeline_layer_splits(
-            self.parallel_strategy, self.hf_config, self.tf_config
-        )
-
-        # initialize mcore (DDP Wrapped) GPTModel
-        with self.device:
-            models = make_mcore_model(
-                hf_config=self.hf_config,
-                tf_config=self.tf_config,
-                mcore_config=self.mcore_config,
-                bridge=self.bridge,
-                is_critic=self.config.is_critic,
-            )
-
-        self.model = _MegatronModelList(models)
-
-        with self.device:
-            self._load_model_from_hf(self.config.path)
-
-        assert self.model, "Megatron models failed to initialize."
-        modules = [m.module if isinstance(m, DDP) else m for m in self.model]
-        total_params = sum(
-            param.numel() for module in modules for param in module.parameters()
-        )
-        self.logger.info(
-            f"Model parameter count: {total_params / 1e6:.2f}M, pp_stage={mpu.get_pipeline_model_parallel_rank()}, vpp_chunks={len(self.model)}"
-        )
-
-        if self.config.disable_dropout:
-            for model in self.model:
-                disable_dropout_in_model(model)
-
-        primary_model = self.model[0]
-        model_config = get_model_config(primary_model)
-        # NOTE: It is recommended to set this option to True for RL training on MoE models for stability.
-        if self.mcore_config.use_deterministic_algorithms:
-            set_deterministic_algorithms(model_config)
-
-        # Set vp_stage for DDP models
-        for i, model_chunk in enumerate(self.model):
-            if (
-                isinstance(model_chunk, DDP)
-                and self.mcore_config.virtual_pipeline_parallel_size > 1
-            ):
-                vp_stage = getattr(model_chunk.module, "vp_stage", None)
-                self.logger.info(f"Setting vp_stage {vp_stage} for model chunk {i}.")
-                setattr(model_chunk, "vp_stage", vp_stage)
-
-        if self.mcore_config.ddp.overlap_grad_reduce and isinstance(primary_model, DDP):
-            model_config.no_sync_func = [
-                model_chunk.no_sync for model_chunk in self.model
-            ]
-            if len(self.model) == 1:
-                model_config.no_sync_func = model_config.no_sync_func[0]
-
-        if (
-            self.mcore_config.ddp.overlap_param_gather
-            and self.mcore_config.ddp.align_param_gather
-        ):
-            model_config.param_sync_func = [
-                model_chunk.start_param_sync for model_chunk in self.model
-            ]
-            if len(self.model) == 1:
-                model_config.param_sync_func = model_config.param_sync_func[0]
-        model_config.finalize_model_grads_func = finalize_model_grads
-        self._create_optimizer(ft_spec)
-        self._initialized = True
+        self.logger.info("MindSpeed-LLM modeling_mode=spec is enabled.")
+        return self._initialize_spec_mode(addr=addr, ft_spec=ft_spec, **kwargs)
 
     @property
     def initialized(self) -> bool:
@@ -543,6 +405,8 @@ class MindSpeedLLMRuntime(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
+        if self.mindspeed_llm_config.modeling_mode == "spec":
+            return _ms_forward_backward_batch(self, mb_list, process_output_fn, forward_only)
         self._ensure_ready()
 
         def forward_step(batch_iter, model):
@@ -1192,27 +1056,34 @@ class MindSpeedLLMRuntime(TrainEngine):
         dist.barrier(group=self.cpu_group)
 
     def _patch_mindspeed(self, parallel_strategy: ParallelStrategy):
-        from mindspeed.megatron_adaptor import repatch
+        del parallel_strategy
 
-        config = self.mindspeed_config.as_dict()
-        megatron_config = self.mcore_config
-        config_overrides = {
-            "context_parallel_size": getattr(
-                parallel_strategy, "context_parallel_size", 1
-            ),
-            "expert_model_parallel_size": getattr(
-                parallel_strategy, "expert_model_parallel_size", 1
-            ),
-            "tensor_model_parallel_size": getattr(
-                parallel_strategy, "tensor_parallel_size", 1
-            ),
-            "recompute_method": megatron_config.recompute_method,
-            "recompute_granularity": megatron_config.recompute_granularity,
-            "recompute_num_layers": megatron_config.recompute_num_layers,
-        }
+    def _rebind_preimported_moe_symbols(self) -> None:
+        return _ms_rebind_preimported_moe_symbols(self)
 
-        config.update(config_overrides)
-        repatch(config)
+    def _log_moe_binding_diagnostics(self) -> None:
+        return _ms_log_moe_binding_diagnostics(self)
+
+    def _log_npu_gmm_dispatch_diagnostics(self) -> None:
+        return _ms_log_npu_gmm_dispatch_diagnostics(self)
+
+    def _validate_grouped_gemm_patch(self) -> None:
+        return _ms_validate_grouped_gemm_patch(self)
+
+    def _set_mindspeed_runtime_context(self, mb: dict[str, Any]) -> None:
+        return _ms_set_mindspeed_runtime_context(self, mb)
+
+    def _initialize_spec_mode(self, addr: str | None, ft_spec: "FinetuneSpec", **kwargs):
+        return _ms_initialize_spec_mode(self, addr=addr, ft_spec=ft_spec, **kwargs)
+
+    def _load_model_from_hf_via_hf2mg(self, path: str) -> None:
+        return _ms_load_model_from_hf_via_hf2mg(self, path)
+
+    def _validate_runtime_parallel_alignment(self, ms_args) -> None:
+        return _ms_validate_runtime_parallel_alignment(self, ms_args)
+
+    def _is_readable_hf2mg_cache(self, cache_root: str) -> bool:
+        return _ms_is_readable_hf2mg_cache(self, cache_root)
 
     def _save_model_to_hf(
         self,
@@ -1221,36 +1092,15 @@ class MindSpeedLLMRuntime(TrainEngine):
         processor: Any | None = None,
         base_model_path: str | None = None,
     ) -> None:
-        assert self.model is not None, "Model is not initialized."
-        os.makedirs(path, exist_ok=True)
-
-        save_weights_to_hf_with_mbridge_fast(
-            bridge=self.bridge,
-            models=self.model,
-            weights_path=path,
-            base_model_path=base_model_path,
-            max_shard_size_byte=int(3e9),
-            max_workers=None,
-            is_critic=self.config.is_critic,
+        del path, tokenizer, processor, base_model_path
+        raise RuntimeError(
+            "MindSpeed-LLM backend is spec-only and does not support mbridge HF save path."
         )
 
-        if dist.get_rank() == 0:
-            if tokenizer is not None:
-                tokenizer.save_pretrained(path)
-            if processor is not None:
-                processor.save_pretrained(path)
-
-        current_platform.synchronize()
-        dist.barrier(group=self.cpu_group)
-
     def _load_model_from_hf(self, path: str) -> None:
-        assert self.model is not None, "Model is not initialized."
-        load_weights_from_hf_with_mbridge_fast(
-            bridge=self.bridge,
-            models=self.model,
-            weights_path=path,
-            max_workers=None,
-            is_critic=self.config.is_critic,
+        del path
+        raise RuntimeError(
+            "MindSpeed-LLM backend is spec-only and does not support mbridge HF load path."
         )
 
     def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
@@ -1363,18 +1213,6 @@ class MindSpeedLLMRuntime(TrainEngine):
 # =============================================================================
 # Algorithm-specific Megatron Engines
 # =============================================================================
-
-_ORIG_MS_RUNTIME_INIT = MindSpeedLLMRuntime.__init__
-_ORIG_MS_RUNTIME_INITIALIZE = MindSpeedLLMRuntime.initialize
-
-
-def _ms_init(self, config: TrainEngineConfig):
-    _ORIG_MS_RUNTIME_INIT(self, config)
-    self.mindspeed_llm_config = config.mindspeed_llm
-    self._mindspeed_llm_argv = list(sys.argv)
-    self.mindspeed_llm_args = None
-    self.logger = logging.getLogger("MindSpeedLLMRuntime")
-
 
 def _ms_patch_mindspeed(self, parallel_strategy: ParallelStrategy):
     del parallel_strategy
@@ -1555,19 +1393,6 @@ def _ms_forward_backward_batch(self, mb_list, process_output_fn, forward_only: b
     )
 
 
-def _ms_initialize(self, addr, ft_spec, *args, **kwargs):
-    if self.mindspeed_llm_config.stage != "sft":
-        raise NotImplementedError("MindSpeed-LLM backend currently supports stage='sft' only.")
-    if self.mindspeed_llm_config.modeling_mode == "spec":
-        self.logger.info("MindSpeed-LLM modeling_mode=spec is enabled.")
-        return self._initialize_spec_mode(addr=addr, ft_spec=ft_spec, **kwargs)
-    if self.mindspeed_llm_config.modeling_mode != "mbridge":
-        raise ValueError(
-            f"Invalid mindspeed_llm.modeling_mode: {self.mindspeed_llm_config.modeling_mode}"
-        )
-    return _ORIG_MS_RUNTIME_INITIALIZE(self, addr, ft_spec, *args, **kwargs)
-
-
 def _ms_initialize_spec_mode(self, addr: str | None, ft_spec: "FinetuneSpec", **kwargs):
     try:
         self.seed = get_seed()
@@ -1721,22 +1546,6 @@ def _ms_is_readable_hf2mg_cache(self, cache_root: str) -> bool:
         if name.startswith("mp_rank_") and os.path.isfile(os.path.join(iter_dir, name, "model_optim_rng.pt")):
             return True
     return False
-
-
-MindSpeedLLMRuntime.__init__ = _ms_init
-MindSpeedLLMRuntime._patch_mindspeed = _ms_patch_mindspeed
-MindSpeedLLMRuntime.create_process_group = _ms_create_process_group
-MindSpeedLLMRuntime._rebind_preimported_moe_symbols = _ms_rebind_preimported_moe_symbols
-MindSpeedLLMRuntime._log_moe_binding_diagnostics = _ms_log_moe_binding_diagnostics
-MindSpeedLLMRuntime._log_npu_gmm_dispatch_diagnostics = _ms_log_npu_gmm_dispatch_diagnostics
-MindSpeedLLMRuntime._validate_grouped_gemm_patch = _ms_validate_grouped_gemm_patch
-MindSpeedLLMRuntime._set_mindspeed_runtime_context = _ms_set_mindspeed_runtime_context
-MindSpeedLLMRuntime.forward_backward_batch = _ms_forward_backward_batch
-MindSpeedLLMRuntime.initialize = _ms_initialize
-MindSpeedLLMRuntime._initialize_spec_mode = _ms_initialize_spec_mode
-MindSpeedLLMRuntime._load_model_from_hf_via_hf2mg = _ms_load_model_from_hf_via_hf2mg
-MindSpeedLLMRuntime._validate_runtime_parallel_alignment = _ms_validate_runtime_parallel_alignment
-MindSpeedLLMRuntime._is_readable_hf2mg_cache = _ms_is_readable_hf2mg_cache
 
 
 class MindSpeedLLMPPOActorRuntime(MindSpeedLLMRuntime):
