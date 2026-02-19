@@ -1182,15 +1182,7 @@ class MindSpeedLLMRuntime(TrainEngine):
         self.device = torch.device(int(os.environ["LOCAL_RANK"]))
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
-        self.is_pp_head = (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-            and mpu.get_tensor_model_parallel_rank() == 0
-        )
-        self.weight_update_group_name = f"update_weight_group_{mpu.get_pipeline_model_parallel_rank()}"
-        self.engine_lock = DistributedLock("train_engine_lock")
         self.alloc_mode = kwargs.get("alloc_mode", None)
-        self.tokenizer = load_hf_tokenizer(self.config.path)
-        self.hf_config = AutoConfig.from_pretrained(self.config.path, trust_remote_code=True)
 
         old_argv = sys.argv
         try:
@@ -1206,10 +1198,18 @@ class MindSpeedLLMRuntime(TrainEngine):
 
         args = get_args()
         self.mindspeed_llm_args = args
+        self.is_pp_head = (
+            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+            and mpu.get_tensor_model_parallel_rank() == 0
+        )
+        self.weight_update_group_name = f"update_weight_group_{mpu.get_pipeline_model_parallel_rank()}"
+        self.engine_lock = DistributedLock("train_engine_lock")
         self.logger = logging.getLogger(f"[MindSpeedLLMRuntime Rank {torch.distributed.get_rank()}]")
         self._init_context_and_model_parallel_group()
         self._cpu_group = torch.distributed.new_group(backend="gloo")
         self.process_group_initialized = True
+        self.tokenizer = load_hf_tokenizer(self.config.path)
+        self.hf_config = AutoConfig.from_pretrained(self.config.path, trust_remote_code=True)
         self._rebind_preimported_moe_symbols()
         self._log_moe_binding_diagnostics()
         self._log_npu_gmm_dispatch_diagnostics()
