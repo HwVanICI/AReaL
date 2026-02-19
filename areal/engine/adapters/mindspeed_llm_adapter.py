@@ -58,18 +58,6 @@ def _build_base_cli_tokens(
     ]
 
 
-def parse_extra_cli_args(
-    *,
-    extra_cli_args: str,
-    backend_cfg: MindSpeedLLMEngineConfig,
-    parallel_strategy: ParallelStrategy,
-) -> tuple[list[str], dict[str, str | bool]]:
-    del backend_cfg, parallel_strategy
-    tokens = shlex.split(extra_cli_args or "", posix=True)
-    explicit_values = _extract_explicit_values(tokens)
-    return tokens, explicit_values
-
-
 def validate_parallel_consistency(
     *,
     explicit_values: dict[str, str | bool],
@@ -112,16 +100,13 @@ def validate_parallel_consistency(
         )
 
 
-def build_mindspeed_llm_argv(
+def _build_mindspeed_llm_argv(
     *,
     backend_cfg: MindSpeedLLMEngineConfig,
     parallel_strategy: ParallelStrategy,
 ) -> list[str]:
-    extra_tokens, explicit_values = parse_extra_cli_args(
-        extra_cli_args=backend_cfg.extra_cli_args,
-        backend_cfg=backend_cfg,
-        parallel_strategy=parallel_strategy,
-    )
+    extra_tokens = shlex.split(backend_cfg.extra_cli_args or "", posix=True)
+    explicit_values = _extract_explicit_values(extra_tokens)
 
     validate_parallel_consistency(
         explicit_values=explicit_values,
@@ -145,10 +130,10 @@ def apply_mindspeed_llm_patches(
         if importlib.util.find_spec(package) is None:
             raise RuntimeError(
                 f"Required package '{package}' is not installed or importable. "
-                "MindSpeed-LLM backend requires mindspeed + mindspeed_llm."
+            "MindSpeed-LLM backend requires mindspeed + mindspeed_llm."
             )
 
-    argv = build_mindspeed_llm_argv(
+    argv = _build_mindspeed_llm_argv(
         backend_cfg=backend_cfg,
         parallel_strategy=parallel_strategy,
     )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import shlex
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -13,6 +12,7 @@ from areal.api.alloc_mode import ParallelStrategy
 from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
 from areal.api.engine_api import InferenceEngine, TrainEngine
 from areal.api.io_struct import DeviceRuntimeInfo, SaveLoadMeta, WeightUpdateMeta
+from areal.engine.adapters.mindspeed_llm_adapter import apply_mindspeed_llm_patches
 
 
 class MindSpeedLLMEngine(TrainEngine):
@@ -26,15 +26,18 @@ class MindSpeedLLMEngine(TrainEngine):
     def __init__(self, config: TrainEngineConfig):
         self.config = config
         self._runtime = None
-        self._init_runtime_with_patched_argv()
+        self._parallel_strategy: ParallelStrategy | None = None
 
     def _build_runtime_argv(self) -> list[str]:
-        ms_cfg = self.config.mindspeed_llm
-        tokens = ["--use-mcore-models", "--stage", str(ms_cfg.stage)]
-        tokens.extend(shlex.split(ms_cfg.extra_cli_args or "", posix=True))
-        return ["areal-mindspeed-llm", *tokens]
+        strategy = self._parallel_strategy or ParallelStrategy()
+        return apply_mindspeed_llm_patches(
+            backend_cfg=self.config.mindspeed_llm,
+            parallel_strategy=strategy,
+        )
 
     def _init_runtime_with_patched_argv(self) -> None:
+        if self._runtime is not None:
+            return
         old_argv = sys.argv
         try:
             sys.argv = self._build_runtime_argv()
@@ -54,9 +57,12 @@ class MindSpeedLLMEngine(TrainEngine):
         return getattr(self._rt, name)
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
+        self._parallel_strategy = parallel_strategy
+        self._init_runtime_with_patched_argv()
         return self._rt.create_process_group(parallel_strategy)
 
     def initialize(self, *args, **kwargs):
+        self._init_runtime_with_patched_argv()
         return self._rt.initialize(*args, **kwargs)
 
     @property
