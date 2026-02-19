@@ -33,7 +33,6 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoConfig, PretrainedConfig
 
 from areal.api.alloc_mode import (
-    AllocationMode,
     MegatronParallelStrategy,
     ParallelStrategy,
 )
@@ -60,7 +59,6 @@ from areal.platforms import current_platform
 from areal.utils import logging, name_resolve, names, perf_tracer, stats_tracker
 from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
 from areal.utils.data import (
-    MicroBatchItem,
     MicroBatchList,
     amend_position_ids,
     broadcast_tensor,
@@ -405,14 +403,11 @@ class MindSpeedLLMRuntime(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
-        if self.mindspeed_llm_config.modeling_mode == "spec":
-            return _ms_forward_backward_batch(self, mb_list, process_output_fn, forward_only)
         self._ensure_ready()
-
         def forward_step(batch_iter, model):
-            mb_input: MicroBatchItem = next(batch_iter)
-
+            mb_input = next(batch_iter)
             cu_seqlens = mb_input.padded_mb.get("cu_seqlens", None)
+            self._set_mindspeed_runtime_context(mb_input.padded_mb)
             output = packed_context_parallel_forward(model, mb_input.padded_mb)
 
             def _process_output(input_, output_):
@@ -421,7 +416,6 @@ class MindSpeedLLMRuntime(TrainEngine):
                     loss = torch.tensor(1.0, device=output_.device)
                 return loss, {}
 
-            model_vp_stage = getattr(model, "vp_stage", 0)
             if mpu.is_pipeline_last_stage(ignore_virtual=False):
                 output = unpad_logits(
                     output,
@@ -432,20 +426,16 @@ class MindSpeedLLMRuntime(TrainEngine):
             return output, functools.partial(_process_output, mb_input.orig_mb)
 
         forward_backward_func = get_forward_backward_func()
-        with trace_scope("megatron_engine.forward_backward"):
-            if len(self.model) > 1:
-                data_iterator = [iter(mb_list) for _ in range(len(self.model))]
-            else:
-                data_iterator = iter(mb_list)
-            forward_backward_func(
-                forward_step_func=forward_step,
-                data_iterator=data_iterator,
-                model=self.model if len(self.model) > 1 else self.model[0],
-                num_microbatches=len(mb_list),
-                seq_length=mb_list.max_seqlen,  # no use when input_shapes was set
-                micro_batch_size=1,  # no use when input_shapes was set
-                forward_only=forward_only,
-            )
+        data_iterator = [iter(mb_list) for _ in range(len(self.model))] if len(self.model) > 1 else iter(mb_list)
+        forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=self.model if len(self.model) > 1 else self.model[0],
+            num_microbatches=len(mb_list),
+            seq_length=mb_list.max_seqlen,
+            micro_batch_size=1,
+            forward_only=forward_only,
+        )
 
     def train_batch(
         self,
@@ -1055,35 +1045,281 @@ class MindSpeedLLMRuntime(TrainEngine):
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
 
-    def _patch_mindspeed(self, parallel_strategy: ParallelStrategy):
-        del parallel_strategy
-
     def _rebind_preimported_moe_symbols(self) -> None:
-        return _ms_rebind_preimported_moe_symbols(self)
+        experts_mod = sys.modules.get("megatron.core.transformer.moe.experts")
+        moe_specs_mod = sys.modules.get("megatron.core.models.gpt.moe_module_specs")
+        if experts_mod is None or moe_specs_mod is None:
+            return
+        for name in ("GroupedMLP", "SequentialMLP", "TEGroupedMLP"):
+            if hasattr(experts_mod, name):
+                setattr(moe_specs_mod, name, getattr(experts_mod, name))
+        gg_mod = sys.modules.get("megatron.core.transformer.moe.grouped_gemm_util")
+        if gg_mod is None:
+            return
+        from mindspeed.core.fusions.grouped_matmul import Ops as MindSpeedGroupedMatmulOps
+        from mindspeed.core.fusions.grouped_matmul import (
+            assert_grouped_gemm_is_available as ms_assert_grouped_gemm_is_available,
+        )
+        from mindspeed.core.fusions.grouped_matmul import (
+            grouped_gemm_is_available as ms_grouped_gemm_is_available,
+        )
+
+        setattr(gg_mod, "ops", MindSpeedGroupedMatmulOps)
+        setattr(gg_mod, "grouped_gemm_is_available", ms_grouped_gemm_is_available)
+        setattr(
+            gg_mod,
+            "assert_grouped_gemm_is_available",
+            ms_assert_grouped_gemm_is_available,
+        )
 
     def _log_moe_binding_diagnostics(self) -> None:
-        return _ms_log_moe_binding_diagnostics(self)
+        try:
+            import megatron.core.transformer.moe.experts as experts_mod
+            import megatron.core.transformer.moe.grouped_gemm_util as gg_mod
+            from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+
+            grouped_mlp = getattr(experts_mod, "GroupedMLP", None)
+            spec_grouped_mlp = get_moe_module_spec.__globals__.get("GroupedMLP", None)
+            gg_ops = getattr(gg_mod, "ops", None)
+            self.logger.info(
+                "MindSpeed MoE binding: experts.GroupedMLP=%s.%s ; "
+                "moe_module_specs.GroupedMLP=%s.%s ; gg.ops=%s.%s",
+                getattr(grouped_mlp, "__module__", None),
+                getattr(grouped_mlp, "__name__", None),
+                getattr(spec_grouped_mlp, "__module__", None),
+                getattr(spec_grouped_mlp, "__name__", None),
+                getattr(gg_ops, "__module__", None),
+                getattr(gg_ops, "__name__", None),
+            )
+        except Exception as e:
+            self.logger.warning("MindSpeed MoE binding diagnostics failed: %s", e)
 
     def _log_npu_gmm_dispatch_diagnostics(self) -> None:
-        return _ms_log_npu_gmm_dispatch_diagnostics(self)
+        try:
+            import mindspeed.ops.gmm as gmm_mod
+
+            npu_gmm = getattr(gmm_mod, "npu_gmm", None)
+            self.logger.info(
+                "MindSpeed GMM symbol: mindspeed.ops.gmm=%s ; npu_gmm=%s.%s",
+                getattr(gmm_mod, "__file__", None),
+                getattr(npu_gmm, "__module__", None),
+                getattr(npu_gmm, "__name__", None),
+            )
+        except Exception as e:
+            self.logger.warning("MindSpeed GMM python import diagnostics failed: %s", e)
+
+        try:
+            has_privateuse1_tensor = torch._C._dispatch_has_kernel_for_dispatch_key(
+                "mindspeed::npu_gmm.Tensor", "PrivateUse1"
+            )
+            has_privateuse1_list = torch._C._dispatch_has_kernel_for_dispatch_key(
+                "mindspeed::npu_gmm.List", "PrivateUse1"
+            )
+            has_autograd_privateuse1_tensor = torch._C._dispatch_has_kernel_for_dispatch_key(
+                "mindspeed::npu_gmm.Tensor", "AutogradPrivateUse1"
+            )
+            has_autograd_privateuse1_list = torch._C._dispatch_has_kernel_for_dispatch_key(
+                "mindspeed::npu_gmm.List", "AutogradPrivateUse1"
+            )
+            self.logger.info(
+                "MindSpeed GMM dispatch: npu_gmm.Tensor PrivateUse1=%s AutogradPrivateUse1=%s ; "
+                "npu_gmm.List PrivateUse1=%s AutogradPrivateUse1=%s",
+                has_privateuse1_tensor,
+                has_autograd_privateuse1_tensor,
+                has_privateuse1_list,
+                has_autograd_privateuse1_list,
+            )
+        except Exception as e:
+            self.logger.warning("MindSpeed GMM dispatch diagnostics failed: %s", e)
 
     def _validate_grouped_gemm_patch(self) -> None:
-        return _ms_validate_grouped_gemm_patch(self)
+        args = get_args()
+        if not getattr(args, "moe_grouped_gemm", False):
+            return
+        if getattr(args, "transformer_impl", None) != "local":
+            return
+        from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+
+        grouped_mlp_cls = get_moe_module_spec.__globals__.get("GroupedMLP", None)
+        grouped_mlp_module = getattr(grouped_mlp_cls, "__module__", "")
+        if not grouped_mlp_module.startswith("mindspeed."):
+            raise RuntimeError(
+                "MindSpeed grouped_gemm patch is not effective: "
+                f"GroupedMLP resolves to {grouped_mlp_module}.{getattr(grouped_mlp_cls, '__name__', 'Unknown')}."
+            )
 
     def _set_mindspeed_runtime_context(self, mb: dict[str, Any]) -> None:
-        return _ms_set_mindspeed_runtime_context(self, mb)
+        from mindspeed.core.context_parallel.get_batch_utils import set_actual_seq_len
+        from mindspeed.utils import set_position_ids
+        from mindspeed_llm.training.utils import compute_actual_seq_len
+
+        cu_seqlens = mb.get("cu_seqlens", None)
+        if cu_seqlens is not None:
+            set_actual_seq_len(cu_seqlens.to(dtype=torch.int64))
+        else:
+            position_ids = mb.get("position_ids", None)
+            if torch.is_tensor(position_ids):
+                set_actual_seq_len(compute_actual_seq_len(position_ids))
+
+        position_ids = mb.get("position_ids", None)
+        if position_ids is None:
+            return
+        args = get_args()
+        if getattr(args, "reset_position_ids", False) and position_ids.ndim == 2:
+            set_position_ids(position_ids.transpose(0, 1).contiguous())
+        else:
+            set_position_ids(position_ids)
 
     def _initialize_spec_mode(self, addr: str | None, ft_spec: "FinetuneSpec", **kwargs):
-        return _ms_initialize_spec_mode(self, addr=addr, ft_spec=ft_spec, **kwargs)
+        try:
+            self.seed = get_seed()
+        except ValueError:
+            self.seed = 42
+        assert addr is None
+        if is_tms_enabled():
+            torch_memory_saver.hook_mode = "preload"
+        current_platform.set_device(int(os.environ["LOCAL_RANK"]))
+        self.device = torch.device(int(os.environ["LOCAL_RANK"]))
+        self.rank = int(os.environ["RANK"])
+        self.world_size = int(os.environ["WORLD_SIZE"])
+        self.is_pp_head = (
+            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+            and mpu.get_tensor_model_parallel_rank() == 0
+        )
+        self.weight_update_group_name = f"update_weight_group_{mpu.get_pipeline_model_parallel_rank()}"
+        self.engine_lock = DistributedLock("train_engine_lock")
+        self.alloc_mode = kwargs.get("alloc_mode", None)
+        self.tokenizer = load_hf_tokenizer(self.config.path)
+        self.hf_config = AutoConfig.from_pretrained(self.config.path, trust_remote_code=True)
+
+        old_argv = sys.argv
+        try:
+            sys.argv = self._mindspeed_llm_argv
+            initialize_megatron(
+                extra_args_provider=None,
+                args_defaults={},
+                ignore_unknown_args=False,
+                allow_no_cuda=True,
+            )
+        finally:
+            sys.argv = old_argv
+
+        args = get_args()
+        self.mindspeed_llm_args = args
+        self.logger = logging.getLogger(f"[MindSpeedLLMRuntime Rank {torch.distributed.get_rank()}]")
+        self._init_context_and_model_parallel_group()
+        self._cpu_group = torch.distributed.new_group(backend="gloo")
+        self.process_group_initialized = True
+        self._rebind_preimported_moe_symbols()
+        self._log_moe_binding_diagnostics()
+        self._log_npu_gmm_dispatch_diagnostics()
+
+        self.tf_config = core_transformer_config_from_args(args)
+        self._validate_grouped_gemm_patch()
+        self.tf_config = configure_pipeline_layer_splits(self.parallel_strategy, self.hf_config, self.tf_config)
+
+        pre_process = mpu.is_pipeline_first_stage()
+        post_process = mpu.is_pipeline_last_stage()
+        with self.device:
+            model = create_gpt_model_from_mindspeed_args(
+                pre_process=pre_process,
+                post_process=post_process,
+            )
+            if self.config.is_critic:
+                model.output_layer = _ValueHead(
+                    input_size=self.tf_config.hidden_size,
+                    sequence_parallel=self.tf_config.sequence_parallel,
+                    dtype=self.tf_config.params_dtype,
+                )
+                model.vocab_size = 1
+            if self.mcore_config.wrap_with_ddp:
+                ddp_config = MCoreDDPConfig(**dataclasses.asdict(self.mcore_config.ddp))
+                model = DDP(
+                    config=self.tf_config,
+                    ddp_config=ddp_config,
+                    module=model,
+                    disable_bucketing=False,
+                )
+        self.model = _MegatronModelList([model])
+
+        with self.device:
+            self._load_model_from_hf_via_hf2mg(self.config.path)
+
+        primary_model = self.model[0]
+        model_config = get_model_config(primary_model)
+        if self.mcore_config.use_deterministic_algorithms:
+            set_deterministic_algorithms(model_config)
+        model_config.finalize_model_grads_func = finalize_model_grads
+        self._create_optimizer(ft_spec)
+        self._initialized = True
 
     def _load_model_from_hf_via_hf2mg(self, path: str) -> None:
-        return _ms_load_model_from_hf_via_hf2mg(self, path)
+        from megatron.training.checkpointing import load_checkpoint
+        from mindspeed_llm.training.checkpointing import _convert_weights_if_needed
+        from mindspeed_llm.training.utils import is_shared_path
+
+        ms_args = self.mindspeed_llm_args
+        if ms_args is None:
+            raise RuntimeError("MindSpeed-LLM args are not initialized.")
+        self._validate_runtime_parallel_alignment(ms_args)
+
+        is_hf_dir = os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))
+        if is_hf_dir:
+            setattr(ms_args, "enable_hf2mg_convert", True)
+            setattr(ms_args, "load", path)
+            if not getattr(ms_args, "mg_save_dir", None):
+                tp = int(getattr(ms_args, "tensor_model_parallel_size", 1))
+                pp = int(getattr(ms_args, "pipeline_model_parallel_size", 1))
+                ep = int(getattr(ms_args, "expert_model_parallel_size", 1))
+                etp = int(getattr(ms_args, "expert_tensor_parallel_size", 1))
+                setattr(ms_args, "mg_save_dir", os.path.join(path, f"areal_hf2mg_tp{tp}pp{pp}ep{ep}etp{etp}"))
+            if not self._is_readable_hf2mg_cache(ms_args.mg_save_dir):
+                os.makedirs(ms_args.mg_save_dir, exist_ok=True)
+                _convert_weights_if_needed(ms_args, is_shared_path(ms_args.mg_save_dir))
+            load_path = ms_args.mg_save_dir
+        else:
+            load_path = path
+        setattr(ms_args, "load", load_path)
+        load_checkpoint(self.model, None, None, strict=True)
 
     def _validate_runtime_parallel_alignment(self, ms_args) -> None:
-        return _ms_validate_runtime_parallel_alignment(self, ms_args)
+        checks = [
+            ("tensor_model_parallel_size", self.parallel_strategy.tensor_parallel_size, "tp"),
+            ("pipeline_model_parallel_size", self.parallel_strategy.pipeline_parallel_size, "pp"),
+            ("expert_model_parallel_size", self.parallel_strategy.expert_parallel_size, "ep"),
+            ("expert_tensor_parallel_size", self.parallel_strategy.expert_tensor_parallel_size, "etp"),
+            ("context_parallel_size", self.parallel_strategy.context_parallel_size, "cp"),
+        ]
+        mismatches = []
+        for key, expected, short in checks:
+            raw = getattr(ms_args, key, None)
+            parsed = int(raw) if raw is not None else None
+            if parsed in (None, expected):
+                continue
+            mismatches.append(f"{short}: allocation_mode={expected}, megatron_args={parsed}")
+        if mismatches:
+            raise ValueError(
+                "MindSpeed-LLM runtime parallel args mismatch with allocation_mode: " + "; ".join(mismatches)
+            )
 
     def _is_readable_hf2mg_cache(self, cache_root: str) -> bool:
-        return _ms_is_readable_hf2mg_cache(self, cache_root)
+        if not os.path.isdir(cache_root):
+            return False
+        tracker = os.path.join(cache_root, "latest_checkpointed_iteration.txt")
+        if not os.path.isfile(tracker):
+            return False
+        try:
+            with open(tracker, encoding="utf-8") as f:
+                iteration = int(f.read().strip())
+        except (OSError, ValueError):
+            return False
+        iter_dir = os.path.join(cache_root, f"iter_{iteration:07d}")
+        if not os.path.isdir(iter_dir):
+            return False
+        for name in os.listdir(iter_dir):
+            if name.startswith("mp_rank_") and os.path.isfile(os.path.join(iter_dir, name, "model_optim_rng.pt")):
+                return True
+        return False
 
     def _save_model_to_hf(
         self,
@@ -1208,345 +1444,6 @@ class MindSpeedLLMRuntime(TrainEngine):
         else:
             values = output.squeeze(-1)
             return values
-
-
-# =============================================================================
-# Algorithm-specific Megatron Engines
-# =============================================================================
-
-def _ms_patch_mindspeed(self, parallel_strategy: ParallelStrategy):
-    del parallel_strategy
-
-
-def _ms_create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
-    if parallel_strategy is None:
-        parallel_strategy = ParallelStrategy()
-    self.parallel_strategy = self._make_parallel_strategy(parallel_strategy)
-    self.process_group_initialized = False
-
-
-def _ms_rebind_preimported_moe_symbols(self) -> None:
-    experts_mod = sys.modules.get("megatron.core.transformer.moe.experts")
-    moe_specs_mod = sys.modules.get("megatron.core.models.gpt.moe_module_specs")
-    if experts_mod is None or moe_specs_mod is None:
-        return
-    for name in ("GroupedMLP", "SequentialMLP", "TEGroupedMLP"):
-        if hasattr(experts_mod, name):
-            setattr(moe_specs_mod, name, getattr(experts_mod, name))
-    gg_mod = sys.modules.get("megatron.core.transformer.moe.grouped_gemm_util")
-    if gg_mod is None:
-        return
-    from mindspeed.core.fusions.grouped_matmul import Ops as MindSpeedGroupedMatmulOps
-    from mindspeed.core.fusions.grouped_matmul import (
-        assert_grouped_gemm_is_available as ms_assert_grouped_gemm_is_available,
-    )
-    from mindspeed.core.fusions.grouped_matmul import (
-        grouped_gemm_is_available as ms_grouped_gemm_is_available,
-    )
-
-    setattr(gg_mod, "ops", MindSpeedGroupedMatmulOps)
-    setattr(gg_mod, "grouped_gemm_is_available", ms_grouped_gemm_is_available)
-    setattr(
-        gg_mod,
-        "assert_grouped_gemm_is_available",
-        ms_assert_grouped_gemm_is_available,
-    )
-
-
-def _ms_log_moe_binding_diagnostics(self) -> None:
-    try:
-        import megatron.core.transformer.moe.experts as experts_mod
-        import megatron.core.transformer.moe.grouped_gemm_util as gg_mod
-        from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
-
-        grouped_mlp = getattr(experts_mod, "GroupedMLP", None)
-        spec_grouped_mlp = get_moe_module_spec.__globals__.get("GroupedMLP", None)
-        gg_ops = getattr(gg_mod, "ops", None)
-        self.logger.info(
-            "MindSpeed MoE binding: experts.GroupedMLP=%s.%s ; "
-            "moe_module_specs.GroupedMLP=%s.%s ; gg.ops=%s.%s",
-            getattr(grouped_mlp, "__module__", None),
-            getattr(grouped_mlp, "__name__", None),
-            getattr(spec_grouped_mlp, "__module__", None),
-            getattr(spec_grouped_mlp, "__name__", None),
-            getattr(gg_ops, "__module__", None),
-            getattr(gg_ops, "__name__", None),
-        )
-    except Exception as e:
-        self.logger.warning("MindSpeed MoE binding diagnostics failed: %s", e)
-
-
-def _ms_log_npu_gmm_dispatch_diagnostics(self) -> None:
-    try:
-        import mindspeed.ops.gmm as gmm_mod
-
-        npu_gmm = getattr(gmm_mod, "npu_gmm", None)
-        self.logger.info(
-            "MindSpeed GMM symbol: mindspeed.ops.gmm=%s ; npu_gmm=%s.%s",
-            getattr(gmm_mod, "__file__", None),
-            getattr(npu_gmm, "__module__", None),
-            getattr(npu_gmm, "__name__", None),
-        )
-    except Exception as e:
-        self.logger.warning("MindSpeed GMM python import diagnostics failed: %s", e)
-
-    try:
-        has_privateuse1_tensor = torch._C._dispatch_has_kernel_for_dispatch_key(
-            "mindspeed::npu_gmm.Tensor", "PrivateUse1"
-        )
-        has_privateuse1_list = torch._C._dispatch_has_kernel_for_dispatch_key(
-            "mindspeed::npu_gmm.List", "PrivateUse1"
-        )
-        has_autograd_privateuse1_tensor = torch._C._dispatch_has_kernel_for_dispatch_key(
-            "mindspeed::npu_gmm.Tensor", "AutogradPrivateUse1"
-        )
-        has_autograd_privateuse1_list = torch._C._dispatch_has_kernel_for_dispatch_key(
-            "mindspeed::npu_gmm.List", "AutogradPrivateUse1"
-        )
-        self.logger.info(
-            "MindSpeed GMM dispatch: npu_gmm.Tensor PrivateUse1=%s AutogradPrivateUse1=%s ; "
-            "npu_gmm.List PrivateUse1=%s AutogradPrivateUse1=%s",
-            has_privateuse1_tensor,
-            has_autograd_privateuse1_tensor,
-            has_privateuse1_list,
-            has_autograd_privateuse1_list,
-        )
-    except Exception as e:
-        self.logger.warning("MindSpeed GMM dispatch diagnostics failed: %s", e)
-
-
-def _ms_validate_grouped_gemm_patch(self) -> None:
-    args = get_args()
-    if not getattr(args, "moe_grouped_gemm", False):
-        return
-    if getattr(args, "transformer_impl", None) != "local":
-        return
-    from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
-
-    grouped_mlp_cls = get_moe_module_spec.__globals__.get("GroupedMLP", None)
-    grouped_mlp_module = getattr(grouped_mlp_cls, "__module__", "")
-    if not grouped_mlp_module.startswith("mindspeed."):
-        raise RuntimeError(
-            "MindSpeed grouped_gemm patch is not effective: "
-            f"GroupedMLP resolves to {grouped_mlp_module}.{getattr(grouped_mlp_cls, '__name__', 'Unknown')}."
-        )
-
-
-def _ms_set_mindspeed_runtime_context(self, mb: dict[str, Any]) -> None:
-    from mindspeed.core.context_parallel.get_batch_utils import set_actual_seq_len
-    from mindspeed.utils import set_position_ids
-    from mindspeed_llm.training.utils import compute_actual_seq_len
-
-    cu_seqlens = mb.get("cu_seqlens", None)
-    if cu_seqlens is not None:
-        set_actual_seq_len(cu_seqlens.to(dtype=torch.int64))
-    else:
-        position_ids = mb.get("position_ids", None)
-        if torch.is_tensor(position_ids):
-            set_actual_seq_len(compute_actual_seq_len(position_ids))
-
-    position_ids = mb.get("position_ids", None)
-    if position_ids is None:
-        return
-    args = get_args()
-    if getattr(args, "reset_position_ids", False) and position_ids.ndim == 2:
-        set_position_ids(position_ids.transpose(0, 1).contiguous())
-    else:
-        set_position_ids(position_ids)
-
-
-def _ms_forward_backward_batch(self, mb_list, process_output_fn, forward_only: bool = False):
-    self._ensure_ready()
-    from areal.utils.data import unpad_logits
-
-    def forward_step(batch_iter, model):
-        mb_input = next(batch_iter)
-        cu_seqlens = mb_input.padded_mb.get("cu_seqlens", None)
-        self._set_mindspeed_runtime_context(mb_input.padded_mb)
-        output = packed_context_parallel_forward(model, mb_input.padded_mb)
-
-        def _process_output(input_, output_):
-            loss = process_output_fn(output_, input_)
-            if loss is None:
-                loss = torch.tensor(1.0, device=output_.device)
-            return loss, {}
-
-        if mpu.is_pipeline_last_stage(ignore_virtual=False):
-            output = unpad_logits(
-                output,
-                padding_length=mb_input.padding_length,
-                cu_seqlens=cu_seqlens,
-                old_cu_seqlens=mb_input.old_cu_seqlens,
-            )
-        return output, functools.partial(_process_output, mb_input.orig_mb)
-
-    forward_backward_func = get_forward_backward_func()
-    data_iterator = [iter(mb_list) for _ in range(len(self.model))] if len(self.model) > 1 else iter(mb_list)
-    forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=self.model if len(self.model) > 1 else self.model[0],
-        num_microbatches=len(mb_list),
-        seq_length=mb_list.max_seqlen,
-        micro_batch_size=1,
-        forward_only=forward_only,
-    )
-
-
-def _ms_initialize_spec_mode(self, addr: str | None, ft_spec: "FinetuneSpec", **kwargs):
-    try:
-        self.seed = get_seed()
-    except ValueError:
-        self.seed = 42
-    assert addr is None
-    if is_tms_enabled():
-        torch_memory_saver.hook_mode = "preload"
-    current_platform.set_device(int(os.environ["LOCAL_RANK"]))
-    self.device = torch.device(int(os.environ["LOCAL_RANK"]))
-    self.rank = int(os.environ["RANK"])
-    self.world_size = int(os.environ["WORLD_SIZE"])
-    self.is_pp_head = (
-        mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-        and mpu.get_tensor_model_parallel_rank() == 0
-    )
-    self.weight_update_group_name = f"update_weight_group_{mpu.get_pipeline_model_parallel_rank()}"
-    self.engine_lock = DistributedLock("train_engine_lock")
-    self.alloc_mode = kwargs.get("alloc_mode", None)
-    self.tokenizer = load_hf_tokenizer(self.config.path)
-    self.hf_config = AutoConfig.from_pretrained(self.config.path, trust_remote_code=True)
-
-    old_argv = sys.argv
-    try:
-        sys.argv = self._mindspeed_llm_argv
-        initialize_megatron(
-            extra_args_provider=None,
-            args_defaults={},
-            ignore_unknown_args=False,
-            allow_no_cuda=True,
-        )
-    finally:
-        sys.argv = old_argv
-
-    args = get_args()
-    self.mindspeed_llm_args = args
-    self.logger = logging.getLogger(f"[MindSpeedLLMRuntime Rank {torch.distributed.get_rank()}]")
-    self._init_context_and_model_parallel_group()
-    self._cpu_group = torch.distributed.new_group(backend="gloo")
-    self.process_group_initialized = True
-    self._rebind_preimported_moe_symbols()
-    self._log_moe_binding_diagnostics()
-    self._log_npu_gmm_dispatch_diagnostics()
-
-    self.tf_config = core_transformer_config_from_args(args)
-    self._validate_grouped_gemm_patch()
-    self.tf_config = configure_pipeline_layer_splits(self.parallel_strategy, self.hf_config, self.tf_config)
-
-    pre_process = mpu.is_pipeline_first_stage()
-    post_process = mpu.is_pipeline_last_stage()
-    with self.device:
-        model = create_gpt_model_from_mindspeed_args(
-            pre_process=pre_process,
-            post_process=post_process,
-        )
-        if self.config.is_critic:
-            model.output_layer = _ValueHead(
-                input_size=self.tf_config.hidden_size,
-                sequence_parallel=self.tf_config.sequence_parallel,
-                dtype=self.tf_config.params_dtype,
-            )
-            model.vocab_size = 1
-        if self.mcore_config.wrap_with_ddp:
-            ddp_config = MCoreDDPConfig(**dataclasses.asdict(self.mcore_config.ddp))
-            model = DDP(
-                config=self.tf_config,
-                ddp_config=ddp_config,
-                module=model,
-                disable_bucketing=False,
-            )
-    self.model = _MegatronModelList([model])
-
-    with self.device:
-        self._load_model_from_hf_via_hf2mg(self.config.path)
-
-    primary_model = self.model[0]
-    model_config = get_model_config(primary_model)
-    if self.mcore_config.use_deterministic_algorithms:
-        set_deterministic_algorithms(model_config)
-    model_config.finalize_model_grads_func = finalize_model_grads
-    self._create_optimizer(ft_spec)
-    self._initialized = True
-
-
-def _ms_load_model_from_hf_via_hf2mg(self, path: str) -> None:
-    from megatron.training.checkpointing import load_checkpoint
-    from mindspeed_llm.training.checkpointing import _convert_weights_if_needed
-    from mindspeed_llm.training.utils import is_shared_path
-
-    ms_args = self.mindspeed_llm_args
-    if ms_args is None:
-        raise RuntimeError("MindSpeed-LLM args are not initialized.")
-    self._validate_runtime_parallel_alignment(ms_args)
-
-    is_hf_dir = os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))
-    if is_hf_dir:
-        setattr(ms_args, "enable_hf2mg_convert", True)
-        setattr(ms_args, "load", path)
-        if not getattr(ms_args, "mg_save_dir", None):
-            tp = int(getattr(ms_args, "tensor_model_parallel_size", 1))
-            pp = int(getattr(ms_args, "pipeline_model_parallel_size", 1))
-            ep = int(getattr(ms_args, "expert_model_parallel_size", 1))
-            etp = int(getattr(ms_args, "expert_tensor_parallel_size", 1))
-            setattr(ms_args, "mg_save_dir", os.path.join(path, f"areal_hf2mg_tp{tp}pp{pp}ep{ep}etp{etp}"))
-        if not self._is_readable_hf2mg_cache(ms_args.mg_save_dir):
-            os.makedirs(ms_args.mg_save_dir, exist_ok=True)
-            _convert_weights_if_needed(ms_args, is_shared_path(ms_args.mg_save_dir))
-        load_path = ms_args.mg_save_dir
-    else:
-        load_path = path
-    setattr(ms_args, "load", load_path)
-    load_checkpoint(self.model, None, None, strict=True)
-
-
-def _ms_validate_runtime_parallel_alignment(self, ms_args) -> None:
-    checks = [
-        ("tensor_model_parallel_size", self.parallel_strategy.tensor_parallel_size, "tp"),
-        ("pipeline_model_parallel_size", self.parallel_strategy.pipeline_parallel_size, "pp"),
-        ("expert_model_parallel_size", self.parallel_strategy.expert_parallel_size, "ep"),
-        ("expert_tensor_parallel_size", self.parallel_strategy.expert_tensor_parallel_size, "etp"),
-        ("context_parallel_size", self.parallel_strategy.context_parallel_size, "cp"),
-    ]
-    mismatches = []
-    for key, expected, short in checks:
-        raw = getattr(ms_args, key, None)
-        parsed = int(raw) if raw is not None else None
-        if parsed in (None, expected):
-            continue
-        mismatches.append(f"{short}: allocation_mode={expected}, megatron_args={parsed}")
-    if mismatches:
-        raise ValueError(
-            "MindSpeed-LLM runtime parallel args mismatch with allocation_mode: " + "; ".join(mismatches)
-        )
-
-
-def _ms_is_readable_hf2mg_cache(self, cache_root: str) -> bool:
-    if not os.path.isdir(cache_root):
-        return False
-    tracker = os.path.join(cache_root, "latest_checkpointed_iteration.txt")
-    if not os.path.isfile(tracker):
-        return False
-    try:
-        with open(tracker, encoding="utf-8") as f:
-            iteration = int(f.read().strip())
-    except (OSError, ValueError):
-        return False
-    iter_dir = os.path.join(cache_root, f"iter_{iteration:07d}")
-    if not os.path.isdir(iter_dir):
-        return False
-    for name in os.listdir(iter_dir):
-        if name.startswith("mp_rank_") and os.path.isfile(os.path.join(iter_dir, name, "model_optim_rng.pt")):
-            return True
-    return False
-
 
 class MindSpeedLLMPPOActorRuntime(MindSpeedLLMRuntime):
     def __init__(self, config: PPOActorConfig):
