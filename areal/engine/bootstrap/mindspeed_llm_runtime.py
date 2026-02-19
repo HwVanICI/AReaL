@@ -60,13 +60,6 @@ from areal.engine.bootstrap.mindspeed_llm_bootstrap import (
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
 from areal.models.mcore.hf_save import save_weights_to_hf_with_mbridge_fast
 from areal.models.mcore.registry import make_hf_and_mcore_config, make_mcore_model
-from areal.models.tree_attn.functional import (
-    _gather_packed_tree_logprobs,
-    gather_packed_tree_logprobs_entropy,
-    merge_packed_tree_results,
-)
-from areal.models.tree_attn.module import BLOCK_SIZE, patch_bridge_for_tree_training
-from areal.models.tree_attn.tree import build_packed_tree_batch
 from areal.platforms import current_platform
 from areal.utils import logging, name_resolve, names, perf_tracer, stats_tracker
 from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
@@ -184,7 +177,6 @@ class MindSpeedLLMRuntime(TrainEngine):
         self.seed: int = 0
         self.own_global_group: bool = False
         self.is_offload: bool = False
-        self.enable_tree_training: bool = self.config.enable_tree_training
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         if parallel_strategy is None:
@@ -257,39 +249,38 @@ class MindSpeedLLMRuntime(TrainEngine):
 
         self.tokenizer = load_hf_tokenizer(self.config.path)
 
-        with patch_bridge_for_tree_training(self.enable_tree_training):
-            self.bridge = mbridge.AutoBridge.from_pretrained(self.config.path)
-            self.bridge.dtype = self.dtype
-            # Set gradient checkpointing options
-            if self.config.gradient_checkpointing:
-                self.bridge.set_extra_args(
-                    recompute_granularity=self.mcore_config.recompute_granularity,
-                    recompute_method=self.mcore_config.recompute_method,
-                    recompute_num_layers=self.mcore_config.recompute_num_layers,
-                    distribute_saved_activations=self.mcore_config.distribute_saved_activations,
-                    recompute_modules=self.mcore_config.recompute_modules,
-                )
-
-            self.logger.info(
-                "Using mbridge to create models and hf model save/load in MegatronEngine."
+        self.bridge = mbridge.AutoBridge.from_pretrained(self.config.path)
+        self.bridge.dtype = self.dtype
+        # Set gradient checkpointing options
+        if self.config.gradient_checkpointing:
+            self.bridge.set_extra_args(
+                recompute_granularity=self.mcore_config.recompute_granularity,
+                recompute_method=self.mcore_config.recompute_method,
+                recompute_num_layers=self.mcore_config.recompute_num_layers,
+                distribute_saved_activations=self.mcore_config.distribute_saved_activations,
+                recompute_modules=self.mcore_config.recompute_modules,
             )
 
-            self.hf_config, self.tf_config = make_hf_and_mcore_config(
-                self.config.path, dtype=self.dtype, bridge=self.bridge
-            )
-            self.tf_config = configure_pipeline_layer_splits(
-                self.parallel_strategy, self.hf_config, self.tf_config
-            )
+        self.logger.info(
+            "Using mbridge to create models and hf model save/load in MegatronEngine."
+        )
 
-            # initialize mcore (DDP Wrapped) GPTModel
-            with self.device:
-                models = make_mcore_model(
-                    hf_config=self.hf_config,
-                    tf_config=self.tf_config,
-                    mcore_config=self.mcore_config,
-                    bridge=self.bridge,
-                    is_critic=self.config.is_critic,
-                )
+        self.hf_config, self.tf_config = make_hf_and_mcore_config(
+            self.config.path, dtype=self.dtype, bridge=self.bridge
+        )
+        self.tf_config = configure_pipeline_layer_splits(
+            self.parallel_strategy, self.hf_config, self.tf_config
+        )
+
+        # initialize mcore (DDP Wrapped) GPTModel
+        with self.device:
+            models = make_mcore_model(
+                hf_config=self.hf_config,
+                tf_config=self.tf_config,
+                mcore_config=self.mcore_config,
+                bridge=self.bridge,
+                is_critic=self.config.is_critic,
+            )
 
         self.model = _MegatronModelList(models)
 
@@ -699,12 +690,7 @@ class MindSpeedLLMRuntime(TrainEngine):
         # Step 4: Aggregate, reorder, and broadcast outputs
         res = None
         if mpu.is_pipeline_last_stage():
-            if self.enable_tree_training:
-                res = merge_packed_tree_results(outputs, batch_size)
-            else:
-                res = reorder_and_pad_outputs(
-                    outputs, output_seqlens, mb_list, aggregate_fn
-                )
+            res = reorder_and_pad_outputs(outputs, output_seqlens, mb_list, aggregate_fn)
         res = broadcast_tensor(
             res,
             src_rank=mpu.get_pipeline_model_parallel_last_rank(),
@@ -1273,30 +1259,6 @@ class MindSpeedLLMRuntime(TrainEngine):
         pp_size = self.parallel_strategy.pipeline_parallel_size
         cp_size = self.parallel_strategy.context_parallel_size
         tp_size = self.parallel_strategy.tensor_parallel_size
-        if self.enable_tree_training:
-            assert cp_size == 1, (
-                "Context parallelism is not supported in tree training."
-            )
-            # Build tree inputs
-            assert BLOCK_SIZE % tp_size == 0, (
-                f"BLOCK_SIZE ({BLOCK_SIZE}) must be divisible by tensor parallel size ({tp_size})."
-            )
-            mb_list = build_packed_tree_batch(
-                input_,
-                mb_spec=self.config.mb_spec,
-                pad_to_maximum=self.config.pad_to_maximum,
-            )
-            recommended_min_n_mbs = 2 * pp_size if pp_size > 1 else 1
-            self.logger.info(
-                f"Packed tree #microbatch: {len(mb_list)}, microbatch #tokens: {mb_list.group_lens}, "
-                f"padded to: {mb_list.padded_to_lengths}, padding lengths: {mb_list.padding_lengths}."
-            )
-            if len(mb_list) < recommended_min_n_mbs:
-                self.logger.warning(
-                    f"Number of tree micro-batches ({len(mb_list)}) is less than recommended"
-                    f" minimum ({recommended_min_n_mbs}) to avoid pipeline bubbles."
-                )
-            return mb_list
         # Amend position ids
         input_ = amend_position_ids(input_)
         # Split the input into micro-batches
@@ -1359,31 +1321,16 @@ class MindSpeedLLMRuntime(TrainEngine):
         total_loss_weight: torch.Tensor,
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
-        if self.config.is_critic and self.enable_tree_training:
-            raise NotImplementedError(
-                "Tree training with critic model is not supported yet."
-            )
         if not self.config.is_critic:
-            if self.enable_tree_training:
-                logprobs, entropy = gather_packed_tree_logprobs_entropy(
-                    output,
-                    inputs["trie_node"],
-                    inputs["input_ids"],
-                    temperature=self.config.temperature,
-                    tp_group=mpu.get_tensor_model_parallel_group()
-                    if mpu.get_tensor_model_parallel_world_size() > 1
-                    else None,
-                )
-            else:
-                labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
-                logprobs, entropy = gather_logprobs_entropy(
-                    output,
-                    labels,
-                    temperature=self.config.temperature,
-                    tp_group=mpu.get_tensor_model_parallel_group()
-                    if mpu.get_tensor_model_parallel_world_size() > 1
-                    else None,
-                )
+            labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+            logprobs, entropy = gather_logprobs_entropy(
+                output,
+                labels,
+                temperature=self.config.temperature,
+                tp_group=mpu.get_tensor_model_parallel_group()
+                if mpu.get_tensor_model_parallel_world_size() > 1
+                else None,
+            )
             loss = loss_fn(logprobs, entropy, inputs)
         else:
             values = output.squeeze(-1)
@@ -1397,22 +1344,7 @@ class MindSpeedLLMRuntime(TrainEngine):
         output: torch.Tensor,
         inputs: dict[str, Any],
     ) -> torch.Tensor | dict[int, torch.Tensor]:
-        if self.config.is_critic and self.enable_tree_training:
-            raise NotImplementedError(
-                "Tree training with critic model is not supported yet."
-            )
         if not self.config.is_critic:
-            if self.enable_tree_training:
-                logprobs = _gather_packed_tree_logprobs(
-                    output,
-                    inputs["trie_node"],
-                    inputs["input_ids"],
-                    temperature=self.config.temperature,
-                    tp_group=mpu.get_tensor_model_parallel_group()
-                    if mpu.get_tensor_model_parallel_world_size() > 1
-                    else None,
-                )
-                return logprobs
             labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
             logprobs = gather_logprobs(
                 output,
