@@ -14,7 +14,6 @@ from megatron.core import tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig as MCoreDDPConfig
 from megatron.core.distributed import finalize_model_grads
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import get_model_config
 from transformers import AutoConfig
 
@@ -296,7 +295,8 @@ class MindSpeedLLMEngine(MegatronEngine):
         from megatron.training import get_args
         from megatron.training.arguments import core_transformer_config_from_args
 
-        self.tf_config = core_transformer_config_from_args(get_args())
+        args = get_args()
+        self.tf_config = core_transformer_config_from_args(args)
         self.tf_config = configure_pipeline_layer_splits(
             self.parallel_strategy, self.hf_config, self.tf_config
         )
@@ -304,28 +304,49 @@ class MindSpeedLLMEngine(MegatronEngine):
         self._check_and_apply_fp8_config()
         self._validate_fp8_consistency()
 
-        spec = getattr(self.mindspeed_llm_args, "spec", None)
+        spec = getattr(args, "spec", None)
         if not spec:
             raise ValueError(
                 "MindSpeed-LLM spec mode requires `--spec ...` in mindspeed_llm.extra_cli_args."
             )
 
         from megatron.core.transformer.spec_utils import import_module
+        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+        from megatron.core.models.gpt.gpt_model import GPTModel
 
         transformer_layer_spec = import_module(spec)
+        use_te = getattr(args, "transformer_impl", None) == "transformer_engine"
+        mtp_block_spec = None
+        if getattr(args, "mtp_num_layers", None) is not None:
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                self.tf_config,
+                transformer_layer_spec,
+                use_transformer_engine=use_te,
+            )
         pre_process = mpu.is_pipeline_first_stage()
         post_process = mpu.is_pipeline_last_stage()
         with self.device:
             model = GPTModel(
                 config=self.tf_config,
                 transformer_layer_spec=transformer_layer_spec,
-                vocab_size=self.hf_config.vocab_size,
-                max_sequence_length=self.hf_config.max_position_embeddings,
+                vocab_size=args.padded_vocab_size,
+                max_sequence_length=args.max_position_embeddings,
                 pre_process=pre_process,
                 post_process=post_process,
-                share_embeddings_and_output_weights=False,
-                position_embedding_type="rope",
-                rotary_base=getattr(self.hf_config, "rope_theta", 10000.0),
+                fp16_lm_cross_entropy=getattr(args, "fp16_lm_cross_entropy", False),
+                parallel_output=True,
+                share_embeddings_and_output_weights=not getattr(
+                    args, "untie_embeddings_and_output_weights", True
+                ),
+                position_embedding_type=getattr(args, "position_embedding_type", "rope"),
+                rotary_percent=getattr(args, "rotary_percent", 1.0),
+                rotary_base=getattr(
+                    args, "rotary_base", getattr(self.hf_config, "rope_theta", 10000.0)
+                ),
+                seq_len_interpolation_factor=getattr(
+                    args, "rotary_seq_len_interpolation_factor", None
+                ),
+                mtp_block_spec=mtp_block_spec,
             )
             if self.config.is_critic:
                 model.output_layer = _ValueHead(
