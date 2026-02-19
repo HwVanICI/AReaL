@@ -100,21 +100,29 @@ class MindSpeedLLMRuntime(MegatronEngine):
         from megatron.training import get_args
         from mindspeed.core.context_parallel.get_batch_utils import set_actual_seq_len
         from mindspeed.utils import set_position_ids
+        from mindspeed_llm.training.utils import compute_actual_seq_len
 
         cu_seqlens = mb.get("cu_seqlens", None)
         if cu_seqlens is not None:
             set_actual_seq_len(cu_seqlens.to(dtype=torch.int64))
         else:
-            attention_mask = mb.get("attention_mask", None)
-            if (
-                attention_mask is not None
-                and torch.is_tensor(attention_mask)
-                and attention_mask.ndim == 2
-            ):
-                lens = attention_mask.sum(dim=1, dtype=torch.int64)
-                actual_seq_len = torch.cumsum(lens, dim=0, dtype=torch.int64)
-                actual_seq_len = torch.nn.functional.pad(actual_seq_len, (1, 0), value=0)
-                set_actual_seq_len(actual_seq_len)
+            position_ids = mb.get("position_ids", None)
+            if torch.is_tensor(position_ids):
+                # Align with MindSpeed-LLM data pipeline semantics.
+                set_actual_seq_len(compute_actual_seq_len(position_ids))
+            else:
+                attention_mask = mb.get("attention_mask", None)
+                if (
+                    attention_mask is not None
+                    and torch.is_tensor(attention_mask)
+                    and attention_mask.ndim == 2
+                ):
+                    lens = attention_mask.sum(dim=1, dtype=torch.int64)
+                    actual_seq_len = torch.cumsum(lens, dim=0, dtype=torch.int64)
+                    actual_seq_len = torch.nn.functional.pad(
+                        actual_seq_len, (1, 0), value=0
+                    )
+                    set_actual_seq_len(actual_seq_len)
 
         position_ids = mb.get("position_ids", None)
         if position_ids is None:
@@ -266,8 +274,6 @@ class MindSpeedLLMRuntime(MegatronEngine):
         post_process = mpu.is_pipeline_last_stage()
         with self.device:
             model = create_gpt_model_from_mindspeed_args(
-                tf_config=self.tf_config,
-                hf_config=self.hf_config,
                 pre_process=pre_process,
                 post_process=post_process,
             )
