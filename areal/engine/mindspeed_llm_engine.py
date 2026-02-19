@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import functools
 import os
+import shlex
+import sys
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -22,7 +24,6 @@ from areal.engine.adapters.mindspeed_llm_adapter import apply_mindspeed_llm_patc
 from areal.engine.megatron_engine import MegatronEngine
 from areal.platforms import current_platform
 from areal.utils import logging
-from areal.utils.environ import is_single_controller
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.lock import DistributedLock
 from areal.utils.mcore.determinisitc import set_deterministic_algorithms
@@ -87,28 +88,52 @@ class MindSpeedLLMEngine(MegatronEngine):
         self.mindspeed_llm_config = config.mindspeed_llm
         self.mindspeed_llm_args = None
         self.logger = logging.getLogger("MindSpeedLLMEngine")
+        # Import adaptor as early as possible for this engine class.
+        self._lazy_import_megatron_adaptor()
 
-    def _should_lazy_import_megatron_adaptor(self) -> bool:
-        # Only import in single-controller worker engine processes to avoid
-        # global side effects in controller / launcher processes.
-        return is_single_controller() and all(
-            key in os.environ for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
-        )
-
-    def _lazy_import_megatron_adaptor(self) -> None:
+    def _lazy_import_megatron_adaptor(
+        self, parallel_strategy: ParallelStrategy | None = None
+    ) -> None:
         if MindSpeedLLMEngine._megatron_adaptor_loaded:
             return
-        if not self._should_lazy_import_megatron_adaptor():
-            return
-        from mindspeed_llm import megatron_adaptor  # noqa: F401
+        if parallel_strategy is not None:
+            base_tokens = [
+                "--use-mcore-models",
+                "--stage",
+                str(self.mindspeed_llm_config.stage),
+                "--tensor-model-parallel-size",
+                str(parallel_strategy.tensor_parallel_size),
+                "--pipeline-model-parallel-size",
+                str(parallel_strategy.pipeline_parallel_size),
+                "--expert-model-parallel-size",
+                str(parallel_strategy.expert_parallel_size),
+                "--expert-tensor-parallel-size",
+                str(parallel_strategy.expert_tensor_parallel_size),
+                "--context-parallel-size",
+                str(parallel_strategy.context_parallel_size),
+            ]
+            extra_tokens = shlex.split(
+                self.mindspeed_llm_config.extra_cli_args or "", posix=True
+            )
+            fake_argv = ["areal-mindspeed-llm"] + base_tokens + extra_tokens
+        else:
+            fake_argv = None
+
+        old_argv = sys.argv
+        try:
+            if fake_argv is not None:
+                sys.argv = fake_argv
+            from mindspeed_llm import megatron_adaptor  # noqa: F401
+        finally:
+            sys.argv = old_argv
 
         MindSpeedLLMEngine._megatron_adaptor_loaded = True
         self.logger.info(
-            "Lazy-loaded mindspeed_llm.megatron_adaptor in single-controller engine process."
+            "Loaded mindspeed_llm.megatron_adaptor for MindSpeedLLMEngine."
         )
 
     def _patch_mindspeed(self, parallel_strategy: ParallelStrategy):
-        self._lazy_import_megatron_adaptor()
+        self._lazy_import_megatron_adaptor(parallel_strategy)
         self.mindspeed_llm_args = apply_mindspeed_llm_patches(
             backend_cfg=self.mindspeed_llm_config,
             parallel_strategy=parallel_strategy,
