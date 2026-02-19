@@ -108,6 +108,23 @@ class MindSpeedLLMRuntime(MegatronEngine):
             if hasattr(experts_mod, name):
                 setattr(moe_specs_mod, name, getattr(experts_mod, name))
 
+    def _log_moe_binding_diagnostics(self) -> None:
+        try:
+            import megatron.core.transformer.moe.experts as experts_mod
+            from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+
+            grouped_mlp = getattr(experts_mod, "GroupedMLP", None)
+            spec_grouped_mlp = get_moe_module_spec.__globals__.get("GroupedMLP", None)
+            self.logger.info(
+                "MindSpeed MoE binding: experts.GroupedMLP=%s.%s ; moe_module_specs.GroupedMLP=%s.%s",
+                getattr(grouped_mlp, "__module__", None),
+                getattr(grouped_mlp, "__name__", None),
+                getattr(spec_grouped_mlp, "__module__", None),
+                getattr(spec_grouped_mlp, "__name__", None),
+            )
+        except Exception as e:
+            self.logger.warning("MindSpeed MoE binding diagnostics failed: %s", e)
+
     def _validate_grouped_gemm_patch(self) -> None:
         args = get_args()
         if not getattr(args, "moe_grouped_gemm", False):
@@ -282,6 +299,7 @@ class MindSpeedLLMRuntime(MegatronEngine):
         args = get_args()
         self.mindspeed_llm_args = args
         self._rebind_preimported_moe_symbols()
+        self._log_moe_binding_diagnostics()
 
         self.tf_config = core_transformer_config_from_args(args)
         self._validate_grouped_gemm_patch()
