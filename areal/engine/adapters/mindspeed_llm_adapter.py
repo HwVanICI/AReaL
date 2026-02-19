@@ -75,8 +75,6 @@ def parse_extra_cli_args(
     try:
         megatron_arguments.parse_args = _unwrap_function(old_parse_args)
         sys.argv = argv
-        from mindspeed_llm import megatron_adaptor  # noqa: F401
-
         # Make this parser path idempotent in long-lived processes.
         unset_global_variables()
         initialize_megatron(

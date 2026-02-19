@@ -22,6 +22,7 @@ from areal.engine.adapters.mindspeed_llm_adapter import apply_mindspeed_llm_patc
 from areal.engine.megatron_engine import MegatronEngine
 from areal.platforms import current_platform
 from areal.utils import logging
+from areal.utils.environ import is_single_controller
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.lock import DistributedLock
 from areal.utils.mcore.determinisitc import set_deterministic_algorithms
@@ -79,6 +80,7 @@ class _ValueHead(torch.nn.Linear):
 
 class MindSpeedLLMEngine(MegatronEngine):
     """Megatron engine variant patched by MindSpeed-LLM (mcore-only)."""
+    _megatron_adaptor_loaded: bool = False
 
     def __init__(self, config: TrainEngineConfig):
         super().__init__(config)
@@ -86,7 +88,27 @@ class MindSpeedLLMEngine(MegatronEngine):
         self.mindspeed_llm_args = None
         self.logger = logging.getLogger("MindSpeedLLMEngine")
 
+    def _should_lazy_import_megatron_adaptor(self) -> bool:
+        # Only import in single-controller worker engine processes to avoid
+        # global side effects in controller / launcher processes.
+        return is_single_controller() and all(
+            key in os.environ for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
+        )
+
+    def _lazy_import_megatron_adaptor(self) -> None:
+        if MindSpeedLLMEngine._megatron_adaptor_loaded:
+            return
+        if not self._should_lazy_import_megatron_adaptor():
+            return
+        from mindspeed_llm import megatron_adaptor  # noqa: F401
+
+        MindSpeedLLMEngine._megatron_adaptor_loaded = True
+        self.logger.info(
+            "Lazy-loaded mindspeed_llm.megatron_adaptor in single-controller engine process."
+        )
+
     def _patch_mindspeed(self, parallel_strategy: ParallelStrategy):
+        self._lazy_import_megatron_adaptor()
         self.mindspeed_llm_args = apply_mindspeed_llm_patches(
             backend_cfg=self.mindspeed_llm_config,
             parallel_strategy=parallel_strategy,
