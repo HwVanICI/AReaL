@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 from megatron.core import parallel_state as mpu
@@ -89,6 +90,87 @@ class MindSpeedLLMEngine(MegatronEngine):
         self.mindspeed_llm_args = apply_mindspeed_llm_patches(
             backend_cfg=self.mindspeed_llm_config,
             parallel_strategy=parallel_strategy,
+        )
+
+    def _set_mindspeed_runtime_context(self, mb: dict[str, Any]) -> None:
+        from megatron.training import get_args
+        from mindspeed.core.context_parallel.get_batch_utils import set_actual_seq_len
+        from mindspeed.utils import set_position_ids
+
+        cu_seqlens = mb.get("cu_seqlens", None)
+        if cu_seqlens is not None:
+            set_actual_seq_len(cu_seqlens.to(dtype=torch.int64))
+        else:
+            attention_mask = mb.get("attention_mask", None)
+            if (
+                attention_mask is not None
+                and torch.is_tensor(attention_mask)
+                and attention_mask.ndim == 2
+            ):
+                lens = attention_mask.sum(dim=1, dtype=torch.int64)
+                actual_seq_len = torch.cumsum(lens, dim=0, dtype=torch.int64)
+                actual_seq_len = torch.nn.functional.pad(actual_seq_len, (1, 0), value=0)
+                set_actual_seq_len(actual_seq_len)
+
+        position_ids = mb.get("position_ids", None)
+        if position_ids is None:
+            return
+        args = get_args()
+        if (
+            getattr(args, "reset_position_ids", False)
+            and torch.is_tensor(position_ids)
+            and position_ids.ndim == 2
+        ):
+            set_position_ids(position_ids.transpose(0, 1).contiguous())
+        else:
+            set_position_ids(position_ids)
+
+    def forward_backward_batch(
+        self,
+        mb_list,
+        process_output_fn: Callable[[torch.Tensor, dict[str, Any]], torch.Tensor | None],
+        forward_only: bool = False,
+    ) -> None:
+        self._ensure_ready()
+        from megatron.core.pipeline_parallel import get_forward_backward_func
+        from areal.utils.mcore.packed_context_parallel import packed_context_parallel_forward
+        from areal.utils.data import unpad_logits
+
+        def forward_step(batch_iter, model):
+            mb_input = next(batch_iter)
+            cu_seqlens = mb_input.padded_mb.get("cu_seqlens", None)
+            self._set_mindspeed_runtime_context(mb_input.padded_mb)
+            output = packed_context_parallel_forward(model, mb_input.padded_mb)
+
+            def _process_output(input_, output_):
+                loss = process_output_fn(output_, input_)
+                if loss is None:
+                    loss = torch.tensor(1.0, device=output_.device)
+                return loss, {}
+
+            if mpu.is_pipeline_last_stage(ignore_virtual=False):
+                output = unpad_logits(
+                    output,
+                    padding_length=mb_input.padding_length,
+                    cu_seqlens=cu_seqlens,
+                    old_cu_seqlens=mb_input.old_cu_seqlens,
+                )
+            return output, functools.partial(_process_output, mb_input.orig_mb)
+
+        forward_backward_func = get_forward_backward_func()
+        if len(self.model) > 1:
+            data_iterator = [iter(mb_list) for _ in range(len(self.model))]
+        else:
+            data_iterator = iter(mb_list)
+
+        forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=self.model if len(self.model) > 1 else self.model[0],
+            num_microbatches=len(mb_list),
+            seq_length=mb_list.max_seqlen,
+            micro_batch_size=1,
+            forward_only=forward_only,
         )
 
     def initialize(self, addr, ft_spec, *args, **kwargs):
