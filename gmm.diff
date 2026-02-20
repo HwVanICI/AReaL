@@ -1,0 +1,113 @@
+diff --git a/mindspeed/core/fusions/grouped_matmul.py b/mindspeed/core/fusions/grouped_matmul.py
+index b6187ec3..62a05cf9 100644
+--- a/mindspeed/core/fusions/grouped_matmul.py
++++ b/mindspeed/core/fusions/grouped_matmul.py
+@@ -1,11 +1,28 @@
+ # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
++import logging
++import os
+ import torch
+ 
++_LOG = logging.getLogger(__name__)
++_LOGGED_ONCE = False
++
+ 
+ class Ops:
+     @staticmethod
+     def gmm(a, b, batch_sizes, trans_b=False, gemm_fusion=False, original_weight=None):
+         from mindspeed.ops.gmm import npu_gmm
++        global _LOGGED_ONCE
++        if os.environ.get("MINDSPEED_GMM_TRACE", "0") == "1" and not _LOGGED_ONCE:
++            _LOGGED_ONCE = True
++            _LOG.warning(
++                "[GMM_TRACE] grouped_matmul.Ops.gmm called: npu_gmm=%s.%s trans_b=%s gemm_fusion=%s a.shape=%s b.shape=%s",
++                getattr(npu_gmm, "__module__", None),
++                getattr(npu_gmm, "__name__", None),
++                trans_b,
++                gemm_fusion,
++                tuple(a.shape) if hasattr(a, "shape") else None,
++                tuple(b.shape) if hasattr(b, "shape") else None,
++            )
+ 
+         if trans_b:
+             b = b.t()
+diff --git a/mindspeed/ops/gmm.py b/mindspeed/ops/gmm.py
+index b48c7d57..559a1f96 100644
+--- a/mindspeed/ops/gmm.py
++++ b/mindspeed/ops/gmm.py
+@@ -1,9 +1,15 @@
+-import torch
++import logging
++import os
++import torch
+ from torch.library import impl
+ from mindspeed.op_builder import GMMOpBuilder, GMMV2OpBuilder
+ from mindspeed.op_builder.builder import AS_LIBRARY
+-from mindspeed.ops.npu_groupmatmul_add import npu_groupmatmul_add_fp32
+-
++from mindspeed.ops.npu_groupmatmul_add import npu_groupmatmul_add_fp32
++
++_LOG = logging.getLogger(__name__)
++_LOGGED_COMMON_ONCE = False
++_LOGGED_BACKWARD_ONCE = False
++
+ 
+ __all__ = ["npu_gmm", "npu_gmm_v2"]
+ 
+@@ -45,11 +51,20 @@ class GMMFunction(torch.autograd.Function):
+ 
+         return outputs[0]
+ 
+-    @staticmethod
+-    def backward(ctx, grad_outputs):
+-        if ctx.group_list_data_type == 0:
+-            x, weight, original_weight = ctx.saved_tensors
+-            group_list = ctx.group_list
++    @staticmethod
++    def backward(ctx, grad_outputs):
++        global _LOGGED_BACKWARD_ONCE
++        if os.environ.get("MINDSPEED_GMM_TRACE", "0") == "1" and not _LOGGED_BACKWARD_ONCE:
++            _LOGGED_BACKWARD_ONCE = True
++            _LOG.warning(
++                "[GMM_TRACE] GMMFunction.backward called: group_list_type=%s gemm_fusion=%s grad.shape=%s",
++                ctx.group_list_type,
++                ctx.gemm_fusion,
++                tuple(grad_outputs.shape) if hasattr(grad_outputs, "shape") else None,
++            )
++        if ctx.group_list_data_type == 0:
++            x, weight, original_weight = ctx.saved_tensors
++            group_list = ctx.group_list
+         else:
+             x, weight, group_list, original_weight = ctx.saved_tensors
+ 
+@@ -136,8 +151,28 @@ def npu_gmm_param_verification(x, weight, *, bias=None, group_list=None, group_t
+         raise RuntimeError(f"{device_warning}, {x_device}(arg0) and {group_list.device}(group_list)!")
+ 
+ 
+-def _npu_gmm_common(original_weight, x, weight, *, bias=None, group_list=None, group_type=0, group_list_type=0, gemm_fusion=False):
+-    support_dtype = [torch.float16, torch.bfloat16, torch.float32]
++def _npu_gmm_common(original_weight, x, weight, *, bias=None, group_list=None, group_type=0, group_list_type=0, gemm_fusion=False):
++    global _LOGGED_COMMON_ONCE
++    if os.environ.get("MINDSPEED_GMM_TRACE", "0") == "1" and not _LOGGED_COMMON_ONCE:
++        _LOGGED_COMMON_ONCE = True
++        has_privateuse1_tensor = torch._C._dispatch_has_kernel_for_dispatch_key(
++            "mindspeed::npu_gmm.Tensor", "PrivateUse1"
++        )
++        has_autograd_privateuse1_tensor = torch._C._dispatch_has_kernel_for_dispatch_key(
++            "mindspeed::npu_gmm.Tensor", "AutogradPrivateUse1"
++        )
++        _LOG.warning(
++            "[GMM_TRACE] _npu_gmm_common called: group_type=%s group_list_type=%s gemm_fusion=%s "
++            "x.requires_grad=%s weight.requires_grad=%s dispatch(npu_gmm.Tensor) PrivateUse1=%s AutogradPrivateUse1=%s",
++            group_type,
++            group_list_type,
++            gemm_fusion,
++            x.requires_grad,
++            weight.requires_grad,
++            has_privateuse1_tensor,
++            has_autograd_privateuse1_tensor,
++        )
++    support_dtype = [torch.float16, torch.bfloat16, torch.float32]
+     if weight.dtype not in support_dtype:
+         raise TypeError(f"Only support non quant case, but got weight dtype {weight.dtype}.")
+     npu_gmm_param_verification(x, weight, bias=bias, group_list=group_list, group_type=group_type,
