@@ -820,7 +820,7 @@ class SchedulingSpec:
             "help": "Which placement strategy to use for Ray scheduling. "
             "Shared will produce 1 placement group for all workers in the role (training). "
             "Separate will 1 placement group per worker (rollout). "
-            "Deferred (WIP) will do the same as separate but defers accelerator scheduling (multinode rollout). ",
+            "Deferred will do the same as separate but defers accelerator scheduling (multinode rollout). ",
             "choices": ["shared", "separate", "deferred"],
         },
     )
@@ -1125,6 +1125,10 @@ class PPOCriticConfig(TrainEngineConfig):
 def get_py_cmd(module: str, args: dict[str, Any]):
     # convert to flags
     cmd = ["python3", "-m", module]
+    return process_args(cmd, args)
+
+
+def process_args(cmd, args):
     for k, v in args.items():
         if v is None or v is False or v == "" or (isinstance(v, list) and not v):
             continue
@@ -1234,6 +1238,15 @@ class vLLMConfig:
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
         return get_py_cmd("areal.engine.vllm_ext.areal_vllm_server", args)
+
+    @staticmethod
+    def build_cmd_from_args_headless(args: dict[str, Any]):
+        args = args.copy()
+        model = args.pop("model")
+        args["headless"] = True
+        # vllm serve needed for headless mode
+        # need to add model directly following vllm serve
+        return process_args(["vllm", "serve", model], args)
 
     @staticmethod
     def build_cmd(

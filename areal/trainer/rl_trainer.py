@@ -27,6 +27,7 @@ from areal.api.engine_api import InferenceEngine
 from areal.api.io_struct import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.api.scheduler_api import Scheduler
 from areal.api.workflow_api import RolloutWorkflow, WorkflowLike
+from areal.engine.ray_vllm_remote import RayRemotevLLMEngine
 from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.engine.vllm_remote import RemotevLLMEngine
 from areal.infra import (
@@ -565,7 +566,14 @@ class PPOTrainer:
                 base_gpu_id=0,
             )
         elif self.allocation_mode.gen_backend == "vllm":
-            engine_cls = RemotevLLMEngine
+            if (
+                self.allocation_mode.gen_instance_size
+                > self.config.cluster.n_gpus_per_node
+            ):
+                # gen instance spans more than 1 node
+                engine_cls = RayRemotevLLMEngine
+            else:
+                engine_cls = RemotevLLMEngine
             server_args = vLLMConfig.build_args(
                 vllm_config=self.config.vllm,
                 tp_size=self.allocation_mode.gen.tp_size,

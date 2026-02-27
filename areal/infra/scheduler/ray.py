@@ -28,6 +28,7 @@ from areal.infra.scheduler.exceptions import (
     WorkerTimeoutError,
 )
 from areal.infra.scheduler.ray_placement_group import (
+    DeferredDeviceRayPlacementStrategy,
     RayPlacementStrategy,
     SeparatedRayPlacementStrategy,
     SharedRayPlacementStrategy,
@@ -138,7 +139,9 @@ class RayScheduler(Scheduler):
 
         mode = placement_strategies[0]
 
-        if mode == "separate":
+        if mode == "deferred":
+            return DeferredDeviceRayPlacementStrategy()
+        elif mode == "separate":
             return SeparatedRayPlacementStrategy()
         elif mode == "shared":
             return SharedRayPlacementStrategy()
@@ -583,10 +586,13 @@ class RayScheduler(Scheduler):
                 # Asynchronously destroy actor
                 actor.destroy.remote()
             except Exception:
-                logger.warning(
-                    f"Could not destroy remote actor {actor}, force killing actor"
-                )
-                ray.kill(actor, no_restart=True)
+                try:
+                    actor.__ray_terminate__.remote()
+                except Exception:
+                    logger.warning(
+                        f"Could not destroy remote actor {actor}, force killing actor"
+                    )
+                    ray.kill(actor, no_restart=True)
 
         # Collect unique placement groups and remove them
         unique_pgs = {wi.placement_group for wi in workers}
