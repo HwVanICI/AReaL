@@ -203,3 +203,17 @@ class SeparatedRayPlacementStrategy(RayPlacementStrategy):
         }
 
         return options, PlacementGroupSchedulingStrategy(**strategy_kwargs)
+
+
+@dataclass
+class DeferredDeviceRayPlacementStrategy(SeparatedRayPlacementStrategy):
+    # primarily for rollout where the launch_server procedure will take accelerators, so we only create the PG and pass it on
+
+    def _create_bundles(self, spec: SchedulingSpec, n_gpus_per_node: int):
+        bundles = _create_bundle_specs_split(
+            n_gpus_per_node, spec.cpu, spec.gpu, spec.mem
+        )
+        return bundles
+
+    def _get_resource_spec(self, spec: SchedulingSpec):
+        return _actor_resource_spec(0, 0, 0)
