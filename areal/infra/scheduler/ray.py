@@ -28,6 +28,7 @@ from areal.infra.scheduler.exceptions import (
     WorkerTimeoutError,
 )
 from areal.infra.scheduler.ray_placement_group import (
+    DeferredDeviceRayPlacementStrategy,
     RayPlacementStrategy,
     SeparatedRayPlacementStrategy,
     SharedRayPlacementStrategy,
