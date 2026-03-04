@@ -769,6 +769,14 @@ class MegatronEngineConfig:
 
     # FP8 Training Configuration
     fp8_config: FP8EngineConfig | None = None
+    num_layers_in_first_pipeline_stage: int | None = field(
+        default=None, metadata={"help": "Number of layers in the first pipeline stage"}
+    )
+    num_layers_in_last_pipeline_stage: int | None = field(
+        default=None, metadata={"help": "Number of layers in the last pipeline stage"}
+    )
+    account_for_embedding_in_pipeline_split: bool = field(default=False)
+    account_for_loss_in_pipeline_split: bool = field(default=False)
 
 
 @dataclass
@@ -781,10 +789,46 @@ class MindSpeedEngineConfig:
 
     # should always be true in mindspeed
     use_flash_attn: bool = True
-    context_parallel_algo: str = "megatron_cp_algo"
+    context_parallel_algo: str = field(
+        default="megatron_cp_algo",
+        metadata={
+            "help": "Context parallel algorithm used by MindSpeed. "
+            "Options: 'megatron_cp_algo', 'hybrid_cp_algo', 'ulysses_cp_algo"
+        },
+    )
     sequence_parallel: bool = False
     use_legacy_models: bool = False
+
+    swap_optimizer: bool = False
+    use_fused_rotary_pos_emb: bool = False
+    use_fused_swiglu: bool = False
+    use_cp_send_recv_overlap: bool = False
+    use_fused_ring_attention_update: bool = False
+    cp_window_size: int = 1
+    moe_alltoall_overlap_comm: bool = False
+    moe_grouped_gemm: bool = True
+    moe_zero_memory: str = field(
+        default="disable",
+        metadata={
+            "help": "MoE zero memory level. Defines how much recomputation occurs in "
+            "experts when using communications overlaps. "
+            "Requires moe_alltoall_overlap_comm. Options: 'disable', 'level0', 'level1'."
+        },
+    )
+    moe_permute_fusion: bool = False
     gemm_gradient_accumulation_fusion: bool = False
+    position_embedding_type: str = field(
+        default="rope",
+        metadata={"help": "Position embedding type. Options: 'rope', 'alibi'"},
+    )
+    moe_aux_loss_coeff: float = field(default=0.0)
+    moe_router_load_balancing_type: str = field(default="aux_loss")
+    moe_token_dispatcher_type: str = field(
+        default="allgather",
+        metadata={
+            "help": "Type of token dispatcher. Options: 'allgather','alltoall' and 'flex'."
+        },
+    )
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1271,6 +1315,10 @@ class PPOCriticConfig(TrainEngineConfig):
 def get_py_cmd(module: str, args: dict[str, Any]):
     # convert to flags
     cmd = ["python3", "-m", module]
+    return process_args(cmd, args)
+
+
+def process_args(cmd, args):
     for k, v in args.items():
         if v is None or v is False or v == "" or (isinstance(v, list) and not v):
             continue
@@ -1371,6 +1419,15 @@ class vLLMConfig:
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
         return get_py_cmd("areal.engine.vllm_ext.areal_vllm_server", args)
+
+    @staticmethod
+    def build_cmd_from_args_headless(args: dict[str, Any]):
+        args = args.copy()
+        model = args.pop("model")
+        args["headless"] = True
+        # vllm serve needed for headless mode
+        # need to add model directly following vllm serve
+        return process_args(["vllm", "serve", model], args)
 
     @staticmethod
     def build_cmd(
