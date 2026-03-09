@@ -10,7 +10,7 @@ from concurrent.futures import Future
 from contextlib import nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
-
+import mindspeed.megatron_adaptor
 import mbridge
 import torch
 import torch.distributed as dist
