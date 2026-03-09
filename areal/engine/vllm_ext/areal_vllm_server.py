@@ -231,7 +231,7 @@ async def set_weight_meta_xccl_lora(
 
 @router.post("/areal_pause_generation")
 async def pause_generation(raw_request: Request):
-    logger.info("API server starts pause_generation")
+    logger.info("API server starts pause_generation and aborts all requests")
 
     llm = raw_request.app.state.engine_client
 
@@ -242,9 +242,7 @@ async def pause_generation(raw_request: Request):
         clear_cache=True,
     )
 
-    return to_json_response(
-        True, "Generation paused (inflight aborted, caches cleared)"
-    )
+    return to_json_response(True, "Generation paused and all requests aborted")
 
 
 @router.post("/areal_continue_generation")
