@@ -1,7 +1,6 @@
 import asyncio
 import logging
 from http import HTTPStatus
-from typing import TYPE_CHECKING
 
 import uvloop
 from fastapi import Depends, Request
@@ -23,9 +22,6 @@ from vllm.entrypoints.openai.protocol import (
 from vllm.entrypoints.utils import cli_env_setup, load_aware_call, with_cancellation
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-if TYPE_CHECKING:
-    pass
 
 logger = init_logger("areal_vllm_server")
 logger.setLevel(logging.INFO)
@@ -114,9 +110,12 @@ def build_response(ret_list):
 async def update_weight(request: UpdateWeightsRequest, raw_request: Request):
     logger.info(f"API server starts update_weight, {request.model_path}")
     llm = raw_request.app.state.engine_client
-    ret_list = await llm.engine_core.call_utility_async(
-        "areal_injected_update_weight",
-        request.model_path,
+
+    # Pause + abort inflight + clear caches
+    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+    ret_list = await llm.collective_rpc(
+        "update_weights",
+        args=(request.model_path,),
     )
     return build_response(ret_list)
 
@@ -124,15 +123,24 @@ async def update_weight(request: UpdateWeightsRequest, raw_request: Request):
 @router.post("/areal_update_weights_lora")
 async def update_weight_lora(request: UpdateWeightsRequestLora, raw_request: Request):
     logger.info(
-        f"API server starts update_weight_lora, lora_model_path-{request.lora_model_path}, lora_name-{request.lora_name}, lora_int_id-{request.lora_int_id}, base_model_name-{request.base_model_name}"
+        "API server starts update_weight_lora, "
+        f"lora_model_path-{request.lora_model_path}, "
+        f"lora_name-{request.lora_name}, "
+        f"lora_int_id-{request.lora_int_id}, "
+        f"base_model_name-{request.base_model_name}"
     )
     llm = raw_request.app.state.engine_client
-    ret_list = await llm.engine_core.call_utility_async(
-        "areal_injected_update_weight_lora",
-        request.lora_model_path,
-        request.lora_name,
-        request.lora_int_id,
-        request.base_model_name,
+    # Pause + abort inflight + clear caches
+    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+
+    ret_list = await llm.collective_rpc(
+        "update_weights_lora",
+        args=(
+            request.lora_model_path,
+            request.lora_name,
+            request.lora_int_id,
+            request.base_model_name,
+        ),
     )
     return build_response(ret_list)
 
@@ -141,9 +149,9 @@ async def update_weight_lora(request: UpdateWeightsRequestLora, raw_request: Req
 async def update_weight_xccl(raw_request: Request):
     logger.info("API server starts update_weight")
     llm = raw_request.app.state.engine_client
-    ret_list = await llm.engine_core.call_utility_async(
-        "areal_injected_update_weight_xccl",
-    )
+    # Pause + abort inflight + clear caches
+    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+    ret_list = await llm.collective_rpc("update_weight_xccl")
     return build_response(ret_list)
 
 
@@ -151,9 +159,10 @@ async def update_weight_xccl(raw_request: Request):
 async def update_weight_lora_xccl(raw_request: Request):
     logger.info("API server starts update_weight_lora via XCCL")
     llm = raw_request.app.state.engine_client
-    ret_list = await llm.engine_core.call_utility_async(
-        "areal_injected_update_weight_lora_xccl",
-    )
+    # Pause + abort inflight + clear caches
+    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+
+    ret_list = await llm.collective_rpc("update_weight_lora_xccl")
     return build_response(ret_list)
 
 
@@ -223,17 +232,31 @@ async def set_weight_meta_xccl_lora(
 @router.post("/areal_pause_generation")
 async def pause_generation(raw_request: Request):
     logger.info("API server starts pause_generation and aborts all requests")
+
     llm = raw_request.app.state.engine_client
-    # Abort all running and waiting requests
+
+    # 1) Pause vLLM generation
     _generation_run_event.clear()
-    await llm.engine_core.call_utility_async("abort_all_reqs")
+    await llm.pause_generation(
+        wait_for_inflight_requests=False,
+        clear_cache=True,
+    )
+
     return to_json_response(True, "Generation paused and all requests aborted")
 
 
 @router.post("/areal_continue_generation")
 async def continue_generation(raw_request: Request):
     logger.info("API server starts continue_generation")
+
+    llm = raw_request.app.state.engine_client
+
+    # resume engine
+    await llm.resume_generation()
+
+    # resume submission loop
     _generation_run_event.set()
+
     return to_json_response(True, "Generation continued")
 
 
