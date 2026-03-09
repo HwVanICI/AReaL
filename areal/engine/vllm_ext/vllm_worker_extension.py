@@ -26,6 +26,29 @@ def undo_moe_postprocess_for_reload(model):
             p.data = p.data.transpose(1, 2).contiguous()
 
 
+def _apply_ascend_patch_once():
+    try:
+        from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+    except Exception:
+        return
+
+    if getattr(AscendUnquantizedFusedMoEMethod, "_areal_patched", False):
+        return
+
+    original = AscendUnquantizedFusedMoEMethod.process_weights_after_loading
+
+    def patched(self_method, layer):
+        original(self_method, layer)
+        layer.w13_weight.weight_loader = layer.weight_loader
+        layer.w2_weight.weight_loader = layer.weight_loader
+
+    AscendUnquantizedFusedMoEMethod.process_weights_after_loading = patched
+    AscendUnquantizedFusedMoEMethod._areal_patched = True
+
+
+_apply_ascend_patch_once()
+
+
 class VLLMWorkerExtension:
     """
     Iherited from vllm codebase
