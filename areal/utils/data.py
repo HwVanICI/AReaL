@@ -257,16 +257,49 @@ def allocate_balanced_mbs_synced(
     mb_spec: MicroBatchSpec,
     lens: list[int],
     group: dist.ProcessGroup | None = None,
+    *,
+    max_iters: int = 25,
 ) -> list[list[int]]:
     group_indices = allocate_balanced_mbs(mb_spec, lens)
-    if not dist.is_initialized():
+    if not dist.is_initialized() or group is None:
         return group_indices
-    all_n_mbs = all_gather_int(len(group_indices), group=group)
-    if all(mbs == len(group_indices) for mbs in all_n_mbs):
-        return group_indices
-    return allocate_balanced_mbs_synced(
-        MicroBatchSpec.new(mb_spec, n_mbs=max(all_n_mbs)), lens, group=group
+
+    seen = set()
+
+    cur_spec = mb_spec
+
+    for _ in range(max_iters):
+        group_indices = allocate_balanced_mbs(cur_spec, lens)
+        local_n = len(group_indices)
+
+        current_platform.synchronize()
+        all_n = all_gather_int(local_n, group)
+        target = max(all_n)
+
+        # already consistent
+        if all(x == local_n for x in all_n):
+            return group_indices
+
+        # cycle / non-convergence guard
+        key = (getattr(cur_spec, "n_mbs", None), local_n, target)
+        if key in seen:
+            # At this point, your allocator is not a contraction mapping.
+            # Force a safe deterministic policy instead of looping forever.
+            break
+        seen.add(key)
+
+        # If your allocator sometimes returns > requested, clamp target upward
+        # But keep it monotonic so we don't oscillate.
+        requested = getattr(cur_spec, "n_mbs", target)
+        next_n = max(requested, target, local_n)
+
+        cur_spec = MicroBatchSpec.new(cur_spec, n_mbs=next_n)
+
+    # Fallback: force identical microbatch count in a deterministic way
+    forced_n = getattr(cur_spec, "n_mbs", None) or max(
+        all_gather_int(len(group_indices), group)
     )
+    return allocate_balanced_mbs(MicroBatchSpec.new(cur_spec, n_mbs=forced_n), lens)
 
 
 def all_gather_int(value: int, group):
