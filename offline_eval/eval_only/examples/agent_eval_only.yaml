@@ -1,0 +1,74 @@
+experiment_name: agent-eval-only
+trial_name: trial0
+
+seed: 1
+tokenizer_path: Qwen/Qwen2-1.5B-Instruct
+
+workflow: examples.openai_agents.train_agents.OpenAIAgentWorkflow
+workflow_kwargs:
+  agent_builder_path: areal.workflow.openai_agent.math_agent.build_math_agent
+  agent_builder_kwargs: {}
+  reward_fn_path: areal.reward.gsm8k.gsm8k_reward_fn
+  gconfig: ${gconfig}
+  tokenizer: ${tokenizer_path}
+
+cluster:
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+allocation_mode: vllm:d1p1t1
+
+scheduler:
+  type: local
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  max_concurrent_rollouts: 16
+  consumer_batch_size: ${valid_dataset.batch_size}
+  max_head_offpolicyness: 1000000000000
+  dump_to_file: true
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 1024
+  max_tokens: 2048
+  greedy: false
+  top_p: 1.0
+  temperature: 0.7
+
+sglang:
+  model_path: ${tokenizer_path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  context_length: ${gconfig.max_tokens}
+  mem_fraction_static: 0.8
+
+vllm:
+  model: ${tokenizer_path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: auto
+  max_model_len: ${gconfig.max_tokens}
+  gpu_memory_utilization: 0.7
+
+valid_dataset:
+  batch_size: 16
+  shuffle: false
+  pin_memory: true
+  num_workers: 4
+  drop_last: false
+  path: openai/gsm8k
+  type: rl

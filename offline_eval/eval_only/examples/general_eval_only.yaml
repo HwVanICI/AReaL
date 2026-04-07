@@ -1,0 +1,73 @@
+experiment_name: gsm8k-eval-only
+trial_name: trial0
+
+seed: 1
+tokenizer_path: Qwen/Qwen2.5-1.5B-Instruct
+
+workflow: areal.workflow.rlvr.RLVRWorkflow
+workflow_kwargs:
+  reward_fn: areal.reward.gsm8k.gsm8k_reward_fn
+  gconfig: ${gconfig}
+  tokenizer: ${tokenizer_path}
+  enable_thinking: false
+
+cluster:
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+allocation_mode: vllm:d1p1t1
+
+scheduler:
+  type: local
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  max_concurrent_rollouts: 2
+  consumer_batch_size: ${valid_dataset.batch_size}
+  max_head_offpolicyness: 1000000000000
+  dump_to_file: true
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 256
+  max_tokens: 512
+  greedy: false
+  top_p: 1.0
+  temperature: 0.6
+
+sglang:
+  model_path: ${tokenizer_path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  context_length: ${gconfig.max_tokens}
+  mem_fraction_static: 0.8
+
+vllm:
+  model: ${tokenizer_path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: auto
+  max_model_len: ${gconfig.max_tokens}
+  gpu_memory_utilization: 0.55
+
+valid_dataset:
+  batch_size: 2
+  shuffle: false
+  pin_memory: false
+  num_workers: 0
+  drop_last: false
+  path: openai/gsm8k
+  type: rl
