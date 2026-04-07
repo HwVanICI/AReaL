@@ -42,10 +42,6 @@ classifiers = [
 
 dependencies = [
     # Core ML/AI libraries
-    "torch>=2.9.1,<2.11",
-    "torchaudio",
-    "torchvision",
-    "torchdata",
     "huggingface_hub",
     "datasets>=3.0.0",
     "transformers==4.57.1",
@@ -132,6 +128,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Platform-dependent PyTorch libraries
+pytorch-cuda = [
+    "torch>=2.9.1,<2.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchdata; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+pytorch-npu = [
+    "torch==2.9.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+    "torch-npu==2.9.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+    "torchaudio==2.9.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+    "torchvision==0.24.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+    "torchdata; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+]
 # CUDA-dependent extras - these packages only have Linux x86_64 wheels
 # Platform markers ensure they're skipped on unsupported platforms
 sglang = [
@@ -162,6 +172,7 @@ megatron = [
 # Convenience extra for CUDA training packages (no inference backend)
 # Install with --extra sglang or --extra vllm for a complete setup
 cuda-train = [
+    "areal[pytorch-cuda]",
     "areal[tms]",
     "areal[megatron]",
     "areal[kernels]",
@@ -189,6 +200,9 @@ cuda = [
     "torch==2.9.1+cu129; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+npu = [
+    "areal[pytorch-npu]",
 ]
 
 [project.urls]
@@ -235,6 +249,34 @@ environments = [
 ]
 conflicts = [
     [
+        { extra = "pytorch-npu" },
+        { extra = "pytorch-cuda" },
+    ],
+    [
+        { extra = "pytorch-npu" },
+        { extra = "sglang" },
+    ],
+    [
+        { extra = "pytorch-npu" },
+        { extra = "vllm" },
+    ],
+    [
+        { extra = "pytorch-npu" },
+        { extra = "cuda-train" },
+    ],
+    [
+        { extra = "pytorch-npu" },
+        { extra = "cuda-sglang" },
+    ],
+    [
+        { extra = "pytorch-npu" },
+        { extra = "cuda-vllm" },
+    ],
+    [
+        { extra = "pytorch-npu" },
+        { extra = "cuda" },
+    ],
+    [
         { extra = "sglang" },
         { extra = "vllm" },
     ],
@@ -260,13 +302,41 @@ conflicts = [
         { extra = "cuda-vllm" },
         { extra = "cuda-sglang" },
     ],
+    [
+        { extra = "npu" },
+        { extra = "pytorch-cuda" },
+    ],
+    [
+        { extra = "npu" },
+        { extra = "sglang" },
+    ],
+    [
+        { extra = "npu" },
+        { extra = "vllm" },
+    ],
+    [
+        { extra = "npu" },
+        { extra = "cuda-train" },
+    ],
+    [
+        { extra = "npu" },
+        { extra = "cuda-sglang" },
+    ],
+    [
+        { extra = "npu" },
+        { extra = "cuda-vllm" },
+    ],
+    [
+        { extra = "npu" },
+        { extra = "cuda" },
+    ],
 ]
 override-dependencies = [
     # litellm[proxy] conflicts with sglang's exact pins:
     # - litellm requires openai>=2.8.0, sglang pins openai==2.6.1
     # - litellm requires soundfile>=0.12.1,<0.13.0, sglang pins soundfile==0.13.1
     "openai>=2.8.0",
-    "soundfile>=0.12.1,<0.13.0",
+    "soundfile==0.13.1",
 ]
 
 # Static metadata so uv lock resolves flash-attn without downloading or building.
@@ -284,6 +354,11 @@ name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu129", extra = "sglang" },
@@ -291,6 +366,7 @@ torch = [
     { index = "pytorch-cu129", extra = "cuda" },
     { index = "pytorch-cu129", extra = "cuda-sglang" },
     { index = "pytorch-cu129", extra = "cuda-vllm" },
+    { index = "pytorch-cpu", extra = "pytorch-npu" },
 ]
 torchaudio = [
     { index = "pytorch-cu129", extra = "sglang" },
@@ -298,6 +374,7 @@ torchaudio = [
     { index = "pytorch-cu129", extra = "cuda" },
     { index = "pytorch-cu129", extra = "cuda-sglang" },
     { index = "pytorch-cu129", extra = "cuda-vllm" },
+    { index = "pytorch-cpu", extra = "pytorch-npu" },
 ]
 torchvision = [
     { index = "pytorch-cu129", extra = "sglang" },
@@ -305,6 +382,7 @@ torchvision = [
     { index = "pytorch-cu129", extra = "cuda" },
     { index = "pytorch-cu129", extra = "cuda-sglang" },
     { index = "pytorch-cu129", extra = "cuda-vllm" },
+    { index = "pytorch-cpu", extra = "pytorch-npu" },
 ]
 
 # =============================================================================
