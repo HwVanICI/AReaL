@@ -110,6 +110,39 @@ if TYPE_CHECKING:
     from areal.api.cli_args import PPOActorConfig, PPOCriticConfig
 
 
+def _patch_te_layernorm_column_parallel_linear_bias():
+    """Fix MindSpeed TE bug where QKV bias is not applied when skip_bias_add=False.
+
+    In MindSpeedTELayerNormColumnParallelLinear, ``te_return_bias`` is set to
+    ``self.skip_bias_add and bias``.  When ``skip_bias_add=False`` (the default
+    for the QKV projection), ``te_return_bias`` evaluates to ``False``, so the
+    forward pass sets ``bias = None`` and never applies it.  This silently drops
+    the QKV bias for models that have one (e.g. Qwen2.5 with
+    ``attention_bias=True``), causing massive logprob divergence.
+
+    The patch wraps the original forward to add the stored bias when it was
+    skipped.
+    """
+    from mindspeed.te.pytorch.module.layernorm_column_parallel_linear import (
+        MindSpeedTELayerNormColumnParallelLinear,
+    )
+
+    if getattr(MindSpeedTELayerNormColumnParallelLinear, "_bias_patched", False):
+        return
+
+    original_forward = MindSpeedTELayerNormColumnParallelLinear.forward
+
+    @functools.wraps(original_forward)
+    def _forward_with_bias(self, inp, is_first_microbatch=None, fp8_output=False):
+        output, bias = original_forward(self, inp, is_first_microbatch, fp8_output)
+        if bias is None and self.bias is not None and not self.skip_bias_add:
+            output = output + self.bias
+        return output, bias
+
+    MindSpeedTELayerNormColumnParallelLinear.forward = _forward_with_bias
+    MindSpeedTELayerNormColumnParallelLinear._bias_patched = True
+
+
 class _MegatronModelList(list):
     """List wrapper that exposes module-like helpers for Megatron model chunks."""
 
@@ -1470,6 +1503,7 @@ class MegatronEngine(TrainEngine):
 
         config.update(config_overrides)
         repatch(config)
+        _patch_te_layernorm_column_parallel_linear_bias()
 
     def _save_model_to_hf(
         self,
