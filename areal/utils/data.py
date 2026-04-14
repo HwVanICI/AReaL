@@ -1206,8 +1206,7 @@ class Normalization:
             mean = mean.expand_as(x)
         elif self.mean_level == "group":
             mean = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for s in self._iter_group_slices(bs):
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
 
@@ -1250,8 +1249,7 @@ class Normalization:
             std = std.expand_as(x)
         elif self.std_level == "group":
             std = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for s in self._iter_group_slices(bs):
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
                 group_mean_slice = mean[s]  # already computed and expanded
@@ -1279,6 +1277,11 @@ class Normalization:
 
         # Normalize
         return (x_centered / (std + eps)).float()
+
+    def _iter_group_slices(self, batch_size: int) -> Iterator[slice]:
+        """Yield slices for every group, including a final partial group."""
+        for start in range(0, batch_size, self.group_size):
+            yield slice(start, min(start + self.group_size, batch_size))
 
     @staticmethod
     def _compute_mean(
