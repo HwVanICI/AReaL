@@ -18,6 +18,7 @@ import aiohttp
 import numpy as np
 import ray
 import requests
+import torch
 import torch.distributed as dist
 import uvloop
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -43,11 +44,12 @@ from areal.infra.utils.concurrent import get_executor
 from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
-from areal.utils import logging, name_resolve, names
-from areal.utils.data import concat_padded_tensors
+from areal.utils import logging, name_resolve, names, stats_tracker
+from areal.utils.data import concat_padded_tensors, get_batch_size
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import find_free_ports, gethostip
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.stats_tracker import ReduceType
 
 from .workflow_executor import WorkflowExecutor
 
@@ -65,52 +67,242 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         workflow: RolloutWorkflow,
         group_size: int,
         logger: Logger,
+        result_policy: str = "drop_group",
+        expected_samples_per_subrollout: int | None = 1,
     ):
         if group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
+        if result_policy not in {"drop_group", "allow_partial"}:
+            raise ValueError(
+                "result_policy must be 'drop_group' or 'allow_partial', "
+                f"got {result_policy!r}."
+            )
+        if (
+            expected_samples_per_subrollout is not None
+            and expected_samples_per_subrollout < 1
+        ):
+            raise ValueError(
+                "expected_samples_per_subrollout must be >= 1 when set, "
+                f"got {expected_samples_per_subrollout}."
+            )
         self.workflow = workflow
         self.group_size = group_size
         self.logger = logger
+        self.result_policy = result_policy
+        self.expected_samples_per_subrollout = expected_samples_per_subrollout
+
+    @staticmethod
+    def _make_result_info(
+        *,
+        kind: str,
+        reason: str | None,
+        tensor_dict: dict[str, Any] | None,
+        sample_count: int,
+    ) -> dict[str, Any]:
+        return dict(
+            kind=kind,
+            reason=reason,
+            tensor_dict=tensor_dict,
+            sample_count=sample_count,
+        )
+
+    @staticmethod
+    def _attach_group_metadata(
+        tensor_dict: dict[str, Any],
+        *,
+        group_id: int,
+        expected_group_size: int,
+        actual_group_size: int,
+        is_complete: bool,
+    ) -> dict[str, Any]:
+        if not tensor_dict:
+            return tensor_dict
+
+        batch_size = get_batch_size(tensor_dict)
+        if batch_size <= 0:
+            return tensor_dict
+
+        metadata = {
+            "group_ids": torch.full((batch_size,), group_id, dtype=torch.long),
+            "group_expected_size": torch.full(
+                (batch_size,), expected_group_size, dtype=torch.long
+            ),
+            "group_actual_size": torch.full(
+                (batch_size,), actual_group_size, dtype=torch.long
+            ),
+            "group_is_complete": torch.full(
+                (batch_size,), is_complete, dtype=torch.bool
+            ),
+        }
+        return {**tensor_dict, **metadata}
+
+    def _result_to_tensor_dict(self, result: Any) -> dict[str, Any]:
+        from areal.experimental.openai import InteractionWithTokenLogpReward
+
+        if isinstance(result, dict) and result and all(
+            isinstance(v, InteractionWithTokenLogpReward) for v in result.values()
+        ):
+            return concat_padded_tensors([v.to_tensor_dict() for v in result.values()])
+        if isinstance(result, dict):
+            return result
+        raise TypeError(f"Unsupported grouped rollout result type: {type(result)}")
+
+    def _classify_result(self, result: Any) -> dict[str, Any]:
+        if isinstance(result, Exception):
+            return self._make_result_info(
+                kind="exception",
+                reason=f"{type(result).__name__}: {result}",
+                tensor_dict=None,
+                sample_count=0,
+            )
+        if result is None:
+            return self._make_result_info(
+                kind="none",
+                reason="sub-rollout returned None",
+                tensor_dict=None,
+                sample_count=0,
+            )
+        if isinstance(result, dict) and len(result) == 0:
+            return self._make_result_info(
+                kind="empty",
+                reason="sub-rollout returned empty dict",
+                tensor_dict=None,
+                sample_count=0,
+            )
+
+        try:
+            tensor_dict = self._result_to_tensor_dict(result)
+        except Exception as exc:
+            return self._make_result_info(
+                kind="invalid",
+                reason=f"failed to materialize grouped result: {exc}",
+                tensor_dict=None,
+                sample_count=0,
+            )
+
+        if not tensor_dict:
+            return self._make_result_info(
+                kind="empty_tensor_dict",
+                reason="materialized grouped result is empty",
+                tensor_dict=None,
+                sample_count=0,
+            )
+
+        sample_count = get_batch_size(tensor_dict)
+        if sample_count <= 0:
+            return self._make_result_info(
+                kind="zero_batch",
+                reason="materialized grouped result has zero batch size",
+                tensor_dict=None,
+                sample_count=0,
+            )
+
+        if self.expected_samples_per_subrollout is not None and (
+            sample_count != self.expected_samples_per_subrollout
+        ):
+            if self.result_policy == "drop_group":
+                return self._make_result_info(
+                    kind="unexpected_count",
+                    reason=(
+                        "sub-rollout sample count does not match expectation: "
+                        f"{sample_count} != {self.expected_samples_per_subrollout}"
+                    ),
+                    tensor_dict=None,
+                    sample_count=sample_count,
+                )
+
+        return self._make_result_info(
+            kind="valid",
+            reason=None,
+            tensor_dict=tensor_dict,
+            sample_count=sample_count,
+        )
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None:
-        from areal.experimental.openai import InteractionWithTokenLogpReward
+        raw_results = await asyncio.gather(
+            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)],
+            return_exceptions=True,
+        )
+        result_infos = [self._classify_result(result) for result in raw_results]
+        valid_infos = [info for info in result_infos if info["tensor_dict"] is not None]
 
-        results = await asyncio.gather(
-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
+        invalid_infos = [info for info in result_infos if info["tensor_dict"] is None]
+        task_id = workflow_context.get().task_id
+        scope = workflow_context.stat_scope()
+
+        tracker = stats_tracker.get(scope)
+        tracker.denominator(grouped_task_counter=torch.ones(1, dtype=torch.bool))
+        tracker.stat(
+            grouped_task_total=torch.ones(1, dtype=torch.float32),
+            grouped_task_invalid_subrollouts=torch.tensor(
+                [float(len(invalid_infos))], dtype=torch.float32
+            ),
+            denominator="grouped_task_counter",
+            reduce_type=ReduceType.SUM,
         )
 
-        valid_results = [r for r in results if r is not None]
+        if invalid_infos:
+            self.logger.warning(
+                "GroupedRolloutWorkflow(%s): invalid sub-rollouts=%s",
+                self.result_policy,
+                [info["reason"] for info in invalid_infos],
+            )
 
-        # All results None -> return None
-        if not valid_results:
+        if self.result_policy == "drop_group" and invalid_infos:
+            tracker.stat(
+                grouped_task_dropped=torch.tensor([1.0], dtype=torch.float32),
+                grouped_task_partial_accepted=torch.tensor([0.0], dtype=torch.float32),
+                grouped_task_complete=torch.tensor([0.0], dtype=torch.float32),
+                denominator="grouped_task_counter",
+            )
             return None
 
-        # Some results None -> warn and continue with valid ones
-        if len(valid_results) < len(results):
-            self.logger.warning(
-                f"GroupedRolloutWorkflow: {len(results) - len(valid_results)}/{len(results)} "
-                "trajectories returned None, using remaining results"
+        if not valid_infos:
+            tracker.stat(
+                grouped_task_dropped=torch.tensor([1.0], dtype=torch.float32),
+                grouped_task_partial_accepted=torch.tensor([0.0], dtype=torch.float32),
+                grouped_task_complete=torch.tensor([0.0], dtype=torch.float32),
+                denominator="grouped_task_counter",
             )
+            return None
 
-        # Check if results are InteractionWithTokenLogpReward dicts
-        first = valid_results[0]
-        if (
-            isinstance(first, dict)
-            and first
-            and all(
-                isinstance(v, InteractionWithTokenLogpReward) for v in first.values()
+        expected_group_size = (
+            self.group_size * self.expected_samples_per_subrollout
+            if self.expected_samples_per_subrollout is not None
+            else -1
+        )
+        actual_group_size = sum(info["sample_count"] for info in valid_infos)
+        is_complete = (
+            len(invalid_infos) == 0
+            and (
+                expected_group_size < 0 or actual_group_size == expected_group_size
             )
-        ):
-            # Merge dicts - each result is {completion_id: InteractionWithTokenLogpReward}
-            merged: dict[str, InteractionWithTokenLogpReward] = {}
-            for result in valid_results:
-                merged.update(result)
-            return merged if merged else None
+        )
 
-        # Otherwise, tensor dicts - concatenate
-        concatenated = concat_padded_tensors(valid_results)
+        tracker.stat(
+            grouped_task_dropped=torch.tensor([0.0], dtype=torch.float32),
+            grouped_task_partial_accepted=torch.tensor(
+                [float(not is_complete)], dtype=torch.float32
+            ),
+            grouped_task_complete=torch.tensor([float(is_complete)], dtype=torch.float32),
+            grouped_task_samples=torch.tensor([float(actual_group_size)], dtype=torch.float32),
+            denominator="grouped_task_counter",
+        )
+
+        enriched_results = [
+            self._attach_group_metadata(
+                info["tensor_dict"],
+                group_id=-1 if task_id is None else int(task_id),
+                expected_group_size=expected_group_size,
+                actual_group_size=actual_group_size,
+                is_complete=is_complete,
+            )
+            for info in valid_infos
+        ]
+
+        concatenated = concat_padded_tensors(enriched_results)
         return concatenated if concatenated else None
 
 
@@ -569,7 +761,13 @@ class RemoteInfEngine(InferenceEngine):
                 raise ValueError("proxy_addr is required for online mode")
             resolved = self._wrap_openai_agent(None, proxy_addr=proxy_addr)
             if group_size > 1:
-                resolved = GroupedRolloutWorkflow(resolved, group_size, self.logger)
+                resolved = GroupedRolloutWorkflow(
+                    resolved,
+                    group_size,
+                    self.logger,
+                    result_policy=self.config.grouped_result_policy,
+                    expected_samples_per_subrollout=self.config.grouped_expected_samples_per_subrollout,
+                )
             return resolved
 
         # 1. Already a RolloutWorkflow instance
@@ -660,7 +858,13 @@ class RemoteInfEngine(InferenceEngine):
 
         # Wrap with GroupedRolloutWorkflow if group_size > 1
         if group_size > 1:
-            resolved = GroupedRolloutWorkflow(resolved, group_size, self.logger)
+            resolved = GroupedRolloutWorkflow(
+                resolved,
+                group_size,
+                self.logger,
+                result_policy=self.config.grouped_result_policy,
+                expected_samples_per_subrollout=self.config.grouped_expected_samples_per_subrollout,
+            )
 
         return resolved
 

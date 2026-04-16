@@ -153,8 +153,9 @@ class PPOActor:
         reward_score = torch.clip(
             reward_score, max=self.reward_clip, min=-self.reward_clip
         )
+        group_ids = data.get("group_ids")
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score)
+            reward_score = self.reward_norm(reward_score, group_ids=group_ids)
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -220,7 +221,7 @@ class PPOActor:
 
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
-            advantages = self.adv_norm(advantages, loss_mask)
+            advantages = self.adv_norm(advantages, loss_mask, group_ids=group_ids)
 
         # Store data in the dict.
         data["advantages"] = advantages
@@ -303,11 +304,60 @@ class PPOActor:
                 **{k: data[k].float() for k in self.config.log_agent_stats_keys},
                 denominator="agent",
             )
+        group_ids = data.get("group_ids")
+        group_actual_size = data.get("group_actual_size")
+        group_expected_size = data.get("group_expected_size")
+        group_is_complete = data.get("group_is_complete")
+        if (
+            torch.is_tensor(group_ids)
+            and torch.is_tensor(group_actual_size)
+            and torch.is_tensor(group_expected_size)
+            and torch.is_tensor(group_is_complete)
+            and group_ids.ndim == 1
+            and group_ids.shape[0] == reward_score.shape[0]
+        ):
+            seen_group_ids = set()
+            first_indices_list = []
+            for idx, gid in enumerate(group_ids.detach().cpu().tolist()):
+                gid = int(gid)
+                if gid in seen_group_ids:
+                    continue
+                seen_group_ids.add(gid)
+                first_indices_list.append(idx)
+            first_indices = torch.tensor(
+                first_indices_list, device=group_ids.device, dtype=torch.long
+            )
+            group_actual = group_actual_size[first_indices].float()
+            group_expected = group_expected_size[first_indices].float()
+            group_complete = group_is_complete[first_indices].bool()
+            group_denominator = torch.ones_like(group_complete, dtype=torch.bool)
+            stats_tracker.denominator(
+                grouped_n_groups=group_denominator,
+                grouped_complete_groups=group_complete,
+                grouped_partial_groups=~group_complete,
+            )
+            stats_tracker.stat(
+                grouped_actual_size=group_actual,
+                grouped_expected_size=group_expected,
+                denominator="grouped_n_groups",
+            )
+            stats_tracker.stat(
+                grouped_complete_ratio=group_complete.float(),
+                denominator="grouped_n_groups",
+            )
         ########## Logging code ends ##########
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
-        for key in ["rewards", "tot_rewards", "kl_rewards"]:
+        for key in [
+            "rewards",
+            "tot_rewards",
+            "kl_rewards",
+            "group_ids",
+            "group_actual_size",
+            "group_expected_size",
+            "group_is_complete",
+        ]:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()

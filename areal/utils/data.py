@@ -261,6 +261,8 @@ def allocate_balanced_mbs_synced(
     group_indices = allocate_balanced_mbs(mb_spec, lens)
     if not dist.is_initialized():
         return group_indices
+    if dist.get_world_size(group=group) <= 1:
+        return group_indices
     all_n_mbs = all_gather_int(len(group_indices), group=group)
     if all(mbs == len(group_indices) for mbs in all_n_mbs):
         return group_indices
@@ -1183,11 +1185,14 @@ class Normalization:
         self,
         x: torch.Tensor,
         loss_mask: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        group_valid_mask: torch.Tensor | None = None,
         high_precision: bool = True,
         reduce_group=None,
     ) -> torch.Tensor:
         bs = x.size(0)
         eps = self.eps
+        work_dtype = torch.float64 if high_precision else torch.float32
 
         # Early return if no elements are active (all masked out)
         if loss_mask is not None and loss_mask.sum().item() == 0:
@@ -1205,14 +1210,19 @@ class Normalization:
             )
             mean = mean.expand_as(x)
         elif self.mean_level == "group":
-            mean = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
-                xx = x[s]
-                m = loss_mask[s] if loss_mask is not None else None
+            mean = torch.zeros_like(x, dtype=work_dtype)
+            for group_mask in self._iter_group_masks(
+                batch_size=bs,
+                x=x,
+                group_ids=group_ids,
+                group_valid_mask=group_valid_mask,
+            ):
+                xx = x[group_mask]
+                m = loss_mask[group_mask] if loss_mask is not None else None
+                group_count = int(group_mask.sum().item())
 
-                # Special case: with group_size=1 and leave_one_out=True, mean should be 0
-                if self.group_size == 1 and self.mean_leave1out:
+                # Special case: single-element groups with leave-one-out should have mean 0.
+                if group_count == 1 and self.mean_leave1out:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_mean = torch.zeros(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device
@@ -1226,9 +1236,9 @@ class Normalization:
                         all_reduce=False,
                         reduce_group=None,
                     )
-                mean[s] = group_mean.expand_as(xx)
+                mean[group_mask] = group_mean.expand_as(xx)
         else:  # mean_level == "none"
-            mean = torch.zeros_like(x)
+            mean = torch.zeros_like(x, dtype=work_dtype)
 
         # Subtract mean
         x_centered = x - mean
@@ -1249,15 +1259,20 @@ class Normalization:
             )
             std = std.expand_as(x)
         elif self.std_level == "group":
-            std = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
-                xx = x[s]
-                m = loss_mask[s] if loss_mask is not None else None
-                group_mean_slice = mean[s]  # already computed and expanded
+            std = torch.zeros_like(x, dtype=work_dtype)
+            for group_mask in self._iter_group_masks(
+                batch_size=bs,
+                x=x,
+                group_ids=group_ids,
+                group_valid_mask=group_valid_mask,
+            ):
+                xx = x[group_mask]
+                m = loss_mask[group_mask] if loss_mask is not None else None
+                group_mean_slice = mean[group_mask]
+                group_count = int(group_mask.sum().item())
 
-                # Special case: with group_size=1 and std_unbiased=True, std should be 1 for numerical stability
-                if self.group_size == 1 and self.std_unbiased:
+                # Special case: single-element groups with unbiased std should have std 1.
+                if group_count == 1 and self.std_unbiased:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_std = torch.ones(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device
@@ -1272,13 +1287,59 @@ class Normalization:
                         all_reduce=False,
                         reduce_group=reduce_group,
                     )
-                std[s] = group_std.expand_as(xx)
+                std[group_mask] = group_std.expand_as(xx)
         else:
-            std = torch.ones_like(x)
+            std = torch.ones_like(x, dtype=work_dtype)
             eps = 0.0
 
         # Normalize
         return (x_centered / (std + eps)).float()
+
+    def _iter_group_masks(
+        self,
+        batch_size: int,
+        x: torch.Tensor,
+        group_ids: torch.Tensor | None,
+        group_valid_mask: torch.Tensor | None,
+    ) -> Iterator[torch.Tensor]:
+        if group_valid_mask is not None:
+            if not torch.is_tensor(group_valid_mask) or group_valid_mask.ndim != 1:
+                raise ValueError("group_valid_mask must be a 1D tensor when provided.")
+            if group_valid_mask.shape[0] != batch_size:
+                raise ValueError(
+                    "group_valid_mask length must match batch size, "
+                    f"got {group_valid_mask.shape[0]} vs {batch_size}."
+                )
+            valid_mask = group_valid_mask.to(device=x.device, dtype=torch.bool)
+        else:
+            valid_mask = torch.ones(batch_size, device=x.device, dtype=torch.bool)
+
+        if group_ids is None:
+            for start in range(0, batch_size, self.group_size):
+                group_mask = torch.zeros(batch_size, device=x.device, dtype=torch.bool)
+                group_mask[start : min(start + self.group_size, batch_size)] = True
+                group_mask &= valid_mask
+                if group_mask.any():
+                    yield group_mask
+            return
+
+        if not torch.is_tensor(group_ids) or group_ids.ndim != 1:
+            raise ValueError("group_ids must be a 1D tensor when provided.")
+        if group_ids.shape[0] != batch_size:
+            raise ValueError(
+                f"group_ids length must match batch size, got {group_ids.shape[0]} vs {batch_size}."
+            )
+
+        group_ids = group_ids.to(device=x.device)
+        seen: set[int] = set()
+        for gid in group_ids.detach().cpu().tolist():
+            gid = int(gid)
+            if gid in seen:
+                continue
+            seen.add(gid)
+            group_mask = (group_ids == gid) & valid_mask
+            if group_mask.any():
+                yield group_mask
 
     @staticmethod
     def _compute_mean(
@@ -1306,7 +1367,11 @@ class Normalization:
             factor = mask.sum(dim, keepdim=True)
             x_sum = x_masked.sum(dim=dim, keepdim=True)
 
-        if dist.is_initialized() and all_reduce:
+        if (
+            dist.is_initialized()
+            and all_reduce
+            and dist.get_world_size(group=reduce_group) > 1
+        ):
             dist.all_reduce(factor, op=dist.ReduceOp.SUM, group=reduce_group)
             dist.all_reduce(x_sum, op=dist.ReduceOp.SUM, group=reduce_group)
 
@@ -1366,7 +1431,11 @@ class Normalization:
             x_centered = x_masked - mean * mask  # only apply mean where mask is 1
             x_sum_sq = (x_centered**2).sum(dim=dim, keepdim=True)
 
-        if dist.is_initialized() and all_reduce:
+        if (
+            dist.is_initialized()
+            and all_reduce
+            and dist.get_world_size(group=reduce_group) > 1
+        ):
             dist.all_reduce(factor, op=dist.ReduceOp.SUM, group=reduce_group)
             dist.all_reduce(x_sum_sq, op=dist.ReduceOp.SUM, group=reduce_group)
 

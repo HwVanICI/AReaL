@@ -222,7 +222,9 @@ class TrainEngine(abc.ABC):
         -------
         list[dict[str, Any]]
             A list of trajectory dictionaries, one per accepted rollout result.
-            Each trajectory contains tensors with shape [group_size, seqlen, ...].
+            Each trajectory contains tensors with shape [batch_size, seqlen, ...],
+            where batch_size is usually group_size but may vary depending on
+            grouped rollout policy and workflow output.
         """
         raise NotImplementedError()
 

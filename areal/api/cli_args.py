@@ -1795,6 +1795,23 @@ class InferenceEngineConfig:
             "help": "Whether to output verbose tracing messages for each generation request."
         },
     )
+    grouped_result_policy: str = field(
+        default="drop_group",
+        metadata={
+            "help": "How grouped rollout handles invalid or variable-sized sub-rollouts. "
+            "'drop_group': reject the whole grouped task when any sub-rollout is invalid "
+            "or does not match grouped_expected_samples_per_subrollout. "
+            "'allow_partial': keep valid sub-rollouts and emit explicit group metadata.",
+            "choices": ["drop_group", "allow_partial"],
+        },
+    )
+    grouped_expected_samples_per_subrollout: int | None = field(
+        default=1,
+        metadata={
+            "help": "Expected number of samples emitted by each sub-rollout inside a grouped task. "
+            "Used by grouped_result_policy='drop_group'. None disables per-sub-rollout cardinality checks."
+        },
+    )
     check_trajectory_format: bool = field(
         default=False,
         metadata={
@@ -1872,6 +1889,19 @@ class InferenceEngineConfig:
             raise ValueError(
                 f"scheduling_spec must contain 1 or 2 SchedulingSpec, "
                 f"got {len(self.scheduling_spec)}"
+            )
+        if self.grouped_result_policy not in {"drop_group", "allow_partial"}:
+            raise ValueError(
+                "grouped_result_policy must be 'drop_group' or 'allow_partial', "
+                f"got {self.grouped_result_policy!r}."
+            )
+        if (
+            self.grouped_expected_samples_per_subrollout is not None
+            and self.grouped_expected_samples_per_subrollout < 1
+        ):
+            raise ValueError(
+                "grouped_expected_samples_per_subrollout must be >= 1 when set, "
+                f"got {self.grouped_expected_samples_per_subrollout}."
             )
 
 

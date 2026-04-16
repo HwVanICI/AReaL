@@ -241,6 +241,13 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             style=self.export_style,
         )
 
+        if not interactions:
+            logger.warning(
+                "Session for task %s has no interactions, trajectory will be rejected.",
+                task_id,
+            )
+            return None
+
         # Record stats
         last_id = list(interactions.keys())[-1] if interactions else None
         if last_id and interactions:

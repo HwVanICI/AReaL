@@ -203,6 +203,58 @@ def test_adv_norm_group_normalization():
     assert not torch.allclose(normalized, advantages)
 
 
+def test_adv_norm_group_normalization_with_group_ids():
+    """Group normalization should regroup by explicit group_ids instead of batch order."""
+    config = NormConfig(mean_level="group", std_level="group", group_size=2)
+    adv_norm = Normalization(config)
+
+    advantages = torch.tensor([10.0, 20.0, 100.0, 200.0], dtype=torch.float32)
+    group_ids = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+
+    normalized = adv_norm(advantages, group_ids=group_ids)
+
+    expected = torch.tensor(
+        [
+            -1.0 / (torch.sqrt(torch.tensor(4050.0)) + config.eps),
+            -1.0 / (torch.sqrt(torch.tensor(16200.0)) + config.eps),
+            1.0 / (torch.sqrt(torch.tensor(4050.0)) + config.eps),
+            1.0 / (torch.sqrt(torch.tensor(16200.0)) + config.eps),
+        ],
+        dtype=torch.float32,
+    ) * 45.0  # adjusted below for readability
+    expected = torch.tensor(
+        [
+            -45.0 / (torch.sqrt(torch.tensor(4050.0)) + config.eps),
+            -90.0 / (torch.sqrt(torch.tensor(16200.0)) + config.eps),
+            45.0 / (torch.sqrt(torch.tensor(4050.0)) + config.eps),
+            90.0 / (torch.sqrt(torch.tensor(16200.0)) + config.eps),
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(normalized, expected)
+
+
+def test_adv_norm_group_normalization_with_group_ids_single_element_group():
+    """Single-element explicit groups should remain numerically stable."""
+    config = NormConfig(mean_level="group", std_level="group", group_size=8)
+    adv_norm = Normalization(config)
+
+    advantages = torch.tensor([1.0, 3.0, 1000.0], dtype=torch.float32)
+    group_ids = torch.tensor([0, 0, 1], dtype=torch.long)
+
+    normalized = adv_norm(advantages, group_ids=group_ids)
+
+    expected = torch.tensor(
+        [
+            -1.0 / (torch.sqrt(torch.tensor(2.0)) + config.eps),
+            1.0 / (torch.sqrt(torch.tensor(2.0)) + config.eps),
+            0.0,
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(normalized, expected)
+
+
 def test_adv_norm_mixed_normalization():
     """Test mixed normalization (different mean and std levels)."""
     config = NormConfig(mean_level="batch", std_level="group", group_size=2)
@@ -304,10 +356,14 @@ def test_adv_norm_dtype_preservation():
 
 
 @patch("torch.distributed.is_initialized")
+@patch("torch.distributed.get_world_size")
 @patch("torch.distributed.all_reduce")
-def test_adv_norm_distributed(mock_all_reduce, mock_is_initialized):
+def test_adv_norm_distributed(
+    mock_all_reduce, mock_get_world_size, mock_is_initialized
+):
     """Test Normalization in distributed setting."""
     mock_is_initialized.return_value = True
+    mock_get_world_size.return_value = 2
     mock_all_reduce.return_value = None
 
     config = NormConfig(mean_level="batch", std_level="batch", group_size=1)
