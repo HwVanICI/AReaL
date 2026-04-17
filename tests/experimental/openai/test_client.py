@@ -4,10 +4,13 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
+from typing import Any
 
 import pytest
 import requests
 
+from areal.api import ModelRequest, ModelResponse
 from tests.utils import get_model_path
 
 from areal.api.cli_args import SGLangConfig
@@ -33,6 +36,24 @@ def check_server_health(base_url):
         return response.status_code == 200
     except requests.exceptions.RequestException:
         return False
+
+
+@dataclass
+class _CaptureEngine:
+    tokenizer: Any
+    last_request: ModelRequest | None = None
+
+    async def agenerate(self, req: ModelRequest) -> ModelResponse:
+        self.last_request = req
+        output_tokens = self.tokenizer.encode("ok", add_special_tokens=False)
+        return ModelResponse(
+            input_tokens=req.input_ids.copy(),
+            output_tokens=output_tokens,
+            output_logprobs=[0.0] * len(output_tokens),
+            output_versions=[0] * len(output_tokens),
+            stop_reason="length",
+            tokenizer=self.tokenizer,
+        )
 
 
 @pytest.fixture(scope="module")
@@ -71,6 +92,55 @@ def sglang_server():
 @pytest.fixture(scope="module")
 def tokenizer():
     return load_hf_tokenizer(MODEL_PATH)
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_propagates_engine_max_tokens(tokenizer):
+    engine = _CaptureEngine(tokenizer=tokenizer)
+    client = ArealOpenAI(
+        engine=engine,
+        tokenizer=tokenizer,
+        tool_call_parser="qwen25",
+        reasoning_parser="qwen3",
+        engine_max_tokens=38000,
+        chat_template_type="hf",
+    )
+
+    content = ("1 " * 17000) + "What is 1+1? Please answer with \\boxed{2}."
+    await client.chat.completions.create(
+        messages=[{"role": "user", "content": content}],
+        max_completion_tokens=64,
+    )
+
+    assert engine.last_request is not None
+    assert len(engine.last_request.input_ids) > 32768
+    assert engine.last_request.gconfig.max_tokens == 38000
+    assert engine.last_request.gconfig.max_new_tokens == 64
+
+
+@pytest.mark.asyncio
+async def test_responses_create_propagates_engine_max_tokens(tokenizer):
+    engine = _CaptureEngine(tokenizer=tokenizer)
+    client = ArealOpenAI(
+        engine=engine,
+        tokenizer=tokenizer,
+        tool_call_parser="qwen25",
+        reasoning_parser="qwen3",
+        engine_max_tokens=38000,
+        chat_template_type="hf",
+    )
+
+    content = ("1 " * 17000) + "What is 1+1? Please answer with \\boxed{2}."
+    await client.responses.create(
+        input=content,
+        max_output_tokens=64,
+        tools=[],
+    )
+
+    assert engine.last_request is not None
+    assert len(engine.last_request.input_ids) > 32768
+    assert engine.last_request.gconfig.max_tokens == 38000
+    assert engine.last_request.gconfig.max_new_tokens == 64
 
 
 @pytest.fixture

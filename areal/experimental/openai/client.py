@@ -141,6 +141,26 @@ def _find_kth(lst: list, target, k: int) -> int:
         return -1
 
 
+def _resolve_request_max_tokens(
+    prompt_len: int,
+    max_new_tokens: int,
+    max_total_tokens: int | None,
+) -> int:
+    """Resolve the total token budget stored in ``GenerationHyperparameters``.
+
+    Downstream inference code enforces ``gconfig.max_tokens`` again even after the
+    OpenAI-facing client has already converted total-token constraints into
+    ``max_new_tokens``. If we leave ``max_tokens`` at its dataclass default
+    (32768), long prompts on the proxy path get rejected incorrectly. When the
+    caller supplied a total-token cap, preserve it; otherwise derive a total
+    budget that exactly matches the prompt plus the allowed completion length.
+    """
+
+    if max_total_tokens is not None:
+        return max_total_tokens
+    return prompt_len + max_new_tokens
+
+
 def concat_prompt_token_ids_with_parent(
     message_list: list[dict],
     parent: InteractionWithTokenLogpReward | None,
@@ -496,11 +516,18 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         if is_omitted(frequency_penalty):
             frequency_penalty = 0.0
 
+        resolved_max_tokens = _resolve_request_max_tokens(
+            prompt_len=len(prompt_token_ids),
+            max_new_tokens=max_new_tokens,
+            max_total_tokens=max_total_tokens_final,
+        )
+
         # Create generation config
         gconfig = GenerationHyperparameters(
             n_samples=n,
             temperature=temp,
             max_new_tokens=max_new_tokens,
+            max_tokens=resolved_max_tokens,
             top_p=top_p_val,
             stop=stop_tokens,
             greedy=temp == 0,
@@ -897,11 +924,18 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         if is_omitted(frequency_penalty):
             frequency_penalty = 0.0
 
+        resolved_max_tokens = _resolve_request_max_tokens(
+            prompt_len=len(prompt_token_ids),
+            max_new_tokens=max_new_tokens,
+            max_total_tokens=self.engine_max_tokens,
+        )
+
         # Create generation config and request
         gconfig = GenerationHyperparameters(
             n_samples=1,
             temperature=temp,
             max_new_tokens=max_new_tokens,
+            max_tokens=resolved_max_tokens,
             top_p=top_p_val,
             stop=stop,
             greedy=temp == 0,
