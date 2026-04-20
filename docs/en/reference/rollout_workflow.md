@@ -156,6 +156,10 @@ Grouped rollout runs the same workflow multiple times per input prompt, producin
 diverse completions for training. This is useful for algorithms like GRPO that benefit
 from multiple samples per prompt.
 
+For the grouped rollout policy configs (`grouped_result_policy` and
+`grouped_expected_samples_per_subrollout`), see
+[Grouped Rollout Policy Reference](./grouped_rollout_policy.md).
+
 ### Configuration
 
 Set `group_size` when submitting rollouts:
@@ -185,13 +189,24 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
 1. Results are merged based on their type:
    - **Tensor dictionaries**: Concatenated along the batch dimension
    - **InteractionWithTokenLogpReward dicts**: Merged into a single dictionary
-1. If some runs return `None` (rejected), only valid results are kept
-1. If all runs return `None`, the entire grouped result is `None`
+1. The grouped result policy then decides:
+   - `drop_group`: reject the whole grouped task if any sub-rollout is invalid
+   - `allow_partial`: keep valid sub-rollouts and attach grouped metadata
+1. If all runs are invalid, the grouped result is `None`
 
 ### Output Shape
 
-With `group_size=4` and a workflow returning `[1, seq_len]` tensors, the grouped output
-has shape `[4, seq_len]` (4 samples concatenated).
+With `group_size=4` and each sub-rollout normally returning `[1, seq_len]` tensors:
+
+- under `drop_group`, the output is either `[4, seq_len]` or the whole grouped task is rejected;
+- under `allow_partial`, the output can be `[k, seq_len]` with `0 < k <= 4`.
+
+Under `allow_partial`, the output also carries:
+
+- `group_ids`
+- `group_expected_size`
+- `group_actual_size`
+- `group_is_complete`
 
 ### Implementation
 
@@ -206,16 +221,16 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
               for _ in range(self.group_size)]
         )
 
-        # Filter None results
-        valid_results = [r for r in results if r is not None]
-        if not valid_results:
+        result_infos = [self._classify_result(result) for result in results]
+        valid_infos = [info for info in result_infos if info["tensor_dict"] is not None]
+        invalid_infos = [info for info in result_infos if info["tensor_dict"] is None]
+        if self.result_policy == "drop_group" and invalid_infos:
+            return None
+        if not valid_infos:
             return None
 
-        # Merge based on result type
-        if all_interaction_dicts(valid_results):
-            return merge_dicts(valid_results)
-        else:
-            return concat_padded_tensors(valid_results)
+        enriched = [self._attach_group_metadata(...) for info in valid_infos]
+        return concat_padded_tensors(enriched)
 ```
 
 ## Implementing Custom Workflows

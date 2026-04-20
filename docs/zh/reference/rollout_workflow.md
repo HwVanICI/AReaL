@@ -148,6 +148,10 @@ JSONL 文件的每一行包含：
 
 分组 Rollout 对每个输入提示多次运行相同工作流，生成多样化回复用于训练。这对于像 GRPO 这样受益于每个提示多个样本的算法很有用。
 
+有关 grouped rollout 新增策略配置（`grouped_result_policy` 与
+`grouped_expected_samples_per_subrollout`）的使用说明，请参阅
+[Grouped Rollout Policy Reference](./grouped_rollout_policy.md)。
+
 ### 配置
 
 提交 Rollout 时设置 `group_size`：
@@ -176,12 +180,24 @@ rollout:
 1. 根据类型合并结果：
    - **张量字典**：沿批次维度连接
    - **InteractionWithTokenLogpReward 字典**：合并为单个字典
-1. 如果某些运行返回 `None`（拒绝），仅保留有效结果
-1. 如果所有运行都返回 `None`，则整个分组结果为 `None`
+1. 根据 `grouped_result_policy` 决定：
+   - `drop_group`：任一子 rollout 无效则整组返回 `None`
+   - `allow_partial`：仅保留有效结果，并注入 grouped metadata
+1. 如果所有运行都返回无效结果，则整个分组结果为 `None`
 
 ### 输出形状
 
-当 `group_size=4` 且工作流返回 `[1, seq_len]` 张量时，分组输出的形状为 `[4, seq_len]`（4 个样本连接）。
+当 `group_size=4` 且每个子 rollout 正常返回 `[1, seq_len]` 张量时：
+
+- `drop_group` 模式下，输出要么是 `[4, seq_len]`，要么整组被拒绝；
+- `allow_partial` 模式下，输出可以是 `[k, seq_len]`，其中 `0 < k <= 4`。
+
+在 `allow_partial` 下，输出还会包含：
+
+- `group_ids`
+- `group_expected_size`
+- `group_actual_size`
+- `group_is_complete`
 
 ### 实现
 
@@ -196,16 +212,16 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
               for _ in range(self.group_size)]
         )
 
-        # 过滤 None 结果
-        valid_results = [r for r in results if r is not None]
-        if not valid_results:
+        result_infos = [self._classify_result(result) for result in results]
+        valid_infos = [info for info in result_infos if info["tensor_dict"] is not None]
+        invalid_infos = [info for info in result_infos if info["tensor_dict"] is None]
+        if self.result_policy == "drop_group" and invalid_infos:
+            return None
+        if not valid_infos:
             return None
 
-        # 根据结果类型合并
-        if all_interaction_dicts(valid_results):
-            return merge_dicts(valid_results)
-        else:
-            return concat_padded_tensors(valid_results)
+        enriched = [self._attach_group_metadata(...) for info in valid_infos]
+        return concat_padded_tensors(enriched)
 ```
 
 ## 实现自定义工作流

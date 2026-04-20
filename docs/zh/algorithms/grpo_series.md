@@ -20,6 +20,9 @@
 
 这些算法共享相同的基础目标，但在归一化策略、裁剪机制、重要性采样级别等方面有所不同。通过调整AReaL中的少量配置参数，你可以在不同算法之间切换。
 
+如果你在 agent workflow 或 grouped sampling 中使用 `gconfig.n_samples > 1`，并且需要控制“不完整 group 如何处理”，请同时参阅
+[Grouped Rollout Policy Reference](../reference/grouped_rollout_policy.md)。
+
 ## 示例用法
 
 所有算法使用相同的执行模式。我们建议修改配置YAML文件中的参数。

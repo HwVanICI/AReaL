@@ -23,6 +23,10 @@ These algorithms share the same base objective but differ in their normalization
 strategies, clipping mechanisms, importance sampling levels, etc. By adjusting a few
 configuration parameters in AReaL, you can switch between different algorithms.
 
+If you run agent workflows or grouped sampling with `gconfig.n_samples > 1`, and need to
+control how incomplete grouped tasks are handled, also see
+[Grouped Rollout Policy Reference](../reference/grouped_rollout_policy.md).
+
 ## Example Usage
 
 All algorithms use the same execution pattern. We recommend modifying parameters in the
