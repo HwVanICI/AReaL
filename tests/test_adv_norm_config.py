@@ -204,34 +204,37 @@ def test_adv_norm_group_normalization():
 
 
 def test_adv_norm_group_normalization_with_group_ids():
-    """Group normalization should regroup by explicit group_ids instead of batch order."""
+    """Group normalization should accept explicit group_ids when groups are contiguous."""
+    config = NormConfig(mean_level="group", std_level="group", group_size=2)
+    adv_norm = Normalization(config)
+
+    advantages = torch.tensor([10.0, 20.0, 100.0, 200.0], dtype=torch.float32)
+    group_ids = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+
+    normalized = adv_norm(advantages, group_ids=group_ids)
+
+    expected = torch.tensor(
+        [
+            -5.0 / (torch.sqrt(torch.tensor(50.0)) + config.eps),
+            5.0 / (torch.sqrt(torch.tensor(50.0)) + config.eps),
+            -50.0 / (torch.sqrt(torch.tensor(5000.0)) + config.eps),
+            50.0 / (torch.sqrt(torch.tensor(5000.0)) + config.eps),
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(normalized, expected)
+
+
+def test_adv_norm_group_normalization_with_non_contiguous_group_ids_raises():
+    """Explicit group_ids must form contiguous runs in batch order."""
     config = NormConfig(mean_level="group", std_level="group", group_size=2)
     adv_norm = Normalization(config)
 
     advantages = torch.tensor([10.0, 20.0, 100.0, 200.0], dtype=torch.float32)
     group_ids = torch.tensor([0, 1, 0, 1], dtype=torch.long)
 
-    normalized = adv_norm(advantages, group_ids=group_ids)
-
-    expected = torch.tensor(
-        [
-            -1.0 / (torch.sqrt(torch.tensor(4050.0)) + config.eps),
-            -1.0 / (torch.sqrt(torch.tensor(16200.0)) + config.eps),
-            1.0 / (torch.sqrt(torch.tensor(4050.0)) + config.eps),
-            1.0 / (torch.sqrt(torch.tensor(16200.0)) + config.eps),
-        ],
-        dtype=torch.float32,
-    ) * 45.0  # adjusted below for readability
-    expected = torch.tensor(
-        [
-            -45.0 / (torch.sqrt(torch.tensor(4050.0)) + config.eps),
-            -90.0 / (torch.sqrt(torch.tensor(16200.0)) + config.eps),
-            45.0 / (torch.sqrt(torch.tensor(4050.0)) + config.eps),
-            90.0 / (torch.sqrt(torch.tensor(16200.0)) + config.eps),
-        ],
-        dtype=torch.float32,
-    )
-    torch.testing.assert_close(normalized, expected)
+    with pytest.raises(ValueError, match="group_ids must form contiguous runs"):
+        adv_norm(advantages, group_ids=group_ids)
 
 
 def test_adv_norm_group_normalization_with_group_ids_single_element_group():

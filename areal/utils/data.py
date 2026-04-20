@@ -1211,15 +1211,15 @@ class Normalization:
             mean = mean.expand_as(x)
         elif self.mean_level == "group":
             mean = torch.zeros_like(x, dtype=work_dtype)
-            for group_mask in self._iter_group_masks(
+            for s in self._iter_group_slices(
                 batch_size=bs,
                 x=x,
                 group_ids=group_ids,
                 group_valid_mask=group_valid_mask,
             ):
-                xx = x[group_mask]
-                m = loss_mask[group_mask] if loss_mask is not None else None
-                group_count = int(group_mask.sum().item())
+                xx = x[s]
+                m = loss_mask[s] if loss_mask is not None else None
+                group_count = xx.shape[0]
 
                 # Special case: single-element groups with leave-one-out should have mean 0.
                 if group_count == 1 and self.mean_leave1out:
@@ -1236,7 +1236,7 @@ class Normalization:
                         all_reduce=False,
                         reduce_group=None,
                     )
-                mean[group_mask] = group_mean.expand_as(xx)
+                mean[s] = group_mean.expand_as(xx)
         else:  # mean_level == "none"
             mean = torch.zeros_like(x, dtype=work_dtype)
 
@@ -1260,16 +1260,16 @@ class Normalization:
             std = std.expand_as(x)
         elif self.std_level == "group":
             std = torch.zeros_like(x, dtype=work_dtype)
-            for group_mask in self._iter_group_masks(
+            for s in self._iter_group_slices(
                 batch_size=bs,
                 x=x,
                 group_ids=group_ids,
                 group_valid_mask=group_valid_mask,
             ):
-                xx = x[group_mask]
-                m = loss_mask[group_mask] if loss_mask is not None else None
-                group_mean_slice = mean[group_mask]
-                group_count = int(group_mask.sum().item())
+                xx = x[s]
+                m = loss_mask[s] if loss_mask is not None else None
+                group_mean_slice = mean[s]
+                group_count = xx.shape[0]
 
                 # Special case: single-element groups with unbiased std should have std 1.
                 if group_count == 1 and self.std_unbiased:
@@ -1287,7 +1287,7 @@ class Normalization:
                         all_reduce=False,
                         reduce_group=reduce_group,
                     )
-                std[group_mask] = group_std.expand_as(xx)
+                std[s] = group_std.expand_as(xx)
         else:
             std = torch.ones_like(x, dtype=work_dtype)
             eps = 0.0
@@ -1295,13 +1295,27 @@ class Normalization:
         # Normalize
         return (x_centered / (std + eps)).float()
 
-    def _iter_group_masks(
+    def _iter_group_slices(
         self,
         batch_size: int,
         x: torch.Tensor,
         group_ids: torch.Tensor | None,
         group_valid_mask: torch.Tensor | None,
-    ) -> Iterator[torch.Tensor]:
+    ) -> Iterator[slice]:
+        def _slice_from_contiguous_valid_mask(
+            valid_mask: torch.Tensor, *, base_start: int = 0
+        ) -> slice | None:
+            valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
+            if valid_indices.numel() == 0:
+                return None
+            start = int(valid_indices[0].item())
+            end = int(valid_indices[-1].item()) + 1
+            if not torch.all(valid_mask[start:end]):
+                raise ValueError(
+                    "group_valid_mask must be contiguous within each group when using group-based normalization."
+                )
+            return slice(base_start + start, base_start + end)
+
         if group_valid_mask is not None:
             if not torch.is_tensor(group_valid_mask) or group_valid_mask.ndim != 1:
                 raise ValueError("group_valid_mask must be a 1D tensor when provided.")
@@ -1316,11 +1330,12 @@ class Normalization:
 
         if group_ids is None:
             for start in range(0, batch_size, self.group_size):
-                group_mask = torch.zeros(batch_size, device=x.device, dtype=torch.bool)
-                group_mask[start : min(start + self.group_size, batch_size)] = True
-                group_mask &= valid_mask
-                if group_mask.any():
-                    yield group_mask
+                end = min(start + self.group_size, batch_size)
+                group_slice = _slice_from_contiguous_valid_mask(
+                    valid_mask[start:end], base_start=start
+                )
+                if group_slice is not None:
+                    yield group_slice
             return
 
         if not torch.is_tensor(group_ids) or group_ids.ndim != 1:
@@ -1332,14 +1347,24 @@ class Normalization:
 
         group_ids = group_ids.to(device=x.device)
         seen: set[int] = set()
-        for gid in group_ids.detach().cpu().tolist():
-            gid = int(gid)
+        gid_list = [int(gid) for gid in group_ids.detach().cpu().tolist()]
+        start = 0
+        while start < batch_size:
+            gid = gid_list[start]
             if gid in seen:
-                continue
+                raise ValueError(
+                    f"group_ids must form contiguous runs in batch order, but group_id={gid} appears multiple times."
+                )
             seen.add(gid)
-            group_mask = (group_ids == gid) & valid_mask
-            if group_mask.any():
-                yield group_mask
+            end = start + 1
+            while end < batch_size and gid_list[end] == gid:
+                end += 1
+            group_slice = _slice_from_contiguous_valid_mask(
+                valid_mask[start:end], base_start=start
+            )
+            if group_slice is not None:
+                yield group_slice
+            start = end
 
     @staticmethod
     def _compute_mean(
