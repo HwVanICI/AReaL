@@ -953,6 +953,7 @@ Refer to Megatron-LM documentation for implementation details.
 | `num_layers_in_last_pipeline_stage`        | integer \| None                                                      | `None`       | Number of layers in the last pipeline stage                                                                                                                                                       |
 | `account_for_embedding_in_pipeline_split`  | boolean                                                              | `False`      | -                                                                                                                                                                                                 |
 | `account_for_loss_in_pipeline_split`       | boolean                                                              | `False`      | -                                                                                                                                                                                                 |
+| `bridge_type`                              | string                                                               | `"mbridge"`  | Bridge backend for MegatronEngine. Choices: 'mbridge' or 'megatron-bridge'. **Choices:** `mbridge`, `megatron-bridge`                                                                             |
 
 (section-mind-speed-engine)=
 
