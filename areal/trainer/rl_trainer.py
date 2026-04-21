@@ -8,6 +8,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
 
+import ray
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -34,7 +35,7 @@ from areal.api.cli_args import (
     ValidDatasetConfig,
     vLLMConfig,
 )
-from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
+from areal.engine import RayRemotevLLMEngine, RemoteSGLangEngine, RemotevLLMEngine
 from areal.experimental.inference_service.controller.controller import (
     RolloutControllerV2,
 )
@@ -1051,7 +1052,14 @@ class PPOTrainer:
                 self.config.vllm.lora_modules = [
                     f"{self.config.gconfig.lora_name}-v0={lora_path}"
                 ]
-            engine_cls = RemotevLLMEngine
+            if ray.is_initialized() and any(
+                spec.ray_placement_strategy == "deferred"
+                for spec in self.config.rollout.scheduling_spec
+            ):
+                # gen instance spans more than 1 node
+                engine_cls = RayRemotevLLMEngine
+            else:
+                engine_cls = RemotevLLMEngine
             server_args = vLLMConfig.build_args(
                 vllm_config=self.config.vllm,
                 tp_size=self.rollout_alloc.parallel.tp_size,
