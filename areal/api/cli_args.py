@@ -922,6 +922,15 @@ class MegatronEngineConfig:
     account_for_embedding_in_pipeline_split: bool = field(default=False)
     account_for_loss_in_pipeline_split: bool = field(default=False)
 
+    # Bridge backend used for HF<->Megatron conversion/model creation.
+    bridge_type: str = field(
+        default="mbridge",
+        metadata={
+            "help": "Bridge backend for MegatronEngine. Choices: 'mbridge' or 'megatron-bridge'.",
+            "choices": ["mbridge", "megatron-bridge"],
+        },
+    )
+
 
 @dataclass
 class MindSpeedEngineConfig:
@@ -976,15 +985,6 @@ class MindSpeedEngineConfig:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
-
-    # Bridge backend used for HF<->Megatron conversion/model creation.
-    bridge_type: str = field(
-        default="mbridge",
-        metadata={
-            "help": "Bridge backend for MegatronEngine. Choices: 'mbridge' or 'megatron-bridge'.",
-            "choices": ["mbridge", "megatron-bridge"],
-        },
-    )
 
 
 class SchedulingStrategyType(str, Enum):
