@@ -655,6 +655,10 @@ https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
 | `max_lora_rank`                | integer                | `16`                                                                | -           |
 | `max_loras`                    | integer                | `8`                                                                 | -           |
 | `lora_modules`                 | list of string \| None | `None`                                                              | -           |
+| `data_parallel_size`           | integer                | `1`                                                                 | -           |
+| `tensor_parallel_size`         | integer \| None        | `None`                                                              | -           |
+| `pipeline_parallel_size`       | integer \| None        | `None`                                                              | -           |
+| `enable_expert_parallel`       | boolean                | `False`                                                             | -           |
 
 (section-train-dataset)=
 
