@@ -61,6 +61,7 @@ dependencies = [
     "huggingface_hub",
     "datasets>=3.0.0",
     "transformers==4.57.1",
+    "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@310e8fb",
     "peft",
     "qwen_agent",
     "openai-agents",
