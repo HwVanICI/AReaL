@@ -811,7 +811,7 @@ class PPOTrainer:
 
     def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
         # Save as HF models for evaluation
-        self.saver.save(
+        actor_save_path = self.saver.save(
             self.actor,
             epoch,
             epoch_step,
@@ -828,6 +828,18 @@ class PPOTrainer:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
                 name="critic",
+            )
+        if (
+            actor_save_path is not None
+            and self.actor.is_data_parallel_head()
+            and isinstance(self.config.vllm, vLLMConfig)
+            and self.config.vllm.save_rank_weights_on_checkpoint
+            and hasattr(self.rollout, "save_rank_weights")
+        ):
+            self.rollout.save_rank_weights(
+                actor_save_path,
+                global_step,
+                self.config.vllm.save_rank_weights_subdir,
             )
         # Async mode: synchronization handled by AsyncCheckpointManager
         if not self.saver.is_async:

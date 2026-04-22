@@ -256,6 +256,12 @@ class RemoteInfBackendProtocol(Protocol):
         """
         ...
 
+    def get_save_rank_weights_request(
+        self, save_dir: str, global_step: int, subdir: str
+    ) -> HttpRequest:
+        """Get request to save rank-local inference weights."""
+        ...
+
     def get_health_check_request(self) -> HttpRequest:
         """Get the health check request.
 
@@ -1207,6 +1213,20 @@ class RemoteInfEngine(InferenceEngine):
         """Onload model memory on all servers."""
         onload_req = self.backend.get_onload_request(tags=tags)
         self._run_request_on_all_servers(onload_req)
+
+    def save_rank_weights(
+        self,
+        save_dir: str,
+        global_step: int,
+        subdir: str,
+    ) -> None:
+        """Save rank-local inference weights on all servers."""
+        save_req = self.backend.get_save_rank_weights_request(
+            save_dir=save_dir,
+            global_step=global_step,
+            subdir=subdir,
+        )
+        self._run_request_on_all_servers(save_req)
 
     def _run_request_on_all_servers(self, req: HttpRequest):
         async def _fn():

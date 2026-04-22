@@ -1028,6 +1028,20 @@ class RolloutController:
     async def continue_generation(self):
         await self._collective_rpc_async("continue_generation")
 
+    def save_rank_weights(
+        self,
+        save_dir: str,
+        global_step: int,
+        subdir: str,
+    ) -> None:
+        self._collective_rpc(
+            "save_rank_weights",
+            save_dir=save_dir,
+            global_step=global_step,
+            subdir=subdir,
+            http_timeout=300.0,
+        )
+
     def set_version(self, version: int) -> None:
         with self._version_lock:
             self._version = version

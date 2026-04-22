@@ -122,11 +122,11 @@ class Saver:
         tokenizer: PreTrainedTokenizerFast | None = None,
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
-    ):
+    ) -> str | None:
         if not self.freq_ctl.check(
             epochs=int(step == self.ft_spec.steps_per_epoch - 1), steps=1
         ):
-            return
+            return None
         path = Saver.get_model_save_path(
             self.config.experiment_name,
             self.config.trial_name,
@@ -149,6 +149,7 @@ class Saver:
                 base_model_path=base_model_path,
             )
             engine.save(meta)
+        return path
 
     def _async_save(
         self,

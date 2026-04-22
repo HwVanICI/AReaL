@@ -93,6 +93,12 @@ class UpdateWeightsFromXcclRequestLora(OpenAIBaseModel):
     group_name: str
 
 
+class SaveRankWeightsRequest(OpenAIBaseModel):
+    save_dir: str
+    global_step: int
+    subdir: str
+
+
 def to_json_response(success, message):
     content = {"success": success, "message": message}
     if success:
@@ -224,6 +230,23 @@ async def set_weight_meta_xccl_lora(
     return build_response(ret_list)
 
 
+@router.post("/areal_save_rank_weights")
+async def save_rank_weights(request: SaveRankWeightsRequest, raw_request: Request):
+    logger.info(
+        "API server starts save_rank_weights at step %s into %s",
+        request.global_step,
+        request.save_dir,
+    )
+    llm = raw_request.app.state.engine_client
+    ret_list = await llm.engine_core.call_utility_async(
+        "areal_injected_save_rank_weights",
+        request.save_dir,
+        request.global_step,
+        request.subdir,
+    )
+    return build_response(ret_list)
+
+
 @router.post("/areal_pause_generation")
 async def pause_generation(raw_request: Request):
     logger.info("API server starts pause_generation and aborts all requests")
@@ -343,6 +366,13 @@ def areal_injected_update_weight_lora_xccl(self):
     return self.collective_rpc("update_weight_lora_xccl")
 
 
+def areal_injected_save_rank_weights(self, save_dir, global_step, subdir):
+    return self.collective_rpc(
+        "save_rank_weights",
+        args=(save_dir, global_step, subdir),
+    )
+
+
 def finish_request(self, req_state: "RequestState"):
     if req_state.lora_name is None:
         return
@@ -369,6 +399,11 @@ def hook():
         EngineCore,
         "areal_injected_update_weight_lora_xccl",
         areal_injected_update_weight_lora_xccl,
+    )
+    setattr(
+        EngineCore,
+        "areal_injected_save_rank_weights",
+        areal_injected_save_rank_weights,
     )
 
     # Patch for LoRARequestStates management in vllm < v0.11.0

@@ -1,3 +1,4 @@
+import os
 import traceback
 
 import torch
@@ -146,6 +147,38 @@ class VLLMWorkerExtension:
             return True, "Success"
         except Exception as e:
             error_msg = f"Failed to update parameter! {e}."
+            logger.error(error_msg)
+            return False, error_msg
+
+    def save_rank_weights(
+        self,
+        save_dir: str,
+        global_step: int,
+        subdir: str,
+    ):
+        logger.info(
+            "Saving vLLM rank-local weights for rank=%s at global_step=%s",
+            self.rank,
+            global_step,
+        )
+        try:
+            rank_dir = os.path.join(save_dir, subdir, f"rank_{self.rank}")
+            os.makedirs(rank_dir, exist_ok=True)
+
+            state = {}
+            for name, param in self.model_runner.model.named_parameters():
+                if param is None:
+                    continue
+                state[name] = param.detach().cpu()
+
+            save_path = os.path.join(rank_dir, f"step_{global_step}.pt")
+            torch.save(state, save_path)
+            return True, f"Saved rank {self.rank} weights to {save_path}"
+        except Exception as e:
+            error_msg = (
+                f"Failed to save rank-local weights on rank {self.rank}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
             logger.error(error_msg)
             return False, error_msg
 

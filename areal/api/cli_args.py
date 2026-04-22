@@ -1309,6 +1309,8 @@ class vLLMConfig:
     )
     enable_sleep_mode: bool = False
     uvicorn_log_level: str = "warning"
+    save_rank_weights_on_checkpoint: bool = False
+    save_rank_weights_subdir: str = "vllm_rank_weights"
     # lora
     enable_lora: bool = False
     max_lora_rank: int = 16  # vllm's default

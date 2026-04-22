@@ -216,6 +216,19 @@ class VLLMBackend:
         """Get vLLM resume request."""
         return HttpRequest(endpoint="/areal_continue_generation", payload={})
 
+    def get_save_rank_weights_request(
+        self, save_dir: str, global_step: int, subdir: str
+    ) -> HttpRequest:
+        """Get vLLM rank-local weight save request."""
+        return HttpRequest(
+            endpoint="/areal_save_rank_weights",
+            payload={
+                "save_dir": save_dir,
+                "global_step": global_step,
+                "subdir": subdir,
+            },
+        )
+
     def get_health_check_request(self) -> HttpRequest:
         """Get vLLM health check request."""
         return HttpRequest(endpoint="/health", payload={}, method="GET")
@@ -341,6 +354,15 @@ class RemotevLLMEngine(InferenceEngine):
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
         """Update weights from disk."""
         return self._engine.update_weights_from_disk(meta)
+
+    def save_rank_weights(
+        self,
+        save_dir: str,
+        global_step: int,
+        subdir: str,
+    ) -> None:
+        """Save rank-local vLLM weights on all servers."""
+        return self._engine.save_rank_weights(save_dir, global_step, subdir)
 
     def submit(
         self,
