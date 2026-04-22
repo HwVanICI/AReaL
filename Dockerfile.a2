@@ -30,7 +30,6 @@ RUN git clone --depth 1 --branch ${MEGATRON_TAG} https://github.com/NVIDIA/Megat
     git clone --depth 1 --branch ${MINDSPEED_TAG} https://gitcode.com/Ascend/MindSpeed.git /areal-workspace/MindSpeed && \
     cp -r /areal-workspace/Megatron-LM/megatron /areal-workspace/MindSpeed/megatron && \
     python3 -m pip install -e /areal-workspace/MindSpeed --no-deps && \
-    python3 -m pip install mbridge==0.15.1 && \
     python3 -m pip cache purge
 
 # Install SGLang
