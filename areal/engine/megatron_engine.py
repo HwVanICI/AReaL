@@ -43,6 +43,10 @@ def _ms_sanitized_get_full_args():
 
 _ms_args_basic.get_full_args = _ms_sanitized_get_full_args
 
+# Install mbridge compatibility shims (missing mcore APIs, transformer_engine
+# stub) before the first ``import mbridge``. See areal/utils/mbridge_compat.py.
+import areal.utils.mbridge_compat  # noqa: F401, I001  # isort: skip
+
 import mbridge
 import torch
 import torch.distributed as dist
@@ -155,6 +159,8 @@ from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
 
 if TYPE_CHECKING:
+    from megatron.bridge.peft.lora import LoRA as MegatronBridgeLoRA
+
     from areal.api import Scheduler
     from areal.api.cli_args import DPOEngineConfig, PPOActorConfig, PPOCriticConfig
 
