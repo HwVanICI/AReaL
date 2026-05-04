@@ -1099,6 +1099,7 @@ Refer to Megatron-LM documentation for implementation details.
 | `account_for_embedding_in_pipeline_split`  | boolean                                                              | `False`      | -                                                                                                                                                                                                 |
 | `account_for_loss_in_pipeline_split`       | boolean                                                              | `False`      | -                                                                                                                                                                                                 |
 | `bridge_type`                              | string                                                               | `"mbridge"`  | Bridge backend for MegatronEngine. Choices: 'mbridge' or 'megatron-bridge'. **Choices:** `mbridge`, `megatron-bridge`                                                                             |
+| `use_mbridge_save`                         | bool                                                                 | `False`      | Use mbridge's save method to save gpu memory when saving weights.                                                                                                                                 |
 
 (section-memory-profiler)=
 

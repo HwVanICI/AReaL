@@ -931,6 +931,13 @@ class MegatronEngineConfig:
         },
     )
 
+    use_mbridge_save: bool = field(
+        default=False,
+        metadata={
+            "help": "Use mbridge's save method to save gpu memory when saving weights."
+        },
+    )
+
 
 @dataclass
 class MindSpeedEngineConfig:

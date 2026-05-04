@@ -232,7 +232,6 @@ def save_weights_to_hf_with_mbridge_fast(
     base_model_path: str | None = None,
     max_shard_size_byte: int = int(3e9),
     max_workers: int | None = None,
-    is_critic: bool = False,
     fp8_direct_convert: bool = False,
 ):
     # 1. Prepare some global metadata required for saving the model.
@@ -588,8 +587,9 @@ def save_weights_to_hf_with_mbridge_fast(
             copy_hf_configs(base_model_path, weights_path)
             _patch_saved_config(base_model_path, weights_path)
 
-    # 8. Save ValueHead weights separately for critic models.
-    if is_critic and mpu.is_pipeline_last_stage():
+
+def save_critic_value_head(models, weights_path):
+    if mpu.is_pipeline_last_stage():
         is_tp_first = mpu.get_tensor_model_parallel_rank() == 0
         is_dp_first = mpu.get_data_parallel_rank(with_context_parallel=True) == 0
         should_save_value_head = is_tp_first and is_dp_first
