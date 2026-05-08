@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AwexSchedulerBridge: compose awex weight-update methods onto SGLang Scheduler."""
+"""AwexSchedulerBridge + PPSchedulerBridge: compose weight-update methods onto SGLang Scheduler."""
 
 from __future__ import annotations
 
@@ -122,8 +122,10 @@ class AwexSchedulerBridge:
 # Duplicated from sglang.srt.managers.scheduler.run_scheduler_process
 # (SGLang commit pinned in this repo).
 #
-# The ONLY addition is AwexSchedulerBridge(scheduler).bind() after the
-# Scheduler() constructor, marked with BEGIN/END AREAL comments.
+# AReaL additions are between # ---- BEGIN AREAL ---- / # ---- END AREAL ----
+# markers.  Deltas vs upstream:
+#   1. AwexSchedulerBridge(scheduler).bind()   -- awex weight update service
+#   2. PPSchedulerBridge(scheduler, server_args).bind()  -- per-PP-rank NCCL groups
 # ---------------------------------------------------------------------------
 
 
@@ -144,8 +146,9 @@ def areal_run_scheduler_process(
     Duplicated from SGLang source.  AReaL additions are between
     ``# ---- BEGIN AREAL ----`` / ``# ---- END AREAL ----`` markers.
 
-    Only delta vs upstream:
-      After ``Scheduler()`` creation → ``AwexSchedulerBridge(scheduler).bind()``
+    Deltas vs upstream:
+      1. After ``Scheduler()`` creation -> ``AwexSchedulerBridge(scheduler).bind()``
+      2. After ``Scheduler()`` creation -> ``PPSchedulerBridge(scheduler, server_args).bind()``
     """
     import signal
 
@@ -166,6 +169,10 @@ def areal_run_scheduler_process(
         numa_bind_to_node,
     )
     from sglang.utils import get_exception_traceback
+
+    from areal.experimental.inference_service.sglang.pp_bridge import (
+        PPSchedulerBridge,
+    )
 
     logger = logging.getLogger(__name__)
     dp_rank = configure_scheduler(
@@ -210,6 +217,7 @@ def areal_run_scheduler_process(
 
         # ---- BEGIN AREAL ----
         AwexSchedulerBridge(scheduler).bind()
+        PPSchedulerBridge(scheduler, server_args).bind()
         # ---- END AREAL ----
 
         pipe_writer.send(scheduler.get_init_info())

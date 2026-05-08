@@ -448,6 +448,7 @@ class RolloutControllerV2:
                     return SGLangConfig.build_cmd(
                         sglang_config=sglang_config,
                         tp_size=tp_size,
+                        pp_size=alloc.parallel.pp_size,
                         base_gpu_id=0,
                         host=host,
                         port=port,
