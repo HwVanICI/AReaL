@@ -53,12 +53,12 @@ class RTensorBackend(Protocol):
         """
         ...
 
-    async def delete(self, node_addr: str, shard_ids: list[Any]) -> None:
+    async def delete(self, node_addr: Any, shard_ids: list[Any]) -> None:
         """Delete shards from storage.
 
         Parameters
         ----------
-        node_addr : str
+        node_addr : Any
             The node address where shards are stored
         shard_ids : list[Any]
             List of shard IDs to delete
@@ -77,12 +77,12 @@ class TensorShardInfo:
     ----------
     shard_id : Any
         Unique identifier for the shard (str for HTTP, ray.ObjectRef for Ray)
-    node_addr : str
-        Network address where shard is stored (empty for Ray backend)
+    node_addr : Any
+        Network address where shard is stored, or a Ray actor handle for Ray backend.
     """
 
     shard_id: Any
-    node_addr: str
+    node_addr: Any
 
 
 class HttpRTensorBackend:
@@ -272,18 +272,56 @@ class HttpRTensorBackend:
 
 class RayRTensorBackend:
     def fetch(self, shards: list[TensorShardInfo]) -> list[torch.Tensor]:
-        """Fetch multiple shards from Ray object store."""
+        """Fetch multiple shards from the owning Ray actors."""
         if not shards:
             return []
-        return ray.get([s.shard_id for s in shards])
 
-    def store(self, tensor: torch.Tensor) -> ray.ObjectRef:
-        """Store tensor in Ray object store, return ObjectRef."""
-        return ray.put(tensor)
+        current_actor = ray.get_runtime_context().current_actor
+        current_actor_id = getattr(current_actor, "_actor_id", None)
+        results: list[torch.Tensor | None] = [None] * len(shards)
+        remote_refs: list[tuple[int, ray.ObjectRef]] = []
 
-    async def delete(self, node_addr: str, shard_ids: list[Any]) -> None:
-        """Free objects from Ray object store."""
-        ray.internal.free(shard_ids)
+        for idx, shard in enumerate(shards):
+            owner_actor = shard.node_addr
+            owner_actor_id = getattr(owner_actor, "_actor_id", None)
+
+            if current_actor_id is not None and owner_actor_id == current_actor_id:
+                results[idx] = fetch(shard.shard_id)
+            elif hasattr(owner_actor, "fetch_rtensor"):
+                remote_refs.append(
+                    (idx, owner_actor.fetch_rtensor.remote(shard.shard_id))
+                )
+            else:
+                results[idx] = ray.get(shard.shard_id)
+
+        if remote_refs:
+            values = ray.get([ref for _, ref in remote_refs])
+            for (idx, _), tensor in zip(remote_refs, values, strict=True):
+                results[idx] = tensor
+
+        return cast(list[torch.Tensor], results)
+
+    def store(self, tensor: torch.Tensor) -> Any:
+        """Store tensor in local actor storage or Ray object store."""
+        if ray.get_runtime_context().current_actor is None:
+            return ray.put(tensor)
+        shard_id = str(uuid.uuid4())
+        _store_local(shard_id, tensor)
+        return shard_id
+
+    async def delete(self, node_addr: Any, shard_ids: list[str]) -> None:
+        """Delete shards from the owning Ray actor."""
+        current_actor = ray.get_runtime_context().current_actor
+        current_actor_id = getattr(current_actor, "_actor_id", None)
+        owner_actor_id = getattr(node_addr, "_actor_id", None)
+        if current_actor_id is not None and owner_actor_id == current_actor_id:
+            for shard_id in shard_ids:
+                remove(shard_id)
+            return
+        if hasattr(node_addr, "delete_rtensor"):
+            await node_addr.delete_rtensor.remote(shard_ids)
+        else:
+            ray.internal.free(shard_ids)
 
 
 _backend: RTensorBackend | None = None
@@ -517,7 +555,7 @@ class RTensor:
         return obj
 
     @staticmethod
-    def collect_shards(obj: Any) -> dict[str, list[Any]]:
+    def collect_shards(obj: Any) -> dict[Any, list[Any]]:
         """Collect shard IDs grouped by node address from nested structure.
 
         Parameters
@@ -527,10 +565,10 @@ class RTensor:
 
         Returns
         -------
-        dict[str, list[Any]]
+        dict[Any, list[Any]]
             Mapping of node_addr -> list of shard_ids
         """
-        shards_by_node: dict[str, list[Any]] = {}
+        shards_by_node: dict[Any, list[Any]] = {}
 
         def _collect(o: Any) -> None:
             if isinstance(o, RTensor):
@@ -548,7 +586,7 @@ class RTensor:
         return shards_by_node
 
     @staticmethod
-    async def clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+    async def clear_node(node_addr: Any, shard_ids: list[Any]) -> None:
         """Clear shards from a node and evict them from the fetch buffer.
 
         Parameters

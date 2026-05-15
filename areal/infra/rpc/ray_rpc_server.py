@@ -15,6 +15,7 @@ import requests
 
 from areal.api import InferenceEngine, TrainEngine
 from areal.api.cli_args import BaseExperimentConfig
+from areal.infra.rpc import rtensor
 from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.proc import kill_process_tree
@@ -254,7 +255,9 @@ class RayRPCServer(RayServer):
             if isinstance(result, Future):
                 result = result.result()
             # Convert all tensors to RTensors and store the tensor locally
-            result = RTensor.remotize(result, node_addr="")
+            result = RTensor.remotize(
+                result, node_addr=ray.get_runtime_context().current_actor
+            )
             # put back to cpu to mimic RPCServer encode/decode
             result = tensor_container_to(result, "cpu")
             self.logger.debug(f"Successfully completed RayRPCServer call {result}")
@@ -279,6 +282,12 @@ class RayRPCServer(RayServer):
         self._engines.clear()
         self._default_engine_name = None
         ray.actor.exit_actor()
+
+    def fetch_rtensor(self, shard_id: str) -> Any:
+        return rtensor.fetch(shard_id)
+
+    def delete_rtensor(self, shard_ids: list[str]) -> int:
+        return sum(rtensor.remove(shard_id) for shard_id in shard_ids)
 
 
 @ray.remote
