@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import shlex
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -142,6 +143,21 @@ class RayScheduler(Scheduler):
         env.update(thread_env)
         return env
 
+    @staticmethod
+    def _command_module(command: str | None) -> str:
+        if not command:
+            return ""
+        parts = shlex.split(command)
+        if "-m" not in parts:
+            return parts[0] if parts else ""
+        module_idx = parts.index("-m") + 1
+        return parts[module_idx] if module_idx < len(parts) else ""
+
+    @classmethod
+    def _uses_http_guard(cls, spec: SchedulingSpec) -> bool:
+        module = cls._command_module(spec.cmd)
+        return module.endswith(".guard") or ".guard." in module
+
     def _get_placement_strategy(
         self, schedulings: list[SchedulingSpec]
     ) -> RayPlacementStrategy:
@@ -191,15 +207,36 @@ class RayScheduler(Scheduler):
             )
             worker_id = f"{role}/{idx}"
             env = self._build_env_vars(spec)
-            actor = RayRPCServer.options(
-                **options,
-                name=worker_id,
-                runtime_env=RuntimeEnv(env_vars=env),
-                scheduling_strategy=pg_scheduling_strategy,
-            ).remote(config=self.exp_config)
+            use_http_guard = self._uses_http_guard(spec)
 
-            # 0 needed to pad the list as the trainer takes index 1 for ports
-            worker_ports = ["0", str(master_port)]
+            if use_http_guard:
+                actor = RayHTTPLauncher.options(
+                    **options,
+                    name=worker_id,
+                    runtime_env=RuntimeEnv(env_vars=env),
+                    scheduling_strategy=pg_scheduling_strategy,
+                ).remote(
+                    config=self.exp_config,
+                    command=spec.cmd,
+                    worker_index=idx,
+                    role=role,
+                )
+                worker_ports = list(
+                    map(
+                        str,
+                        ray.get(actor.alloc_ports.remote(count=1)),
+                    )
+                )
+                ray.get(actor.post_init.remote(port=int(worker_ports[0])))
+            else:
+                actor = RayRPCServer.options(
+                    **options,
+                    name=worker_id,
+                    runtime_env=RuntimeEnv(env_vars=env),
+                    scheduling_strategy=pg_scheduling_strategy,
+                ).remote(config=self.exp_config)
+                # 0 needed to pad the list as the trainer takes index 1 for ports
+                worker_ports = ["0", str(master_port)]
             worker = Worker(
                 id=worker_id, ip=master_ip, worker_ports=worker_ports, engine_ports=[]
             )

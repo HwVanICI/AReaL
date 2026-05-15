@@ -27,6 +27,21 @@ from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import find_free_ports
 
 
+def _build_python_module_cmd(command: str) -> list[str]:
+    """Build a module command from ``module`` or ``python -m module``."""
+    parts = shlex.split(command)
+    if not parts:
+        raise RuntimeError("Cannot launch server without a command.")
+
+    if "-m" in parts:
+        module_idx = parts.index("-m") + 1
+        if module_idx >= len(parts):
+            raise RuntimeError(f"Invalid Python module command: {command}")
+        return [sys.executable, "-m", *parts[module_idx:]]
+
+    return [sys.executable, "-m", *parts]
+
+
 class RayServer(abc.ABC):
     """
     Ray actor base class that all Ray actors under RayScheduler should inherit from
@@ -346,8 +361,7 @@ class RayHTTPLauncher(RayServer):
                 f"Command was not given to {self.__class__.__name__}.launch_server. Cannot launch without command."
             )
 
-        cmd = [sys.executable, "-m"]
-        cmd.extend(shlex.split(self.command))
+        cmd = _build_python_module_cmd(self.command)
         cmd.extend(["--port", str(port)])
 
         cmd.extend(["--experiment-name", self.config.experiment_name])
