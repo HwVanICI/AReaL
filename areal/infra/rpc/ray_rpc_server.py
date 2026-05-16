@@ -289,6 +289,14 @@ class RayRPCServer(RayServer):
     def delete_rtensor(self, shard_ids: list[str]) -> int:
         return sum(rtensor.remove(shard_id) for shard_id in shard_ids)
 
+    def clear_all_rtensors(self) -> tuple[int, int]:
+        """Defensive sweep of actor-local ``_storage`` and ``_fetch_buffer``.
+
+        Used at training step end to drain RTensors that weren't tracked by
+        ``TrainController.clear_batches``. See inclusionAI/AReaL#1209.
+        """
+        return rtensor.clear_all_local()
+
 
 @ray.remote
 class RayHTTPLauncher(RayServer):
