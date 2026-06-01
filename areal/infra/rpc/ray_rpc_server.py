@@ -341,7 +341,14 @@ class RayHTTPLauncher(RayServer):
         }
         return self._post_request("create_engine", payload)
 
-    def call(self, method: str, *args, engine_name: str | None = None, **kwargs) -> Any:
+    def call(
+        self,
+        method: str,
+        *args,
+        engine_name: str | None = None,
+        rpc_meta: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> Any:
         self.logger.debug(
             f"Calling {method} on engine '{engine_name}' with arguments {args=} {kwargs=}"
         )
@@ -351,6 +358,7 @@ class RayHTTPLauncher(RayServer):
             "engine_name": engine_name,
             "args": serialize_value(list(args)),
             "kwargs": serialize_value(kwargs),
+            "rpc_meta": rpc_meta,
         }
         return self._post_request("call", payload)
 
@@ -417,6 +425,24 @@ class RayHTTPLauncher(RayServer):
         retry_delay: float = 1.0,
     ):
         url = f"{self.url}/{endpoint}"
+
+        def _response_error_detail(response: requests.Response) -> str:
+            try:
+                body = response.json()
+            except ValueError:
+                body_text = response.text.strip()
+                if len(body_text) > 2000:
+                    body_text = body_text[:2000] + "...<truncated>"
+                return body_text or response.reason or "empty response body"
+            if isinstance(body, dict):
+                return str(
+                    body.get("detail")
+                    or body.get("error")
+                    or body.get("message")
+                    or body
+                )
+            return str(body)
+
         # adapted from local scheduler
         for attempt in range(1, max_retries + 1):
             if self.worker_process and self.worker_process.poll() is not None:
@@ -429,15 +455,19 @@ class RayHTTPLauncher(RayServer):
                 deserialized_result = deserialize_value(result)
                 return deserialized_result
             elif response.status_code in [400, 500]:
-                error_detail = response.json().get("detail", "unknown error")
-                return error_detail
+                error_detail = _response_error_detail(response)
+                raise RuntimeError(
+                    f"POST {url} failed with HTTP {response.status_code}: "
+                    f"{error_detail}"
+                )
 
             # otherwise retry
             if attempt < max_retries:
                 delay = retry_delay * (2 ** (attempt - 1))
+                error_detail = _response_error_detail(response)
                 self.logger.warning(
                     f"Calling url {url} failed on actor '{ray.runtime_context.get_runtime_context().current_actor}' "
-                    f"(attempt {attempt}/{max_retries}): {response.json()}. "
+                    f"(attempt {attempt}/{max_retries}): HTTP {response.status_code}: {error_detail}. "
                     f"Retrying in {delay:.1f}s..."
                 )
                 time.sleep(delay)
