@@ -106,7 +106,10 @@ from areal.engine.megatron_utils.megatron import (
     patch_torch_all_gather_object,
     remove_padding,
 )
-from areal.engine.megatron_utils.megatron_lora import get_vllm_lora_target_modules
+from areal.engine.megatron_utils.megatron_lora import (
+    get_vllm_lora_target_modules,
+    patch_mbridge_name_mapping,
+)
 from areal.engine.megatron_utils.packed_context_parallel import (
     _is_multi_modal_payload_key,
     extract_vision_from_multi_modal,
@@ -362,6 +365,161 @@ class MegatronEngine(TrainEngine):
         self.is_vision_model: bool = False
         self.processor = None
         self.awex_writer: AwexMegatronWriterAdapter | None = None
+        self.lora_mode = self.config.use_merged_lora or self.config.use_lora
+
+    def print_trainable_parameters(self, model):
+        trainable_params = 0
+        all_param = 0
+        lora_params = 0
+
+        for name, param in model.named_parameters():
+            all_param += param.numel()
+            if param.requires_grad:
+                trainable_params += param.numel()
+                if "lora" in name.lower():
+                    lora_params += param.numel()
+                    print(
+                        f"LoRA param: {name:60s} | shape: {str(param.shape):20s} | numel: {param.numel():>10,}"
+                    )
+
+        print(f"\n{'=' * 100}")
+        print(
+            f"LoRA params:      {lora_params:>15,} || LoRA trainable%: {100 * lora_params / all_param:.4f}%"
+        )
+        print(
+            f"Trainable params: {trainable_params:>15,} || all params: {all_param:>15,} || trainable%: {100 * trainable_params / all_param:.4f}%"
+        )
+
+        lora_rank = self.config.lora_rank
+        lora_alpha = self.config.lora_alpha
+        lora_target_modules = self.config.target_modules
+        lora_dropout = self.config.lora_dropout
+        print(
+            f"LoRA config:  Rank {lora_rank}, Alpha {lora_alpha}, Dropout {lora_dropout}, Target Modules {lora_target_modules} "
+        )
+
+        print(f"{'=' * 100}")
+
+    def wrap_model_with_lora(self):
+        from peft import LoraConfig, get_peft_model
+
+        # Build megatron config dict for PEFT
+        megatron_config_dict = {
+            # Architecture from self.hf_config
+            "num_layers": self.hf_config.num_hidden_layers,
+            "hidden_size": self.hf_config.hidden_size,
+            "num_attention_heads": self.hf_config.num_attention_heads,
+            "num_query_groups": self.hf_config.num_key_value_heads,
+            "ffn_hidden_size": self.hf_config.intermediate_size,
+            "layernorm_epsilon": self.hf_config.rms_norm_eps,
+            "attention_dropout": self.hf_config.attention_dropout,
+            "hidden_dropout": 0.0,
+            # MoE Architecture (handle different naming)
+            "num_moe_experts": getattr(
+                self.hf_config,
+                "num_experts",
+                getattr(self.hf_config, "n_routed_experts", None),
+            ),
+            "moe_router_topk": getattr(self.hf_config, "num_experts_per_tok", None),
+            "moe_ffn_hidden_size": getattr(
+                self.hf_config, "moe_intermediate_size", None
+            ),
+            "moe_aux_loss_coeff": getattr(
+                self.hf_config,
+                "router_aux_loss_coef",
+                getattr(self.hf_config, "aux_loss_coef", 0.01),
+            ),
+            # GLM-4 specific MoE settings
+            "moe_shared_expert_intermediate_size": getattr(
+                self.hf_config, "intermediate_size", None
+            )
+            if getattr(self.hf_config, "n_shared_experts", 0) > 0
+            else None,
+            # Parallelism from self.parallel_strategy
+            "tensor_model_parallel_size": self.parallel_strategy.tensor_parallel_size,
+            "pipeline_model_parallel_size": self.parallel_strategy.pipeline_parallel_size,
+            "sequence_parallel": self.parallel_strategy.use_sequence_parallel,
+            "expert_model_parallel_size": self.parallel_strategy.expert_parallel_size,
+            "expert_tensor_parallel_size": self.parallel_strategy.expert_tensor_parallel_size,
+            # From self.config.megatron (safe access)
+            "virtual_pipeline_model_parallel_size": getattr(
+                self.config.megatron, "virtual_pipeline_model_parallel_size", 1
+            ),
+            "recompute_granularity": getattr(
+                self.config.megatron, "recompute_granularity", "full"
+            ),
+            "recompute_method": getattr(
+                self.config.megatron, "recompute_method", "uniform"
+            ),
+            "recompute_num_layers": getattr(
+                self.config.megatron, "recompute_num_layers", 1
+            ),
+            "distribute_saved_activations": getattr(
+                self.config.megatron, "distribute_saved_activations", None
+            ),
+            "recompute_modules": getattr(
+                self.config.megatron, "recompute_modules", None
+            ),
+            # MoE settings from self.config.megatron (safe access)
+            "moe_shared_expert_overlap": getattr(
+                self.config.megatron, "moe_shared_expert_overlap", False
+            ),
+            "moe_enable_deepep": getattr(
+                self.config.megatron, "moe_enable_deepep", False
+            ),
+            "moe_token_dispatcher_type": getattr(
+                self.config.megatron, "moe_token_dispatcher_type", "alltoall"
+            ),
+            "moe_permute_fusion": getattr(
+                self.config.megatron, "moe_permute_fusion", False
+            ),
+            # Dtype settings
+            "bf16": self.config.dtype == "bfloat16",
+            "fp16": self.config.dtype == "float16",
+            "params_dtype": torch.bfloat16
+            if self.config.dtype == "bfloat16"
+            else torch.float32,
+            "pipeline_dtype": torch.bfloat16
+            if self.config.dtype == "bfloat16"
+            else torch.float32,
+            # Activation & Normalization
+            "normalization": "RMSNorm",
+            "gated_linear_unit": True,
+            # CRITICAL: MoE doesn't support bias - force to False even if HF config says True
+            "add_bias_linear": False,
+            "add_qkv_bias": False,
+            "qk_layernorm": getattr(self.hf_config, "use_qk_norm", False),
+            # Initialization
+            "use_cpu_initialization": True,
+            "deterministic_mode": getattr(
+                self.config.megatron, "use_deterministic_algorithms", False
+            ),
+            "init_method_std": self.hf_config.initializer_range,
+        }
+
+        # Clean up None values (optional but cleaner)
+        megatron_config_dict = {
+            k: v for k, v in megatron_config_dict.items() if v is not None
+        }
+
+        lora_rank = self.config.lora_rank
+        lora_alpha = self.config.lora_alpha
+        lora_target_modules = self.config.target_modules
+        lora_dropout = self.config.lora_dropout
+
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+            megatron_config=megatron_config_dict,
+            megatron_core="megatron.core",
+        )
+
+        model = get_peft_model(self.model[0], lora_config)
+        self.print_trainable_parameters(model)
+        return model
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         if parallel_strategy is None:
@@ -479,6 +637,7 @@ class MegatronEngine(TrainEngine):
         )
         self.engine_lock = DistributedLock("train_engine_lock")
 
+        # Allow use_merged_lora with mbridge
         if self.config.use_lora and self.bridge_cls != "megatron-bridge":
             raise NotImplementedError(
                 "MegatronEngine LoRA POC currently only supports bridge_type='megatron-bridge'. "
@@ -491,6 +650,10 @@ class MegatronEngine(TrainEngine):
             self.enable_tree_training and self.bridge_cls == "mbridge"
         ):
             self.bridge = self._build_hf_mcore_bridge()
+
+            # Patch mbridge name mapping for unfused layernorms and QK norms
+            if self.bridge_cls == "mbridge" and self.config.use_merged_lora:
+                self.bridge = patch_mbridge_name_mapping(self.bridge)
 
             self.hf_config, self.tf_config = make_hf_and_mcore_config(
                 self.config.path,
@@ -546,21 +709,41 @@ class MegatronEngine(TrainEngine):
             self._check_and_apply_fp8_config()
             self._validate_fp8_consistency()
 
+            # initialize mcore (DDP Wrapped) GPTModel
+            if self.config.use_merged_lora:
+                self.logger.info("Trainer Mode: merged lora. Setting use_bridge=False")
+                bridge = None
+            elif self.config.use_lora:
+                self.logger.info(
+                    "Trainer mode: regular (both lora). Setting use_bridge=False"
+                )
+                bridge = None
+            else:
+                bridge = self.bridge
+
             with self.device:
                 models = make_mcore_model(
                     hf_config=self.hf_config,
                     tf_config=self.tf_config,
                     mcore_config=self.mcore_config,
-                    bridge=self.bridge,
+                    bridge=bridge,
                     bridge_type=self.bridge_cls,
                     is_critic=self.config.is_critic,
-                    use_lora=self.config.use_lora,
+                    use_lora=self.config.use_lora or self.config.use_merged_lora,
                 )
 
         self.model = _MegatronModelList(models)
+        print(self.model)
+        print(models)
 
         if self.config.use_lora:
             self._apply_megatron_bridge_lora()
+        elif self.config.use_merged_lora:
+            # For merged LoRA, wrap model with PEFT after creation
+            if self.rank == 0:
+                self.logger.info("Wrapping model with merged LoRA using PEFT")
+            # Note: wrap_model_with_lora modifies model in place via get_peft_model
+            model = self.wrap_model_with_lora()
 
         if self.config.init_from_scratch:
             self.logger.info("init_from_scratch=True; skipping HF weight loading.")
@@ -1492,7 +1675,7 @@ class MegatronEngine(TrainEngine):
 
         use_distributed_optimizer = (
             False
-            if self.config.use_lora
+            if (self.config.use_lora or self.config.use_merged_lora)
             else self.mcore_config.ddp.use_distributed_optimizer
         )
 
@@ -1566,7 +1749,7 @@ class MegatronEngine(TrainEngine):
         self.lr_scheduler = lr_scheduler
 
         # MegatronCheckpointManager now only support distributed optimizer which lora does not support
-        if not self.config.use_lora:
+        if not (self.config.use_lora or self.config.use_merged_lora):
             self.checkpointer = MegatronCheckpointManager(
                 model=self.model,
                 optimizer=self.optimizer,
@@ -1887,7 +2070,22 @@ class MegatronEngine(TrainEngine):
         buffer_size = 0
         converted_named_tensors = []
 
-        for name, param in get_named_parameters(self.model, num_moe_experts):
+        if self.config.use_merged_lora:
+            from areal.engine.megatron_utils.megatron import (
+                get_named_parameters_lora_merged,
+            )
+
+            named_parameters_iterator = get_named_parameters_lora_merged(
+                self.model, num_moe_experts
+            )
+        else:
+            named_parameters_iterator = get_named_parameters(
+                self.model, num_moe_experts
+            )
+
+        for name, param in named_parameters_iterator:
+            if self.config.use_lora and not param.requires_grad:
+                continue
             if ".experts." in name and not self.config.use_lora:
                 continue
             if self.config.use_lora and (
@@ -1917,7 +2115,22 @@ class MegatronEngine(TrainEngine):
         buffer_size = 0
         named_tensors = []
 
-        for name, param in get_named_parameters(self.model, num_moe_experts):
+        if self.config.use_merged_lora:
+            from areal.engine.megatron_utils.megatron import (
+                get_named_parameters_lora_merged,
+            )
+
+            named_parameters_iterator = get_named_parameters_lora_merged(
+                self.model, num_moe_experts
+            )
+        else:
+            named_parameters_iterator = get_named_parameters(
+                self.model, num_moe_experts
+            )
+
+        for name, param in named_parameters_iterator:
+            if self.config.use_lora and not param.requires_grad:
+                continue
             if ".experts." not in name or self.config.use_lora:
                 continue
             buffer_size = self._impl_update_expert_weight_from_distributed(
@@ -2081,15 +2294,28 @@ class MegatronEngine(TrainEngine):
                         )
                     self.bridge.save_weights(models=self.model, weights_path=path)
                 else:
-                    save_weights_to_hf_with_mbridge_fast(
-                        bridge=self.bridge,
-                        models=self.model,
-                        weights_path=path,
-                        base_model_path=base_model_path,
-                        max_shard_size_byte=int(3e9),
-                        max_workers=None,
-                        fp8_direct_convert=self.fp8_direct_convert,
-                    )
+                    if self.lora_mode:
+                        from areal.models.mcore.hf_save import save_lora_adapters_to_hf
+
+                        # Save only LoRA adapters
+                        save_lora_adapters_to_hf(
+                            models=self.model,
+                            output_dir=path,
+                            base_model_name=self.config.path,
+                            rank=self.config.lora_rank,
+                            lora_alpha=self.config.lora_alpha,
+                            target_modules=self.config.target_modules,
+                        )
+                    else:
+                        save_weights_to_hf_with_mbridge_fast(
+                            bridge=self.bridge,
+                            models=self.model,
+                            weights_path=path,
+                            base_model_path=base_model_path,
+                            max_shard_size_byte=int(3e9),
+                            max_workers=None,
+                            fp8_direct_convert=self.fp8_direct_convert,
+                        )
 
             if self.config.is_critic:
                 save_critic_value_head(self.model, path)

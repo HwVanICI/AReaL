@@ -1188,6 +1188,12 @@ class TrainEngineConfig:
     )
 
     # Lora
+    use_merged_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use LoRA in merged mode(train engine will have lora but inference engine operates in full parameters mode)."
+        },
+    )
     use_lora: bool = field(
         default=False,
         metadata={
@@ -1196,6 +1202,7 @@ class TrainEngineConfig:
     )
     lora_rank: int = field(default=32, metadata={"help": "lora rank"})
     lora_alpha: int = field(default=16, metadata={"help": "lora alpha"})
+    lora_dropout: float = field(default=0.1, metadata={"help": "lora dropout"})
     target_modules: list[str] = field(
         default_factory=list,
         metadata={"help": "lora target_modules."},
