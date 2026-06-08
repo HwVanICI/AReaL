@@ -8,6 +8,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api import (
@@ -137,6 +138,46 @@ class VLLMBackend:
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
         )
+
+    def build_score_request(
+        self, input_ids: list[int], target_len: int, with_lora: bool, version: int
+    ) -> HttpRequest:
+        payload: dict[str, Any] = {
+            "prompt": input_ids,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "logprobs": 1,
+            "prompt_logprobs": 1,
+            "echo": True,
+        }
+        if with_lora:
+            raise NotImplementedError(
+                "LoRA scoring request is not supported in vLLM teacher compute_logp yet."
+            )
+        return HttpRequest(endpoint="/v1/completions", payload=payload)
+
+    def parse_score_response(
+        self, response: dict[str, Any], target_len: int
+    ) -> list[float]:
+        choices = response.get("choices")
+        if not choices:
+            raise ValueError("vLLM response missing choices for score request")
+        prompt_logprobs = choices[0].get("prompt_logprobs")
+        if prompt_logprobs is None:
+            raise ValueError("vLLM response missing prompt_logprobs for score request")
+        if len(prompt_logprobs) < target_len + 1:
+            raise ValueError(
+                f"prompt_logprobs too short: got {len(prompt_logprobs)}, need {target_len + 1}"
+            )
+        sliced = prompt_logprobs[-target_len:]
+        token_logps: list[float] = []
+        for item in sliced:
+            if not item:
+                token_logps.append(0.0)
+                continue
+            top = next(iter(item.values()))
+            token_logps.append(float(top["logprob"] if isinstance(top, dict) else top))
+        return token_logps
 
     def build_disk_weight_update_requests(
         self, meta: WeightUpdateMeta
@@ -528,6 +569,9 @@ class RemotevLLMEngine(InferenceEngine):
             group_size=group_size,
             dynamic_bs=dynamic_bs,
         )
+
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        return self._engine.compute_logp(data)
 
     def pause(self):
         return self._engine.pause()

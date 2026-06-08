@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import warnings
 from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
@@ -3070,7 +3071,32 @@ class DPOConfig(BaseExperimentConfig):
 
 
 @dataclass
-class TeacherConfig(PPOActorConfig):
+class TeacherConfig:
+    engine_type: str = field(
+        default="rollout",
+        metadata={
+            "help": "Teacher engine type. 'rollout' uses inference engine scoring; "
+            "'train' uses the legacy train-engine teacher path.",
+            "choices": ["rollout", "train"],
+        },
+    )
+    rollout: InferenceEngineConfig | None = field(default=None)
+    train: PPOActorConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Legacy train-engine teacher config. Required when engine_type='train'."
+        },
+    )
+    path: str = field(
+        default="",
+        metadata={
+            "help": "Teacher model path. If set, overrides shared rollout backend model path."
+        },
+    )
+    offload: bool = field(
+        default=False,
+        metadata={"help": "Whether to offload teacher rollout model between steps"},
+    )
     rl_loss_weight: float = field(
         default=1.0,
         metadata={"help": "RL loss weight"},
@@ -3080,6 +3106,22 @@ class TeacherConfig(PPOActorConfig):
         default=0.005,
         metadata={"help": "Distillation loss weight"},
     )
+
+    def __post_init__(self):
+        if self.rollout is not None and self.train is not None:
+            warnings.warn(
+                "Both teacher.rollout and teacher.train are configured; "
+                f"teacher.engine_type={self.engine_type!r} selects which one is used.",
+                stacklevel=2,
+            )
+        if self.engine_type == "rollout" and self.rollout is None:
+            raise ValueError(
+                "teacher.rollout must be provided when teacher.engine_type='rollout'."
+            )
+        if self.engine_type == "train" and self.train is None:
+            raise ValueError(
+                "teacher.train must be provided when teacher.engine_type='train'."
+            )
 
 
 @dataclass
