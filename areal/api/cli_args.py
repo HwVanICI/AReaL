@@ -948,6 +948,16 @@ class MegatronEngineConfig:
         },
     )
 
+    use_bridge_for_update_weights: bool = field(
+        default=False,
+        metadata={
+            "help": "When True and bridge_type='megatron-bridge', delegate live "
+            "weight sync to bridge.export_hf_weights instead of the hand-rolled "
+            "convert_to_hf registry. Required for models without a registry entry "
+            "(e.g. Qwen3.5). FP8 paths fall back to the registry automatically.",
+        },
+    )
+
 
 @dataclass
 class MindSpeedEngineConfig:
@@ -1786,6 +1796,16 @@ class vLLMConfig:
     )
     enable_sleep_mode: bool = False
     uvicorn_log_level: str = "warning"
+    # GDN prefill backend for hybrid models like Qwen3.5; "triton" avoids the
+    # FlashInfer GDN-kernel hang (vLLM #38916). None leaves vLLM's default, so
+    # no flag is emitted and non-GDN models are unaffected.
+    gdn_prefill_backend: str | None = field(
+        default=None,
+        metadata={
+            "help": "GDN prefill backend for hybrid models like Qwen3.5.",
+            "choices": ["triton", "flashinfer"],
+        },
+    )
     # lora
     enable_lora: bool = False
     max_lora_rank: int = 16  # vllm's default
