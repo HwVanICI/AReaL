@@ -352,6 +352,11 @@ class PPOTrainer:
                         "use_lora": config.actor.use_lora,
                         "lora_name": config.gconfig.lora_name,
                         "base_model_name": config.actor.path,
+                        # Keep enough recent adapter versions for off-policy
+                        # rollouts (max_head_offpolicyness) plus a safety margin;
+                        # older versions are unloaded to bound sglang VRAM and
+                        # avoid the adapter-accumulation hang.
+                        "lora_keep_versions": config.rollout.max_head_offpolicyness + 2,
                     }
                 )
             if self._is_actor_rollout_colocated(config):
