@@ -959,6 +959,14 @@ class MegatronEngineConfig:
         },
     )
 
+    enable_mtp: bool = field(
+        default=False,
+        metadata={
+            "help": "Build the model's Multi-Token-Prediction (MTP) head. Default "
+            "False: MTP is inference-only and unused by RL; set True for SFT.",
+        },
+    )
+
 
 @dataclass
 class MindSpeedEngineConfig:
