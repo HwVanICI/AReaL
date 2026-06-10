@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import aiohttp
 import numpy as np
-import ray
 import requests
 import torch.distributed as dist
 import uvloop
@@ -1331,13 +1330,6 @@ class RemoteInfEngine(InferenceEngine):
         try:
             self._wait_for_server(address, process=server_info.process)
             self.local_server_processes.append(server_info)
-            if ray.is_initialized():
-                # do not return with process for ray as it is not picklable
-                return LocalInfServerInfo(
-                    host=server_args["host"],
-                    port=server_args["port"],
-                    process=None,
-                )
             return server_info
         except TimeoutError:
             logger.warning(
@@ -1354,11 +1346,6 @@ class RemoteInfEngine(InferenceEngine):
             if server_info.process.poll() is not None:
                 return
             kill_process_tree(server_info.process.pid, graceful=True)
-        elif server_info.is_ray:
-            for actor in server_info.actors:
-                logger.info(f"Shutting down actor {actor}")
-                # manual graceful termination
-                actor.__ray_terminate__.remote()
 
     def teardown_server(self):
         """Teardown all locally launched servers."""

@@ -8,7 +8,6 @@ from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
 
-import ray
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -35,13 +34,12 @@ from areal.api.cli_args import (
     ValidDatasetConfig,
     vLLMConfig,
 )
-from areal.engine import RayRemotevLLMEngine, RemoteSGLangEngine, RemotevLLMEngine
+from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
 from areal.experimental.inference_service.controller.controller import (
     RolloutControllerV2,
 )
 from areal.infra import (
     LocalScheduler,
-    RayScheduler,
     RolloutController,
     SlurmScheduler,
     current_platform,
@@ -931,8 +929,6 @@ class PPOTrainer:
         cfg = self.config.scheduler
         if cfg.type == "local":
             return LocalScheduler(exp_config=self.config)
-        elif cfg.type == "ray":
-            return RayScheduler(exp_config=self.config)
         elif cfg.type == "slurm":
             return SlurmScheduler(exp_config=self.config)
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")
@@ -1065,14 +1061,7 @@ class PPOTrainer:
                 self.config.vllm.lora_modules = [
                     f"{self.config.gconfig.lora_name}-v0={lora_path}"
                 ]
-            if ray.is_initialized() and any(
-                spec.ray_placement_strategy == "deferred"
-                for spec in self.config.rollout.scheduling_spec
-            ):
-                # gen instance spans more than 1 node
-                engine_cls = RayRemotevLLMEngine
-            else:
-                engine_cls = RemotevLLMEngine
+            engine_cls = RemotevLLMEngine
             server_args = vLLMConfig.build_args(
                 vllm_config=self.config.vllm,
                 tp_size=self.rollout_alloc.parallel.tp_size,

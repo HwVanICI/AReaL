@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
-import ray
 import torch
 import torch.distributed as dist
 from PIL.Image import Image as ImageObject
@@ -440,12 +439,6 @@ class LocalInfServerInfo:
     host: str
     port: int
     process: subprocess.Popen | None = None
-    # need to store actors in the case where launch server has actor refs so we can call destructor later
-    actors: list[ray.actor.ActorHandle[Any]] = field(default_factory=list)
-
-    @property
-    def is_ray(self) -> bool:
-        return bool(self.actors)
 
     @property
     def is_popen(self) -> bool:
@@ -456,8 +449,7 @@ class LocalInfServerInfo:
         if isinstance(ret, subprocess.Popen):
             return cls(host=host, port=port, process=ret)
 
-        # Must be list[ActorHandle]
-        return cls(host=host, port=port, actors=ret)
+        raise TypeError(f"Unsupported launch result type: {type(ret)!r}")
 
 
 @dataclass

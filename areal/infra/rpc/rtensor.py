@@ -12,7 +12,6 @@ from typing import Any, Protocol, cast
 
 import aiohttp
 import orjson
-import ray
 import torch
 
 from areal.infra.utils.concurrent import run_async_task
@@ -49,7 +48,7 @@ class RTensorBackend(Protocol):
         Returns
         -------
         Any
-            Shard ID (str for HTTP backend, ray.ObjectRef for Ray backend)
+            Shard ID for the HTTP backend.
         """
         ...
 
@@ -76,9 +75,9 @@ class TensorShardInfo:
     Attributes
     ----------
     shard_id : Any
-        Unique identifier for the shard (str for HTTP, ray.ObjectRef for Ray)
+        Unique identifier for the shard.
     node_addr : Any
-        Network address where shard is stored, or a Ray actor handle for Ray backend.
+        Network address where shard is stored.
     """
 
     shard_id: Any
@@ -270,70 +269,13 @@ class HttpRTensorBackend:
                     await resp.json()
 
 
-class RayRTensorBackend:
-    def fetch(self, shards: list[TensorShardInfo]) -> list[torch.Tensor]:
-        """Fetch multiple shards from the owning Ray actors."""
-        if not shards:
-            return []
-
-        current_actor = ray.get_runtime_context().current_actor
-        current_actor_id = getattr(current_actor, "_actor_id", None)
-        results: list[torch.Tensor | None] = [None] * len(shards)
-        remote_refs: list[tuple[int, ray.ObjectRef]] = []
-
-        for idx, shard in enumerate(shards):
-            owner_actor = shard.node_addr
-            owner_actor_id = getattr(owner_actor, "_actor_id", None)
-
-            if current_actor_id is not None and owner_actor_id == current_actor_id:
-                results[idx] = fetch(shard.shard_id)
-            elif hasattr(owner_actor, "fetch_rtensor"):
-                remote_refs.append(
-                    (idx, owner_actor.fetch_rtensor.remote(shard.shard_id))
-                )
-            else:
-                results[idx] = ray.get(shard.shard_id)
-
-        if remote_refs:
-            values = ray.get([ref for _, ref in remote_refs])
-            for (idx, _), tensor in zip(remote_refs, values, strict=True):
-                results[idx] = tensor
-
-        return cast(list[torch.Tensor], results)
-
-    def store(self, tensor: torch.Tensor) -> Any:
-        """Store tensor in local actor storage or Ray object store."""
-        if ray.get_runtime_context().current_actor is None:
-            return ray.put(tensor)
-        shard_id = str(uuid.uuid4())
-        _store_local(shard_id, tensor)
-        return shard_id
-
-    async def delete(self, node_addr: Any, shard_ids: list[str]) -> None:
-        """Delete shards from the owning Ray actor."""
-        current_actor = ray.get_runtime_context().current_actor
-        current_actor_id = getattr(current_actor, "_actor_id", None)
-        owner_actor_id = getattr(node_addr, "_actor_id", None)
-        if current_actor_id is not None and owner_actor_id == current_actor_id:
-            for shard_id in shard_ids:
-                remove(shard_id)
-            return
-        if hasattr(node_addr, "delete_rtensor"):
-            await node_addr.delete_rtensor.remote(shard_ids)
-        else:
-            ray.internal.free(shard_ids)
-
-
 _backend: RTensorBackend | None = None
 
 
 def get_backend() -> RTensorBackend:
     global _backend
     if _backend is None:
-        if ray.is_initialized():
-            _backend = RayRTensorBackend()
-        else:
-            _backend = HttpRTensorBackend()
+        _backend = HttpRTensorBackend()
     return _backend
 
 
@@ -691,7 +633,7 @@ def clear_all_local() -> tuple[int, int]:
     ``TrainController.clear_batches`` — e.g. small tensors returned by
     auxiliary RPC calls (``get_device_stats``, ``set_version``, stats from
     ``clear_batches`` itself, etc.) that accumulate per-step across many
-    actors. Safe to call only after a step's batches are consumed; see
+    workers. Safe to call only after a step's batches are consumed; see
     inclusionAI/AReaL#1209.
 
     Returns
