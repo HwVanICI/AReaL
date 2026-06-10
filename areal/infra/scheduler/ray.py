@@ -16,17 +16,18 @@ import orjson
 import ray
 import ray.exceptions
 import requests
+from ray.actor import ActorHandle
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from areal.api import Job, Scheduler, Worker
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     BaseExperimentConfig,
     NameResolveConfig,
     SchedulingSpec,
     SchedulingStrategyType,
 )
-from areal.infra.platforms import current_platform
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
@@ -50,15 +51,19 @@ from areal.infra.utils.proc import kill_process_tree, run_with_streaming_logs
 from areal.infra.utils.ray import create_resource_spec, ray_resource_type
 from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
-from areal.utils.network import find_free_ports, format_hostport, gethostip
+from areal.utils.network import (
+    format_hostport,
+    gethostip,
+    split_hostport,
+)
 from areal.utils.offload import get_tms_env_vars
 
 logger = logging.getLogger("RayScheduler")
 
-
-def _ray_device_resource() -> str:
-    device = ray_resource_type()
-    return "GPU" if device == "CPU" else device
+DEVICE_CONTROL_ENV_VARS = {
+    "GPU": "CUDA_VISIBLE_DEVICES",
+    "NPU": "ASCEND_RT_VISIBLE_DEVICES",
+}
 
 
 def _read_log_tail(log_file: str, lines: int = 50) -> str:
@@ -70,6 +75,86 @@ def _read_log_tail(log_file: str, lines: int = 50) -> str:
         return f"[Could not read log file: {e}]"
 
 
+class RayBackendWorkerProcessManager:
+    def __init__(
+        self,
+        role: str,
+        log_file: str,
+        merged_log: str,
+        device_control_env_var: str,
+        env_vars: dict[str, str],
+        visible_devices: list[str],
+        host: str,
+    ):
+        self.role = role
+        self.log_file = log_file
+        self.merged_log = merged_log
+        self.device_control_env_var = device_control_env_var
+        self.env_vars = env_vars
+        self.visible_devices = visible_devices
+        self.host = host
+        self.backend_worker_processes: dict[tuple[tuple[str, str], str, int], Any] = {}
+
+    def start_backend_worker(
+        self,
+        group_key: tuple[str, str],
+        backend: str,
+        server_args: dict[str, Any],
+    ) -> dict[str, Any]:
+        server_args = server_args.copy()
+        base_env = os.environ.copy()
+        base_env.update(self.env_vars)
+        if backend == "sglang":
+            from areal.api.cli_args import SGLangConfig
+            from areal.engine.sglang_remote import SGLangBackend
+
+            cmd = SGLangConfig.build_cmd_from_args(server_args)
+            env = SGLangBackend.build_server_env(base_env)
+        elif backend == "vllm":
+            from areal.api.cli_args import vLLMConfig
+            from areal.engine.vllm_remote import VLLMBackend
+
+            cmd = vLLMConfig.build_cmd_from_args(server_args)
+            env = VLLMBackend.build_server_env(base_env)
+        else:
+            raise RuntimeError(f"Unsupported multi-node inference backend: {backend}")
+
+        node_rank = int(server_args.get("node_rank", 0))
+        process_key = (group_key, backend, node_rank)
+        old_process = self.backend_worker_processes.pop(process_key, None)
+        if old_process is not None and old_process.poll() is None:
+            kill_process_tree(old_process.pid, timeout=5, graceful=True)
+
+        if self.visible_devices:
+            env[self.device_control_env_var] = ",".join(self.visible_devices)
+        process = run_with_streaming_logs(
+            cmd,
+            self.log_file,
+            self.merged_log,
+            self.role,
+            env=env,
+        )
+        time.sleep(0.1)
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"{backend} server node {server_args.get('node_rank')} exited "
+                f"immediately with code {process.returncode}\n{_read_log_tail(self.log_file)}"
+            )
+        self.backend_worker_processes[process_key] = process
+        return {"host": self.host, "pid": process.pid, "key": process_key}
+
+    def drain_worker_processes(
+        self, group_key: tuple[str, str] | None = None
+    ) -> list[tuple[str, Any]]:
+        processes = []
+        for process_key in list(self.backend_worker_processes):
+            if group_key is not None and process_key[0] != group_key:
+                continue
+            process = self.backend_worker_processes.pop(process_key)
+            processes.append((f"backend worker {process_key}", process))
+        return processes
+
+
 @ray.remote
 class RayWorkerProcessLauncher:
     def __init__(
@@ -77,50 +162,49 @@ class RayWorkerProcessLauncher:
         role: str,
         log_file: str,
         merged_log: str,
+        ray_device_resource: str,
+        device_control_env_var: str,
         env_vars: dict[str, str] | None = None,
     ):
         self.role = role
         self.log_file = log_file
         self.merged_log = merged_log
+        self.ray_device_resource = ray_device_resource
+        self.device_control_env_var = device_control_env_var
         self.env_vars = env_vars or {}
         self.host = gethostip()
         self.worker_processes: dict[str, Any] = {}
-        self.backend_worker_processes: dict[str, Any] = {}
         self.visible_devices = self._get_visible_devices()
+        self.backend_process_manager: RayBackendWorkerProcessManager | None = None
 
     def _get_visible_devices(self) -> list[str]:
-        env_var = current_platform.device_control_env_var
-        visible = os.environ.get(env_var) if env_var else None
-        if visible:
-            return [x for x in visible.split(",") if x != ""]
+        devices = []
         try:
             ids = ray.get_runtime_context().get_accelerator_ids()
-            device = _ray_device_resource()
+            device = self.ray_device_resource
             if device in ids:
-                return [str(x) for x in ids[device]]
-            if "GPU" in ids:
-                return [str(x) for x in ids["GPU"]]
-            if "NPU" in ids:
-                return [str(x) for x in ids["NPU"]]
+                devices = [str(x) for x in ids[device]]
         except Exception:
             pass
-        return []
 
-    def node_info(self) -> dict[str, Any]:
+        if not devices:
+            visible = os.environ.get(self.device_control_env_var)
+            if visible:
+                devices = [x for x in visible.split(",") if x != ""]
+
+        return sorted(devices, key=int)
+
+    def get_node_info(self) -> dict[str, Any]:
         return {
             "host": self.host,
             "visible_devices": self.visible_devices,
             "node_id": ray.get_runtime_context().get_node_id(),
         }
 
-    def alloc_ports(self, count: int) -> dict[str, Any]:
-        return {"host": self.host, "ports": find_free_ports(count)}
-
-    def start_worker(
+    def _build_worker_spec(
         self,
         role: str,
         worker_index: int,
-        port_count: int,
         gpu_devices: list[str],
         cmd: str | None,
         experiment_name: str,
@@ -133,21 +217,22 @@ class RayWorkerProcessLauncher:
         worker_id = f"{role}/{worker_index}"
         if not cmd:
             cmd = "python -m areal.infra.rpc.rpc_server"
-        if "--port" in cmd:
+
+        # Build RPC command (port will be auto-assigned by server)
+        rpc_cmd = shlex.split(cmd)
+        if any(token == "--port" or token.startswith("--port=") for token in rpc_cmd):
             raise RuntimeError(
                 "Custom command should not include --port argument. "
                 "The scheduler automatically allocates and provides the port."
             )
 
-        ports = find_free_ports(port_count)
-        cmd_prefix = shlex.split(cmd)
-        if cmd_prefix[0].startswith("python"):
-            cmd_prefix[0] = sys.executable
-        cmd_suffix = [
+        if rpc_cmd[0].startswith("python"):
+            rpc_cmd[0] = sys.executable
+        rpc_cmd_flags = [
             "--host",
             "0.0.0.0",
             "--port",
-            str(ports[0]),
+            "0",
             "--experiment-name",
             str(experiment_name),
             "--trial-name",
@@ -164,104 +249,146 @@ class RayWorkerProcessLauncher:
             etcd3_addr,
         ]
         if fileroot:
-            cmd_suffix.extend(["--fileroot", str(fileroot)])
-        full_cmd = [*cmd_prefix, *cmd_suffix]
+            rpc_cmd_flags.extend(["--fileroot", str(fileroot)])
+        rpc_cmd = [*rpc_cmd, *rpc_cmd_flags]
 
         env = os.environ.copy()
         env.update(self.env_vars)
-        if current_platform.device_control_env_var:
-            env[current_platform.device_control_env_var] = ",".join(gpu_devices)
+        env[self.device_control_env_var] = ",".join(gpu_devices)
 
-        logger.info(
-            "Starting Ray worker %s on %s devices=%s ports=%s: %s",
-            worker_id,
-            self.host,
-            gpu_devices,
-            ports,
-            " ".join(full_cmd),
-        )
-        process = run_with_streaming_logs(
-            full_cmd,
-            self.log_file,
-            self.merged_log,
-            role,
-            env=env,
-        )
-        time.sleep(0.1)
-        if process.poll() is not None:
-            raise RuntimeError(
-                f"Worker {worker_id} exited immediately with code {process.returncode}\n"
-                f"{_read_log_tail(self.log_file)}"
-            )
-        self.processes[worker_id] = process
         return {
             "worker_id": worker_id,
-            "ip": self.host,
-            "worker_ports": [str(p) for p in ports],
-            "pid": process.pid,
+            "role": role,
             "gpu_devices": gpu_devices,
+            "cmd": rpc_cmd,
+            "env": env,
         }
 
-    def process_status(self, worker_id: str) -> dict[str, Any]:
-        process = self.worker_processes.get(worker_id)
-        if process is None:
-            return {"exists": False, "returncode": None}
-        return {"exists": True, "returncode": process.poll()}
+    def start_workers(self, worker_specs: list[dict[str, Any]]) -> None:
+        workers = [self._build_worker_spec(**spec) for spec in worker_specs]
+        started = []
+        try:
+            for worker in workers:
+                logger.info(
+                    "Starting Ray worker %s on %s devices=%s ports=%s: %s",
+                    worker["worker_id"],
+                    self.host,
+                    worker["gpu_devices"],
+                    "auto",
+                    " ".join(worker["cmd"]),
+                )
+                worker["process"] = run_with_streaming_logs(
+                    worker["cmd"],
+                    self.log_file,
+                    self.merged_log,
+                    worker["role"],
+                    env=worker["env"],
+                )
+                started.append(worker)
 
-    def launch_llm_server(
-        self, backend: str, server_args: dict[str, Any]
+            # Give every spawned process a short window to fail fast before returning.
+            # Unlike per-worker RPC, all processes in this batch are spawned first.
+            time.sleep(0.1)
+            failures = [
+                worker for worker in started if worker["process"].poll() is not None
+            ]
+            if failures:
+                failed_workers = ", ".join(
+                    f"{worker['worker_id']}={worker['process'].returncode}"
+                    for worker in failures
+                )
+                raise RuntimeError(
+                    f"Workers exited immediately: {failed_workers}\n"
+                    f"{_read_log_tail(self.log_file)}"
+                )
+
+            for worker in started:
+                process = worker["process"]
+                self.worker_processes[worker["worker_id"]] = process
+        except Exception:
+            for worker in started:
+                process = worker.get("process")
+                if process is not None and process.poll() is None:
+                    try:
+                        kill_process_tree(process.pid, timeout=5, graceful=True)
+                    except Exception:
+                        logger.warning(
+                            "Failed to stop partially started Ray worker",
+                            exc_info=True,
+                        )
+            raise
+
+    def worker_statuses(self, worker_ids: list[str]) -> dict[str, dict[str, Any]]:
+        statuses = {}
+        for worker_id in worker_ids:
+            process = self.worker_processes.get(worker_id)
+            if process is None:
+                statuses[worker_id] = {"exists": False, "returncode": None}
+            else:
+                statuses[worker_id] = {"exists": True, "returncode": process.poll()}
+        return statuses
+
+    def start_backend_worker(
+        self, group_key: tuple[str, str], backend: str, server_args: dict[str, Any]
     ) -> dict[str, Any]:
-        server_args = server_args.copy()
-        if backend == "sglang":
-            from areal.api.cli_args import SGLangConfig
-
-            cmd = SGLangConfig.build_cmd_from_args(server_args)
-        elif backend == "vllm":
-            from areal.api.cli_args import vLLMConfig
-
-            cmd = vLLMConfig.build_cmd_from_args(server_args)
-        else:
-            raise RuntimeError(f"Unsupported multi-node inference backend: {backend}")
-
-        key = (
-            f"{backend}:{server_args.get('node_rank', 0)}:{server_args.get('port', '')}"
-        )
-        env = os.environ.copy()
-        env.update(self.env_vars)
-        if current_platform.device_control_env_var and self.visible_devices:
-            env[current_platform.device_control_env_var] = ",".join(
-                self.visible_devices
+        if self.backend_process_manager is None:
+            self.backend_process_manager = RayBackendWorkerProcessManager(
+                self.role,
+                self.log_file,
+                self.merged_log,
+                self.device_control_env_var,
+                self.env_vars,
+                self.visible_devices,
+                self.host,
             )
-        process = run_with_streaming_logs(
-            cmd,
-            self.log_file,
-            self.merged_log,
-            self.role,
-            env=env,
+        return self.backend_process_manager.start_backend_worker(
+            group_key, backend, server_args
         )
-        time.sleep(0.1)
-        if process.poll() is not None:
-            raise RuntimeError(
-                f"{backend} server node {server_args.get('node_rank')} exited "
-                f"immediately with code {process.returncode}\n{_read_log_tail(self.log_file)}"
+
+    def _stop_processes(self, processes: list[tuple[str, Any]]) -> None:
+        async def stop_process(name: str, process: Any) -> None:
+            try:
+                if process.poll() is None:
+                    await asyncio.to_thread(
+                        kill_process_tree, process.pid, timeout=5, graceful=True
+                    )
+            except Exception:
+                logger.warning("Failed to stop Ray-managed %s", name, exc_info=True)
+
+        if not processes:
+            return
+
+        async def stop_processes() -> None:
+            await asyncio.gather(
+                *(stop_process(name, process) for name, process in processes)
             )
-        self.backend_worker_processes[key] = process
-        return {"host": self.host, "pid": process.pid}
 
-    def stop_all(self) -> None:
-        for process in list(self.backend_worker_processes.values()):
-            try:
-                kill_process_tree(process.pid, timeout=5, graceful=True)
-            except Exception:
-                logger.warning("Failed to stop Ray-managed LLM server", exc_info=True)
-        self.backend_worker_processes.clear()
+        run_async_task(stop_processes)
 
-        for process in list(self.worker_processes.values()):
-            try:
-                kill_process_tree(process.pid, timeout=5, graceful=True)
-            except Exception:
-                logger.warning("Failed to stop Ray-managed HTTP server", exc_info=True)
-        self.worker_processes.clear()
+    def stop_backend_worker_group(self, group_key: tuple[str, str]) -> None:
+        if self.backend_process_manager is None:
+            return
+
+        self._stop_processes(
+            self.backend_process_manager.drain_worker_processes(group_key)
+        )
+
+    def stop_all_processes(self) -> None:
+        try:
+            processes = []
+            if self.backend_process_manager is not None:
+                processes.extend(self.backend_process_manager.drain_worker_processes())
+            processes.extend(
+                (f"worker process {worker_id}", process)
+                for worker_id, process in self.worker_processes.items()
+            )
+            self._stop_processes(processes)
+            self.worker_processes.clear()
+        except Exception:
+            logger.warning("Failed to stop Ray launcher processes", exc_info=True)
+
+    def __ray_shutdown__(self) -> None:
+        self.stop_all_processes()
 
 
 @dataclass
@@ -270,14 +397,151 @@ class RayWorkerInfo:
 
     worker: Worker
     role: str
-    ray_job_id: int  # -1 for forked workers (managed by parent)
     task_index: int
-    discovered: bool = False
+    launchers: list[ActorHandle] = field(default_factory=list)
     spec: SchedulingSpec | None = None
-    node: str | None = None
-    launchers: list[Any] = field(default_factory=list)
-    placement_group: Any | None = None
-    gpu_devices: list[str] = field(default_factory=list)
+
+
+class RayMultiNodeRolloutCoordinator:
+    def __init__(
+        self,
+        exp_config: BaseExperimentConfig | None,
+        startup_timeout: float,
+    ):
+        self.startup_timeout = startup_timeout
+        rollout_config = getattr(exp_config, "rollout", None)
+        self._rollout_inference_backend = (
+            ModelAllocation.from_str(rollout_config.backend, name="rollout").backend
+            if rollout_config is not None
+            else None
+        )
+
+    async def _build_multi_node_server_args(
+        self,
+        worker_info: RayWorkerInfo,
+        backend: str,
+        server_args: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        port = int(worker_info.worker.worker_ports[0])
+        timeout = aiohttp.ClientTimeout(total=self.startup_timeout)
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            connector=get_default_connector(),
+        ) as session:
+            async with session.post(
+                f"http://{format_hostport(worker_info.worker.ip, port)}/alloc_ports",
+                json=dict(count=1),
+            ) as resp:
+                resp.raise_for_status()
+                host_ports = await resp.json()
+        master_host = host_ports["host"]
+        master_port = host_ports["ports"][0]
+        n_nodes = len(worker_info.launchers)
+
+        head_args = copy.deepcopy(server_args)
+        worker_args = []
+        if backend == "sglang":
+            dist_init_addr = f"{master_host}:{master_port}"
+            head_args.update(nnodes=n_nodes, node_rank=0, dist_init_addr=dist_init_addr)
+            for node_rank in range(1, n_nodes):
+                args = copy.deepcopy(server_args)
+                args.pop("host", None)
+                args.pop("port", None)
+                args.update(
+                    nnodes=n_nodes, node_rank=node_rank, dist_init_addr=dist_init_addr
+                )
+                worker_args.append(args)
+        elif backend == "vllm":
+            head_args.update(
+                nnodes=n_nodes,
+                node_rank=0,
+                master_addr=master_host,
+                master_port=str(master_port),
+            )
+            for node_rank in range(1, n_nodes):
+                args = copy.deepcopy(server_args)
+                args.pop("host", None)
+                args.pop("port", None)
+                args.update(
+                    nnodes=n_nodes,
+                    node_rank=node_rank,
+                    master_addr=master_host,
+                    master_port=str(master_port),
+                    headless=True,
+                )
+                worker_args.append(args)
+        else:
+            raise EngineCallError(
+                worker_info.worker.id,
+                "launch_server",
+                f"Unsupported multi-node inference backend: {backend}",
+            )
+
+        return head_args, worker_args
+
+    async def _stop_backend_workers_on_launchers(
+        self, backend_worker_group_key: tuple[str, str], launchers: list[ActorHandle]
+    ) -> None:
+        if not launchers:
+            return
+        try:
+            refs = [
+                launcher.stop_backend_worker_group.remote(backend_worker_group_key)
+                for launcher in launchers
+            ]
+            await asyncio.wait_for(asyncio.gather(*refs), timeout=30)
+        except Exception:
+            logger.warning(
+                "Failed to stop Ray-managed multi-node backend workers",
+                exc_info=True,
+            )
+
+    async def prepare_launch_server(
+        self,
+        worker_info: RayWorkerInfo,
+        engine_name: str,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        server_args = kwargs.get("server_args")
+        if not isinstance(server_args, dict) or len(worker_info.launchers) <= 1:
+            return kwargs
+        if worker_info.role != "rollout" or self._rollout_inference_backend is None:
+            raise EngineCallError(
+                worker_info.worker.id,
+                "launch_server",
+                "Multi-node inference launch is only supported for rollout workers "
+                "with rollout.backend set to sglang or vllm.",
+            )
+        backend = self._rollout_inference_backend
+
+        head_args, worker_args = await self._build_multi_node_server_args(
+            worker_info, backend, server_args
+        )
+        backend_worker_group_key = (worker_info.worker.id, engine_name)
+        refs = [
+            launcher.start_backend_worker.remote(
+                backend_worker_group_key, backend, args
+            )
+            for launcher, args in zip(
+                worker_info.launchers[1:], worker_args, strict=True
+            )
+        ]
+        try:
+            await asyncio.wait_for(asyncio.gather(*refs), timeout=self.startup_timeout)
+        except BaseException:
+            await self._stop_backend_workers_on_launchers(
+                backend_worker_group_key, worker_info.launchers[1:]
+            )
+            raise
+        return {**kwargs, "server_args": head_args}
+
+    async def stop_backend_workers(
+        self, worker_info: RayWorkerInfo, engine_name: str
+    ) -> None:
+        backend_worker_group_key = (worker_info.worker.id, engine_name)
+        await self._stop_backend_workers_on_launchers(
+            backend_worker_group_key, worker_info.launchers[1:]
+        )
 
 
 class RayScheduler(Scheduler):
@@ -316,6 +580,13 @@ class RayScheduler(Scheduler):
         if self.experiment_name is None or self.trial_name is None:
             raise ValueError("experiment_name and trial_name must be provided")
 
+        self.ray_device_resource = ray_resource_type()
+        if self.ray_device_resource not in DEVICE_CONTROL_ENV_VARS:
+            raise RuntimeError(
+                f"RayScheduler does not support {self.ray_device_resource}-only clusters"
+            )
+        self.device_control_env_var = DEVICE_CONTROL_ENV_VARS[self.ray_device_resource]
+
         # name_resolve config (exp_config overwrites direct params)
         self.name_resolve_config = NameResolveConfig(
             type=name_resolve_type,
@@ -346,8 +617,13 @@ class RayScheduler(Scheduler):
 
         # Internal state
         self._workers: dict[str, list[RayWorkerInfo]] = {}
-        self._jobs: dict[str, list[Any]] = {}  # role -> Ray launcher actors
+        self._launchers: dict[
+            str, list[ActorHandle]
+        ] = {}  # role -> Ray launcher actors
         self._placement_groups: dict[str, Any] = {}
+        self._multi_node_rollout = RayMultiNodeRolloutCoordinator(
+            exp_config, startup_timeout
+        )
 
         # Colocation tracking: colocated roles reuse workers from target role
         # For forked roles, they also track target but have their own workers in _workers
@@ -396,6 +672,20 @@ class RayScheduler(Scheduler):
                     return worker_info
         return None
 
+    def _stop_launchers(self, role: str, timeout: float) -> None:
+        refs = []
+        for launcher in self._launchers.get(role, []):
+            try:
+                refs.append(launcher.stop_all_processes.remote())
+            except Exception as e:
+                logger.error(f"Error submitting Ray launcher stop for role {role}: {e}")
+
+        for ref in refs:
+            try:
+                ray.get(ref, timeout=timeout)
+            except Exception as e:
+                logger.error(f"Error stopping Ray launcher for role {role}: {e}")
+
     def _check_worker_process_status(self, role: str) -> None:
         """Check Ray worker process status and raise if failed."""
         # For colocated/forked roles, check the target role's process status instead
@@ -403,31 +693,67 @@ class RayScheduler(Scheduler):
             target_role = self._colocated_roles[role]
             return self._check_worker_process_status(target_role)
 
-        if role not in self._jobs:
+        if role not in self._launchers:
             raise WorkerNotFoundError(f"Role '{role}' not found")
 
+        workers_by_launcher: list[tuple[ActorHandle, list[RayWorkerInfo]]] = []
         for worker_info in self._workers.get(role, []):
             if not worker_info.launchers:
                 continue
-            try:
-                status = ray.get(
-                    worker_info.launchers[0].process_status.remote(worker_info.worker.id),
-                    timeout=2,
+            head_launcher = worker_info.launchers[0]
+            for launcher, worker_infos in workers_by_launcher:
+                if launcher is head_launcher:
+                    worker_infos.append(worker_info)
+                    break
+            else:
+                workers_by_launcher.append((head_launcher, [worker_info]))
+
+        refs = []
+        for launcher, worker_infos in workers_by_launcher:
+            refs.append(
+                (
+                    worker_infos,
+                    launcher.worker_statuses.remote(
+                        [worker_info.worker.id for worker_info in worker_infos]
+                    ),
                 )
-            except Exception as e:
+            )
+
+        for worker_infos, ref in refs:
+            try:
+                statuses = ray.get(ref, timeout=2)
+            except ray.exceptions.GetTimeoutError:
+                logger.debug(
+                    "Timed out querying Ray worker process status for role %s; "
+                    "status is unknown",
+                    role,
+                )
+                continue
+            except ray.exceptions.RayActorError as e:
+                worker_info = worker_infos[0]
                 logs = self._read_log_tail(role)
                 raise WorkerFailedError(
                     worker_info.worker.id,
                     -1,
-                    f"Ray worker status query failed: {e}. Logs:\n{logs}",
+                    f"Ray worker process launcher failed: {e}. Logs:\n{logs}",
                 ) from e
-            if status.get("exists") and status.get("returncode") is not None:
-                logs = self._read_log_tail(role)
-                raise WorkerFailedError(
-                    worker_info.worker.id,
-                    status["returncode"],
-                    logs,
-                )
+
+            for worker_info in worker_infos:
+                status = statuses.get(worker_info.worker.id, {})
+                if not status.get("exists"):
+                    logs = self._read_log_tail(role)
+                    raise WorkerFailedError(
+                        worker_info.worker.id,
+                        -1,
+                        f"Ray worker process is missing from launcher. Logs:\n{logs}",
+                    )
+                if status.get("returncode") is not None:
+                    logs = self._read_log_tail(role)
+                    raise WorkerFailedError(
+                        worker_info.worker.id,
+                        status["returncode"],
+                        logs,
+                    )
 
     def _verify_worker_alive(self, worker_id: str) -> RayWorkerInfo:
         """Verify worker exists and job is running."""
@@ -449,7 +775,7 @@ class RayScheduler(Scheduler):
 
     def _is_worker_ready(self, worker_info: RayWorkerInfo) -> bool:
         """Check if worker is ready via health endpoint."""
-        if not worker_info.discovered:
+        if not worker_info.worker.worker_ports:
             return False
 
         port = int(worker_info.worker.worker_ports[0])
@@ -461,17 +787,18 @@ class RayScheduler(Scheduler):
         except Exception:
             return False
 
-    def _configure_worker(self, worker_info: RayWorkerInfo, worker_rank: int) -> None:
-        # Wait for worker to be ready
-        while not self._is_worker_ready(worker_info):
-            time.sleep(0.1)
-
+    async def _configure_worker(
+        self,
+        session: aiohttp.ClientSession,
+        worker_info: RayWorkerInfo,
+        worker_rank: int,
+    ) -> None:
         worker_id = worker_info.worker.id
         port = int(worker_info.worker.worker_ports[0])
         url = f"http://{format_hostport(worker_info.worker.ip, port)}/configure"
 
         try:
-            response = requests.post(
+            async with session.post(
                 url,
                 data=orjson.dumps(
                     serialize_value(
@@ -483,32 +810,31 @@ class RayScheduler(Scheduler):
                     )
                 ),
                 headers={"Content-Type": "application/json"},
-                timeout=300.0,
-            )
+                timeout=aiohttp.ClientTimeout(total=300.0),
+            ) as response:
+                if response.status == 200:
+                    logger.info(f"Configuration successful on worker '{worker_id}'")
+                    return
+                elif response.status == 400:
+                    error_detail = (await response.json()).get("error", "Unknown error")
+                    raise WorkerConfigurationError(worker_id, error_detail, str(400))
+                elif response.status == 500:
+                    error_detail = (await response.json()).get("error", "Unknown error")
+                    raise WorkerConfigurationError(worker_id, error_detail, str(500))
+                else:
+                    raise WorkerConfigurationError(
+                        worker_id,
+                        f"Unexpected status code: {response.status}",
+                        str(response.status),
+                    )
 
-            if response.status_code == 200:
-                logger.info(f"Configuration successful on worker '{worker_id}'")
-                return
-            elif response.status_code == 400:
-                error_detail = response.json().get("error", "Unknown error")
-                raise WorkerConfigurationError(worker_id, error_detail, str(400))
-            elif response.status_code == 500:
-                error_detail = response.json().get("error", "Unknown error")
-                raise WorkerConfigurationError(worker_id, error_detail, str(500))
-            else:
-                raise WorkerConfigurationError(
-                    worker_id,
-                    f"Unexpected status code: {response.status_code}",
-                    str(response.status_code),
-                )
-
-        except requests.exceptions.ConnectionError as e:
+        except (aiohttp.ClientConnectionError, aiohttp.ClientConnectorError) as e:
             self._check_worker_process_status(worker_info.role)
             raise RPCConnectionError(
                 worker_id, worker_info.worker.ip, port, str(e)
             ) from e
 
-        except requests.exceptions.Timeout as e:
+        except TimeoutError as e:
             raise WorkerConfigurationError(worker_id, f"Request timed out: {e}") from e
 
         except WorkerConfigurationError:
@@ -518,6 +844,61 @@ class RayScheduler(Scheduler):
             raise WorkerConfigurationError(
                 worker_id, f"Unexpected error: {str(e)}"
             ) from e
+
+    async def _configure_workers(self, workers: list[RayWorkerInfo]) -> None:
+        """Configure workers concurrently and wait for all responses."""
+        if not workers:
+            return
+
+        logger.info(f"Configuring {len(workers)} workers concurrently")
+        timeout = aiohttp.ClientTimeout(total=300.0)
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            connector=get_default_connector(),
+        ) as session:
+            tasks = [
+                self._configure_worker(session, worker_info, worker_rank)
+                for worker_rank, worker_info in enumerate(workers)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    def _discover_worker_network(self, role: str) -> None:
+        if role not in self._workers:
+            raise WorkerNotFoundError(f"Role '{role}' is not created yet")
+
+        # Apply discoveries to worker infos
+        for worker_info in self._workers[role]:
+            if worker_info.worker.worker_ports:
+                continue
+            task_index = worker_info.task_index
+            key = names.worker_discovery(
+                self.experiment_name, self.trial_name, role, str(task_index)
+            )
+            try:
+                addr = name_resolve.get(key)
+            except name_resolve.NameEntryNotFoundError:
+                continue
+            ip, port = split_hostport(addr)
+            worker_info.worker.ip = ip
+            worker_ports = [str(port)]
+            worker_info.worker.worker_ports = worker_ports
+
+            self._wait_worker_ready(worker_info)
+
+            # Allocate new ports from the worker
+            if worker_info.spec.port_count > 1:
+                resp = requests.post(
+                    f"http://{format_hostport(ip, port)}/alloc_ports",
+                    json=dict(count=worker_info.spec.port_count - 1),
+                )
+                resp.raise_for_status()
+                worker_ports += list(map(str, resp.json()["ports"]))
+
+            logger.debug(f"Discovered {worker_info.worker.id} at {addr}")
 
     def _prepare_worker_specs(
         self, role: str, num_workers: int, schedulings: list[SchedulingSpec] | None
@@ -723,14 +1104,9 @@ class RayScheduler(Scheduler):
         return RayWorkerInfo(
             worker=worker,
             role=role,
-            ray_job_id=-1,  # Not a separate Ray job
             task_index=idx,
-            discovered=True,  # Already discovered during fork
-            spec=target_wi.spec,  # Inherit from target
-            node=target_wi.node,  # Same node as target
             launchers=target_wi.launchers,
-            placement_group=target_wi.placement_group,
-            gpu_devices=target_wi.gpu_devices,
+            spec=target_wi.spec,  # Inherit from target
         )
 
     async def _kill_forked_worker(
@@ -863,8 +1239,7 @@ class RayScheduler(Scheduler):
 
         # Configure forked workers if exp_config is available
         if self.exp_config is not None:
-            for worker_rank, worker_info in enumerate(workers):
-                self._configure_worker(worker_info, worker_rank)
+            await self._configure_workers(workers)
 
         return worker_ids
 
@@ -920,12 +1295,41 @@ class RayScheduler(Scheduler):
         """Generate Ray placement group for worker job with bundle-per-node layout."""
         pg = placement_group(bundles=bundles, strategy="PACK")
         try:
-            ray.get(pg.ready(), timeout=timeout)
-        except ray.exceptions.GetTimeoutError as e:
+            ready_ref = pg.ready()
+            tik = time.time()
+            while True:
+                elapsed = time.time() - tik
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Timed out waiting for placement group for role '{role}'"
+                    )
+
+                if ray.wait(
+                    [ready_ref], timeout=min(self.health_check_interval, remaining)
+                )[0]:
+                    ray.get(ready_ref, timeout=0)
+                    break
+
+                elapsed = time.time() - tik
+                logger.info(
+                    "Waiting for Ray placement group for role '%s': "
+                    "elapsed=%.0fs remaining=%.0fs bundles=%s "
+                    "available_resources=%s cluster_resources=%s",
+                    role,
+                    elapsed,
+                    max(0.0, timeout - elapsed),
+                    bundles,
+                    ray.available_resources(),
+                    ray.cluster_resources(),
+                )
+        except TimeoutError as e:
             remove_placement_group(pg)
             logger.error(
                 "Ray placement group timeout, please check if the resource requirement "
                 "for your experiment exceeds the available resources in the cluster. \n"
+                f"ray.available_resources(): {ray.available_resources()} \n"
+                f"ray.cluster_resources(): {ray.cluster_resources()} \n"
                 f"ray.nodes(): {ray.nodes()} \n"
                 f"Placement Group bundles: {bundles}"
             )
@@ -976,7 +1380,7 @@ class RayScheduler(Scheduler):
                     bundles.append(
                         {
                             "CPU": per_node_cpu,
-                            _ray_device_resource(): float(self.n_gpus_per_node),
+                            self.ray_device_resource: float(self.n_gpus_per_node),
                             "memory": per_node_mem * 1024**3,
                         }
                     )
@@ -1001,7 +1405,7 @@ class RayScheduler(Scheduler):
             bundles.append(
                 {
                     "CPU": spec.cpu * workers_on_node,
-                    _ray_device_resource(): float(gpus_on_node),
+                    self.ray_device_resource: float(gpus_on_node),
                     "memory": spec.mem * workers_on_node * 1024**3,
                 }
             )
@@ -1098,7 +1502,7 @@ class RayScheduler(Scheduler):
                 # Fork mode: spawn new processes on same nodes via /fork endpoint
                 return self.fork_workers(role, colocate_role)
 
-            # Reuse existing workers - no new Ray job submitted
+            # Reuse existing workers - no new Ray launchers created
             worker_ids = [w.worker.id for w in target_workers]
             self._colocated_roles[role] = colocate_role
 
@@ -1110,7 +1514,7 @@ class RayScheduler(Scheduler):
 
         if strategy_type != SchedulingStrategyType.separation:
             raise ValueError(f"Unknown scheduling strategy type: {strategy_type}")
-        # Non-colocated: calculate nodes needed and submit new Ray job
+        # Non-colocated: calculate nodes needed and create new Ray launchers
         spec = schedulings[0]
         total_gpus = spec.gpu * replicas
 
@@ -1136,11 +1540,11 @@ class RayScheduler(Scheduler):
 
             for item in plan:
                 bundle = bundles[item["bundle_index"]]
-                gpu_count = int(bundle.get(_ray_device_resource(), 0))
+                gpu_count = int(bundle.get(self.ray_device_resource, 0))
                 cpu_count = int(bundle.get("CPU", 0))
                 mem_gb = max(1, int(bundle.get("memory", 0) // 1024**3))
                 options = create_resource_spec(
-                    _ray_device_resource(), cpu_count, gpu_count, mem_gb * 1024**3
+                    self.ray_device_resource, cpu_count, gpu_count, mem_gb * 1024**3
                 )
                 options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
                     placement_group=pg,
@@ -1151,12 +1555,15 @@ class RayScheduler(Scheduler):
                     role,
                     self._log_path_of(role),
                     self._merged_log_path(),
+                    self.ray_device_resource,
+                    self.device_control_env_var,
                     spec.env_vars,
                 )
                 launchers.append((item, launcher))
 
             node_infos = ray.get(
-                [launcher.node_info.remote() for _, launcher in launchers]
+                [launcher.get_node_info.remote() for _, launcher in launchers],
+                timeout=self.startup_timeout,
             )
             ordered = sorted(
                 zip(launchers, node_infos, strict=True),
@@ -1166,132 +1573,116 @@ class RayScheduler(Scheduler):
                     x[0][0]["bundle_index"],
                 ),
             )
-            all_launchers = [launcher for (item, launcher), info in ordered]
-            self._jobs[role] = all_launchers
+            self._launchers[role] = [launcher for (_, launcher), _ in ordered]
 
             workers = []
-            worker_ids = []
+            start_refs = []
+
+            def build_worker_spec(
+                worker_idx: int, gpu_devices: list[str], worker_spec: SchedulingSpec
+            ) -> dict[str, Any]:
+                return dict(
+                    role=role,
+                    worker_index=worker_idx,
+                    gpu_devices=gpu_devices,
+                    cmd=worker_spec.cmd,
+                    experiment_name=self.experiment_name,
+                    trial_name=self.trial_name,
+                    name_resolve_type=self.name_resolve_config.type,
+                    nfs_record_root=self.name_resolve_config.nfs_record_root,
+                    etcd3_addr=self.name_resolve_config.etcd3_addr,
+                    fileroot=self.fileroot,
+                )
+
+            def build_worker_info(
+                worker_idx: int,
+                worker_launchers: list[ActorHandle],
+                worker_spec: SchedulingSpec,
+            ) -> RayWorkerInfo:
+                worker_id = f"{role}/{worker_idx}"
+                worker = Worker(
+                    id=worker_id,
+                    ip="",  # Will be discovered
+                    worker_ports=[],  # Will be discovered
+                    engine_ports=[],
+                )
+                return RayWorkerInfo(
+                    worker=worker,
+                    role=role,
+                    launchers=worker_launchers,
+                    task_index=worker_idx,
+                    spec=worker_spec,
+                )
+
             if nodes_per_worker > 1:
-                grouped: dict[
-                    int, list[tuple[dict[str, Any], Any, dict[str, Any]]]
-                ] = {}
+                nodes_by_worker: dict[int, list[tuple[int, Any, list[str]]]] = {}
                 for (item, launcher), info in ordered:
-                    grouped.setdefault(item["worker_idx"], []).append(
-                        (item, launcher, info)
+                    nodes_by_worker.setdefault(item["worker_idx"], []).append(
+                        (item["node_rank"], launcher, info["visible_devices"])
                     )
                 for worker_idx in range(replicas):
-                    group = sorted(grouped[worker_idx], key=lambda x: x[0]["node_rank"])
-                    head_item, head_launcher, head_info = group[0]
-                    worker_id = f"{role}/{worker_idx}"
-                    result = ray.get(
-                        head_launcher.start_worker.remote(
-                            role,
-                            worker_idx,
-                            spec.port_count,
-                            head_info["visible_devices"],
-                            spec.cmd,
-                            self.experiment_name,
-                            self.trial_name,
-                            self.name_resolve_config.type,
-                            self.name_resolve_config.nfs_record_root,
-                            self.name_resolve_config.etcd3_addr,
-                            self.fileroot,
+                    node_group = sorted(nodes_by_worker[worker_idx], key=lambda x: x[0])
+                    _, head_launcher, head_visible_devices = node_group[0]
+                    worker_spec = schedulings[worker_idx]
+                    start_refs.append(
+                        head_launcher.start_workers.remote(
+                            [
+                                build_worker_spec(
+                                    worker_idx,
+                                    head_visible_devices,
+                                    worker_spec,
+                                )
+                            ]
                         )
                     )
-                    worker = Worker(
-                        id=worker_id,
-                        ip=result["ip"],
-                        worker_ports=result["worker_ports"],
-                        engine_ports=[],
+                    workers.append(
+                        build_worker_info(
+                            worker_idx,
+                            [launcher for _, launcher, _ in node_group],
+                            worker_spec,
+                        )
                     )
-                    worker_info = RayWorkerInfo(
-                        worker=worker,
-                        role=role,
-                        ray_job_id=worker_idx,
-                        task_index=worker_idx,
-                        discovered=True,
-                        spec=spec,
-                        node=head_info["host"],
-                        launchers=[launcher for _, launcher, _ in group],
-                        placement_group=pg,
-                        gpu_devices=result["gpu_devices"],
-                    )
-                    workers.append(worker_info)
-                    worker_ids.append(worker_id)
+
             else:
                 next_worker_idx = 0
                 for (item, launcher), info in ordered:
                     visible = info["visible_devices"]
                     workers_on_node = item["workers"]
+                    batch = []
                     for local_idx in range(workers_on_node):
                         worker_idx = next_worker_idx
                         next_worker_idx += 1
                         start = local_idx * max(1, spec.gpu)
                         end = start + max(1, spec.gpu)
                         gpu_devices = visible[start:end] if spec.gpu > 0 else []
-                        worker_id = f"{role}/{worker_idx}"
-                        result = ray.get(
-                            launcher.start_worker.remote(
-                                role,
-                                worker_idx,
-                                schedulings[worker_idx].port_count,
-                                gpu_devices,
-                                schedulings[worker_idx].cmd,
-                                self.experiment_name,
-                                self.trial_name,
-                                self.name_resolve_config.type,
-                                self.name_resolve_config.nfs_record_root,
-                                self.name_resolve_config.etcd3_addr,
-                                self.fileroot,
-                            )
+                        worker_spec = schedulings[worker_idx]
+                        batch.append(
+                            build_worker_spec(worker_idx, gpu_devices, worker_spec)
                         )
-                        worker = Worker(
-                            id=worker_id,
-                            ip=result["ip"],
-                            worker_ports=result["worker_ports"],
-                            engine_ports=[],
+                        workers.append(
+                            build_worker_info(worker_idx, [launcher], worker_spec)
                         )
-                        worker_info = RayWorkerInfo(
-                            worker=worker,
-                            role=role,
-                            ray_job_id=worker_idx,
-                            task_index=worker_idx,
-                            discovered=True,
-                            spec=schedulings[worker_idx],
-                            node=info["host"],
-                            launchers=[launcher],
-                            placement_group=pg,
-                            gpu_devices=result["gpu_devices"],
-                        )
-                        workers.append(worker_info)
-                        worker_ids.append(worker_id)
+                    if batch:
+                        start_refs.append(launcher.start_workers.remote(batch))
+
+            ray.get(
+                start_refs,
+                timeout=self.startup_timeout,
+            )
 
             self._workers[role] = workers
+            worker_ids = [worker_info.worker.id for worker_info in workers]
 
             logger.info(f"Created {replicas} workers for role '{role}' with Ray")
-        except WorkerCreationError:
-            if role in self._jobs:
-                for launcher in self._jobs[role]:
-                    try:
-                        ray.get(launcher.stop_all.remote(), timeout=10)
-                    except Exception:
-                        pass
-                del self._jobs[role]
-            if role in self._placement_groups:
-                remove_placement_group(self._placement_groups[role])
-                del self._placement_groups[role]
-            raise
         except Exception as e:
-            if role in self._jobs:
-                for launcher in self._jobs[role]:
-                    try:
-                        ray.get(launcher.stop_all.remote(), timeout=10)
-                    except Exception:
-                        pass
-                del self._jobs[role]
+            if role in self._launchers:
+                self._stop_launchers(role, timeout=10)
+                del self._launchers[role]
             if role in self._placement_groups:
                 remove_placement_group(self._placement_groups[role])
                 del self._placement_groups[role]
+            if isinstance(e, WorkerCreationError):
+                raise
             logs = self._read_log_tail(role)
             raise WorkerCreationError(
                 role,
@@ -1330,7 +1721,7 @@ class RayScheduler(Scheduler):
             # Forked roles have their own workers in _workers
             if role in self._workers:
                 workers = self._workers[role]
-                # Forked workers are already discovered and configured during creation
+                # Forked workers already have known endpoints and are configured during creation.
                 # Just verify they're still healthy
                 for worker_info in workers:
                     if not self._is_worker_ready(worker_info):
@@ -1368,6 +1759,19 @@ class RayScheduler(Scheduler):
             except WorkerFailedError:
                 raise
 
+            if any(not w.worker.worker_ports for w in workers):
+                self._discover_worker_network(role)
+
+            # Wait for all to be discovered
+            discovered_count = sum(1 for w in workers if w.worker.worker_ports)
+            if discovered_count < len(workers):
+                if discovered_count > 0:
+                    logger.debug(
+                        f"Discovered {discovered_count}/{len(workers)} workers"
+                    )
+                time.sleep(self.health_check_interval)
+                continue
+
             # Health check all workers
             ready_workers = []
 
@@ -1381,8 +1785,7 @@ class RayScheduler(Scheduler):
 
                 # Configure workers if exp_config is available
                 if self.exp_config is not None:
-                    for worker_rank, worker_info in enumerate(workers):
-                        self._configure_worker(worker_info, worker_rank)
+                    run_async_task(self._configure_workers, workers)
 
                 return [w.worker for w in workers]
 
@@ -1457,7 +1860,7 @@ class RayScheduler(Scheduler):
             raise RuntimeError(str(e)) from e
 
     def delete_workers(self, role: str | None = None, reverse_order: bool = False):
-        """Delete workers and cancel Ray jobs.
+        """Delete workers and stop Ray launchers.
 
         Teardown follows a two-phase protocol analogous to the Ray and Local
         schedulers:
@@ -1466,7 +1869,7 @@ class RayScheduler(Scheduler):
            HTTP concurrently.  This runs the engine-side CPU barrier and
            ``dist.destroy_process_group`` so that NCCL communicators and the
            TCPStore are shut down cleanly on all ranks.
-        2. **Job cancel** – stop the Ray-managed launcher actors.  At this
+        2. **Launcher stop** – stop the Ray-managed launcher actors.  At this
            point process groups are already torn down, so killing the
            processes will not produce spurious ``TCPStore.recvValue failed``
            warnings.
@@ -1482,7 +1885,7 @@ class RayScheduler(Scheduler):
         """
         del reverse_order  # unused, see docstring
         if role is None:
-            # Delete colocated/forked roles first (they don't own Ray jobs)
+            # Delete colocated/forked roles first (they don't own Ray launchers)
             colocated_roles = list(self._colocated_roles.keys())
             for r in colocated_roles:
                 self.delete_workers(r)
@@ -1523,13 +1926,10 @@ class RayScheduler(Scheduler):
         # dist.destroy_process_group complete on every rank.
         self._destroy_engines_on_workers(workers)
 
-        # Phase 2: cancel the Ray job. Process groups are already torn
+        # Phase 2: stop the Ray launchers. Process groups are already torn
         # down, so stopping actors will not cause TCPStore race conditions.
-        for launcher in self._jobs.get(role, []):
-            try:
-                ray.get(launcher.stop_all.remote(), timeout=30)
-            except Exception as e:
-                logger.error(f"Error stopping Ray launcher for role {role}: {e}")
+        self._stop_launchers(role, timeout=30)
+        for launcher in self._launchers.get(role, []):
             try:
                 ray.kill(launcher, no_restart=True)
             except Exception:
@@ -1543,7 +1943,7 @@ class RayScheduler(Scheduler):
 
         # Clean up internal state
         del self._workers[role]
-        self._jobs.pop(role, None)
+        self._launchers.pop(role, None)
         self._placement_groups.pop(role, None)
 
         logger.info(f"Successfully deleted workers for role '{role}'")
@@ -1704,78 +2104,6 @@ class RayScheduler(Scheduler):
                 worker_id, f"Engine creation timed out: {e}"
             ) from e
 
-    def _prepare_multi_node_server_args(
-        self,
-        worker_info: RayWorkerInfo,
-        server_args: dict[str, Any],
-    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-        backend = (
-            "vllm"
-            if "distributed_executor_backend" in server_args or "model" in server_args
-            else "sglang"
-        )
-        head_launcher = worker_info.launchers[0]
-        host_ports = ray.get(head_launcher.alloc_ports.remote(1))
-        master_host = host_ports["host"]
-        master_port = host_ports["ports"][0]
-        n_nodes = len(worker_info.launchers)
-
-        head_args = copy.deepcopy(server_args)
-        worker_args = []
-        if backend == "sglang":
-            dist_init_addr = f"{master_host}:{master_port}"
-            head_args.update(nnodes=n_nodes, node_rank=0, dist_init_addr=dist_init_addr)
-            for node_rank in range(1, n_nodes):
-                args = copy.deepcopy(server_args)
-                args.pop("host", None)
-                args.pop("port", None)
-                args.update(
-                    nnodes=n_nodes, node_rank=node_rank, dist_init_addr=dist_init_addr
-                )
-                worker_args.append(args)
-        else:
-            head_args.update(
-                nnodes=n_nodes,
-                node_rank=0,
-                master_addr=master_host,
-                master_port=str(master_port),
-            )
-            for node_rank in range(1, n_nodes):
-                args = copy.deepcopy(server_args)
-                args.pop("host", None)
-                args.pop("port", None)
-                args.update(
-                    nnodes=n_nodes,
-                    node_rank=node_rank,
-                    master_addr=master_host,
-                    master_port=str(master_port),
-                    headless=True,
-                )
-                worker_args.append(args)
-
-        return backend, head_args, worker_args
-
-    async def _launch_multi_node_server(
-        self,
-        worker_info: RayWorkerInfo,
-        kwargs: dict[str, Any],
-    ) -> dict[str, Any]:
-        server_args = kwargs.get("server_args")
-        if not isinstance(server_args, dict) or len(worker_info.launchers) <= 1:
-            return kwargs
-
-        backend, head_args, worker_args = self._prepare_multi_node_server_args(
-            worker_info, server_args
-        )
-        refs = []
-        for launcher, args in zip(worker_info.launchers[1:], worker_args, strict=True):
-            refs.append(launcher.launch_llm_server.remote(backend, args))
-        if refs:
-            await asyncio.to_thread(ray.get, refs)
-        new_kwargs = kwargs.copy()
-        new_kwargs["server_args"] = head_args
-        return new_kwargs
-
     def call_engine(
         self,
         worker_id: str,
@@ -1858,8 +2186,63 @@ class RayScheduler(Scheduler):
             engine_name = worker_id
 
         if method == "launch_server" and len(worker_info.launchers) > 1:
-            kwargs = await self._launch_multi_node_server(worker_info, kwargs)
+            kwargs = await self._multi_node_rollout.prepare_launch_server(
+                worker_info, engine_name, kwargs
+            )
+            try:
+                return await self._async_call_engine_rpc(
+                    worker_info,
+                    worker_id,
+                    method,
+                    engine_name,
+                    args,
+                    kwargs,
+                    rpc_meta,
+                    http_timeout,
+                    max_retries,
+                    retry_delay,
+                )
+            except BaseException:
+                await self._multi_node_rollout.stop_backend_workers(
+                    worker_info, engine_name
+                )
+                raise
 
+        try:
+            return await self._async_call_engine_rpc(
+                worker_info,
+                worker_id,
+                method,
+                engine_name,
+                args,
+                kwargs,
+                rpc_meta,
+                http_timeout,
+                max_retries,
+                retry_delay,
+            )
+        finally:
+            if (
+                method in ("destroy", "teardown_server")
+                and len(worker_info.launchers) > 1
+            ):
+                await self._multi_node_rollout.stop_backend_workers(
+                    worker_info, engine_name
+                )
+
+    async def _async_call_engine_rpc(
+        self,
+        worker_info: RayWorkerInfo,
+        worker_id: str,
+        method: str,
+        engine_name: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        rpc_meta: dict[str, Any] | None,
+        http_timeout: float,
+        max_retries: int,
+        retry_delay: float,
+    ) -> Any:
         serialized_args = serialize_value(list(args))
         serialized_kwargs = serialize_value(kwargs)
         payload = {
