@@ -26,7 +26,7 @@ from areal.utils.data import (
 )
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import find_free_ports
-
+from areal.utils.offload import torch_memory_saver
 
 def _build_python_module_cmd(command: str) -> list[str]:
     """Build a module command from ``module`` or ``python -m module``."""
@@ -219,19 +219,20 @@ class RayRPCServer(RayServer):
                 engine=engine, rpc_meta=rpc_meta
             )
             if should_broadcast:
-                device = self._get_device()
-                args = tensor_container_to(args, device)
-                args = broadcast_tensor_container(
-                    args,
-                    src_rank=engine.current_data_parallel_head(),
-                    group=engine.context_and_model_parallel_group,
-                )
-                kwargs = tensor_container_to(kwargs, device)
-                kwargs = broadcast_tensor_container(
-                    kwargs,
-                    src_rank=engine.current_data_parallel_head(),
-                    group=engine.context_and_model_parallel_group,
-                )
+                with torch_memory_saver.disable():
+                    device = self._get_device()
+                    args = tensor_container_to(args, device)
+                    args = broadcast_tensor_container(
+                        args,
+                        src_rank=engine.current_data_parallel_head(),
+                        group=engine.context_and_model_parallel_group,
+                    )
+                    kwargs = tensor_container_to(kwargs, device)
+                    kwargs = broadcast_tensor_container(
+                        kwargs,
+                        src_rank=engine.current_data_parallel_head(),
+                        group=engine.context_and_model_parallel_group,
+                    )
         except Exception as e:
             self.logger.error(
                 f"RayRPCServer broadcast failed for '{method}': {e}\n"
