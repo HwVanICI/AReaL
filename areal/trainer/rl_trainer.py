@@ -321,6 +321,12 @@ class PPOTrainer:
                         "base_model_name": config.actor.path,
                     }
                 )
+            if self._is_actor_rollout_colocated(config):
+                disk_kwargs.update(
+                    {
+                        "colocate_mode": True,
+                    }
+                )
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
         elif self.config.actor.weight_update_mode == "xccl":
             # NCCL/XCCL weight update
@@ -763,6 +769,13 @@ class PPOTrainer:
                 new_version = global_step + 1
                 versioned_meta = self.weight_update_meta.with_version(new_version)
                 self.actor.update_weights(versioned_meta)
+                if versioned_meta.colocate_stage:
+                    self._offload_model(self.actor, role="actor")
+                    self._onload_rollout()
+                    stage_meta = versioned_meta.with_colocate_stage(1)
+                    self.actor.update_weights(stage_meta)
+                    self._offload_rollout()
+                    self._onload_model(self.actor, role="actor")
 
                 self.actor.set_version(new_version)
                 if self.critic is not None:
