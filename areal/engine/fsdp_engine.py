@@ -611,7 +611,7 @@ class FSDPEngine(TrainEngine):
         self._check_rollout_engine_connected()
         context = self._offload_aware_context()
         if meta.colocate_mode and meta.colocate_stage == 1 and meta.type == "disk":
-                context = nullcontext()
+            context = nullcontext()
         with context:
             if meta.type == "xccl":
                 assert self.weight_update_group_initialized
@@ -1492,7 +1492,9 @@ class FSDPEngine(TrainEngine):
             self._save_model_to_hf(meta.path, self.tokenizer, self.processor)
             current_platform.synchronize()
             dist.barrier(group=self.cpu_group)
-            self.logger.info(f"{dist.get_rank()=} [stage0]-----actor end writing weights to disk.")
+            self.logger.info(
+                f"{dist.get_rank()=} [stage0]-----actor end writing weights to disk."
+            )
         else:
             fut = Future()
             if dist.get_rank() == 0:
@@ -1507,7 +1509,9 @@ class FSDPEngine(TrainEngine):
                 )
 
                 fut.result()
-                self.logger.info(f"{dist.get_rank()=} [stage1]-----rollout end reading weights from disk.")
+                self.logger.info(
+                    f"{dist.get_rank()=} [stage1]-----rollout end reading weights from disk."
+                )
             current_platform.synchronize()
             dist.barrier(group=self.cpu_group)
 

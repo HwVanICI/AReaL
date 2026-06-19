@@ -193,7 +193,6 @@ class WeightUpdateMeta:
     colocate_stage: int = 0
     colocate_mode: bool = False
 
-
     backend: str | None = None
 
     use_lora: bool = False
@@ -238,11 +237,13 @@ class WeightUpdateMeta:
         return new_meta
 
     def with_colocate_stage(self, stage: int) -> "WeightUpdateMeta":
-        """ for update colocation,
-            stage 0 for actor save weights
-            stage 1 for rollout load weights
+        """for update colocation,
+        stage 0 for actor save weights
+        stage 1 for rollout load weights
         """
-        assert stage in [0, 1] and self.colocate_mode, f"colocate_mode must be True,got {self.colocate_mode}.stage must be 0 or 1, got {stage}"
+        assert stage in [0, 1] and self.colocate_mode, (
+            f"colocate_mode must be True,got {self.colocate_mode}.stage must be 0 or 1, got {stage}"
+        )
         new_meta = copy.copy(self)
         new_meta.colocate_stage = stage
         return new_meta
