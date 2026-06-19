@@ -28,6 +28,7 @@ from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import find_free_ports
 from areal.utils.offload import torch_memory_saver
 
+
 def _build_python_module_cmd(command: str) -> list[str]:
     """Build a module command from ``module`` or ``python -m module``."""
     parts = shlex.split(command)
