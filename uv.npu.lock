@@ -16,6 +16,7 @@ supported-markers = [
 overrides = [
     { name = "hydra-core", specifier = "==1.4.0.dev1" },
     { name = "openai", specifier = ">=2.8.0" },
+    { name = "safetensors", specifier = "<0.8.0" },
     { name = "soundfile", specifier = "==0.13.1" },
     { name = "timm", specifier = "==1.0.16" },
 ]
