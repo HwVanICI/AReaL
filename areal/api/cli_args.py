@@ -1135,25 +1135,6 @@ class SchedulingSpec:
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
     )
-    ray_placement_strategy: str = field(
-        default="shared",
-        metadata={
-            "help": "Which placement strategy to use for Ray scheduling. "
-            "Shared will produce 1 placement group for all workers in the role (training). "
-            "Separate will 1 placement group per worker (rollout). "
-            "Deferred will do the same as separate but defers accelerator scheduling (multinode rollout). ",
-            "choices": ["shared", "separate", "deferred"],
-        },
-    )
-
-    def __post_init__(self):
-        """Validate scheduling spec configuration."""
-        valid_strategies = {"shared", "separate", "deferred"}
-        if self.ray_placement_strategy not in valid_strategies:
-            raise ValueError(
-                f"ray_placement_strategy must be one of {valid_strategies}, "
-                f"got '{self.ray_placement_strategy}'"
-            )
 
 
 @dataclass
@@ -1911,15 +1892,6 @@ class vLLMConfig:
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
         return get_py_cmd("areal.engine.vllm_ext.areal_vllm_server", args)
-
-    @staticmethod
-    def build_cmd_from_args_headless(args: dict[str, Any]):
-        args = args.copy()
-        model = args.pop("model")
-        args["headless"] = True
-        # vllm serve needed for headless mode
-        # need to add model directly following vllm serve
-        return process_args(["vllm", "serve", model], args)
 
     @staticmethod
     def build_cmd(
