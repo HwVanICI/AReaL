@@ -9,10 +9,12 @@ properly with LD_PRELOAD hooks.
 import os
 from contextlib import nullcontext
 
-try:
-    from torch_memory_saver import torch_memory_saver
-except ImportError:
+def is_tms_enabled() -> bool:
+    return os.environ.get("TMS_INIT_ENABLE", "0") == "1"
 
+if is_tms_enabled():
+    from torch_memory_saver import torch_memory_saver
+else:
     class MockTorchMemorySaver:
         def disable(self):
             return nullcontext()
@@ -25,9 +27,10 @@ except ImportError:
 
     torch_memory_saver = MockTorchMemorySaver()
 
-
 def get_tms_env_vars() -> dict[str, str]:
     """Get environment variables for torch_memory_saver (TMS)."""
+    if not is_tms_enabled():
+        return {}
     import torch_memory_saver as tms_pkg
 
     # Locate the LD_PRELOAD shared library
@@ -46,6 +49,3 @@ def get_tms_env_vars() -> dict[str, str]:
     }
     return env_vars
 
-
-def is_tms_enabled() -> bool:
-    return os.environ.get("TMS_INIT_ENABLE", "0") == "1"

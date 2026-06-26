@@ -106,6 +106,9 @@ class RayServer(abc.ABC):
         for k, v in env.items():
             os.environ[str(k)] = str(v)
 
+    def get_env(self):
+        return {str(k): str(v) for k, v in os.environ.items()}
+
     def post_init(self, **kwargs) -> Any:
         # the HTTPLauncher needs this, but keeping this here for interface compatibility
         # launched after the actor has been deployed

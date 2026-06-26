@@ -307,6 +307,8 @@ class PPOTrainer:
         # Save initial LoRA weights if enabled (for inference server pre-loading)
         initial_lora_path = self._save_initial_lora_weights()
 
+        if self._should_offload_actor:
+            self._offload_model(self.actor, role="actor")
         # Initialize inference with LoRA path
         self.rollout = self._init_rollout(
             config.rollout, is_eval=False, lora_path=initial_lora_path
@@ -587,16 +589,13 @@ class PPOTrainer:
             raise cleanup_error
 
     def _apply_initial_offload_policy(self) -> None:
-        if self._should_offload_rollout:
-            self._offload_rollout()
         if self._should_offload_ref:
             self._offload_model(self.ref, role="ref")
         if self._should_offload_critic:
             self._offload_model(self.critic, role="critic")
         if self._should_offload_teacher:
             self._offload_model(self.teacher, role="teacher")
-        if self._should_offload_actor:
-            self._offload_model(self.actor, role="actor")
+
 
     def train(
         self,
@@ -644,8 +643,6 @@ class PPOTrainer:
             epoch = global_step // steps_per_epoch
             step = global_step % steps_per_epoch
 
-            if self._should_offload_rollout:
-                self._onload_rollout()
             with (
                 stats_tracker.record_timing("rollout"),
                 perf_tracer.trace_scope(
@@ -799,6 +796,28 @@ class PPOTrainer:
                 if self._should_offload_critic:
                     self._offload_model(self.critic, role="critic")
 
+            with (
+                stats_tracker.record_timing("save"),
+                perf_tracer.trace_scope(
+                    "train.save",
+                    category=Category.IO,
+                    args={"global_step": global_step},
+                ),
+            ):
+                self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
+
+            with (
+                stats_tracker.record_timing("checkpoint_for_recover"),
+                perf_tracer.trace_scope(
+                    "train.checkpoint",
+                    category=Category.IO,
+                    args={"global_step": global_step},
+                ),
+            ):
+                self._save_recover_checkpoint(
+                    epoch=epoch, epoch_step=step, global_step=global_step
+                )
+
             # pause inference for updating weights, save, and evaluation
             self.rollout.pause()
 
@@ -822,8 +841,6 @@ class PPOTrainer:
                     self._onload_rollout()
                     stage_meta = versioned_meta.with_colocate_stage(1)
                     self.actor.update_weights(stage_meta)
-                    self._offload_rollout()
-                    self._onload_model(self.actor, role="actor")
 
                 self.actor.set_version(new_version)
                 if self.critic is not None:
@@ -832,34 +849,6 @@ class PPOTrainer:
                 if self.eval_rollout is not None:
                     self.eval_rollout.set_version(new_version)
 
-            with (
-                stats_tracker.record_timing("save"),
-                perf_tracer.trace_scope(
-                    "train.save",
-                    category=Category.IO,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
-
-            with (
-                stats_tracker.record_timing("checkpoint_for_recover"),
-                perf_tracer.trace_scope(
-                    "train.checkpoint",
-                    category=Category.IO,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._save_recover_checkpoint(
-                    epoch=epoch, epoch_step=step, global_step=global_step
-                )
-
-            # Offload actor before eval
-            if self._should_offload_actor:
-                self._offload_model(self.actor, role="actor")
-
-            if self._should_offload_rollout:
-                self._onload_rollout(is_eval=True)
             with (
                 stats_tracker.record_timing("eval"),
                 perf_tracer.trace_scope(
@@ -875,8 +864,6 @@ class PPOTrainer:
                     epoch_step=step,
                     global_step=global_step,
                 )
-            if self._should_offload_rollout:
-                self._offload_rollout(is_eval=True)
 
             with (
                 stats_tracker.record_timing("clear_batches"),
