@@ -596,12 +596,13 @@ class DataController:
         endpoint: str,
         api_key: str,
         payload: dict[str, Any],
-        timeout: float = 60,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         url = f"{self._gateway_addr}{endpoint}"
+        timeout_val = timeout or self.config.setup_timeout
         try:
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=timeout), trust_env=False
+                timeout=aiohttp.ClientTimeout(total=timeout_val), trust_env=False
             ) as session:
                 async with session.post(
                     url,

@@ -11,5 +11,5 @@ class GatewayConfig:
     port: int = 8090
     router_addr: str = ""
     admin_api_key: str = "areal-data-admin"
-    forward_timeout: float = 60.0
+    forward_timeout: float = 300.0
     router_timeout: float = 30.0

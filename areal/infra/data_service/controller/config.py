@@ -25,7 +25,7 @@ class DataServiceConfig:
     scheduling_strategy: SchedulingStrategy = field(
         default_factory=lambda: SchedulingStrategy(type="separation"),
     )
-    setup_timeout: float = 120.0
+    setup_timeout: float = 300.0
     dataloader_num_workers: int = 4
     seed: int = 42
 

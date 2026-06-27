@@ -14,7 +14,7 @@ def main():
     parser.add_argument("--admin-api-key", default="areal-data-admin")
     parser.add_argument("--router-addr", default="http://localhost:8091")
     parser.add_argument("--router-timeout", type=float, default=30.0)
-    parser.add_argument("--forward-timeout", type=float, default=60.0)
+    parser.add_argument("--forward-timeout", type=float, default=300.0)
     args, _ = parser.parse_known_args()
 
     from areal.infra.data_service.gateway.app import create_gateway_app
