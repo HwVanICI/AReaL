@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import pickle
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -185,10 +186,22 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
     @app.post("/v1/samples/fetch")
     async def fetch_samples(body: FetchSamplesRequest):
         async with _locked_active_state(body.dataset_id) as state:
+            start_time = time.monotonic()
+            logger.info(
+                "Fetching %d samples for dataset %s",
+                len(body.indices),
+                body.dataset_id,
+            )
             samples = await asyncio.to_thread(
                 lambda: [
                     serialize_value(state.raw_dataset[idx]) for idx in body.indices
                 ]
+            )
+            logger.info(
+                "Fetched %d samples for dataset %s in %.2fs",
+                len(body.indices),
+                body.dataset_id,
+                time.monotonic() - start_time,
             )
             return {"samples": samples}
 

@@ -119,6 +119,7 @@ class _PrefetchBuffer:
     # -- Background thread -------------------------------------------------
 
     def _run(self) -> None:
+        last_log_time = 0.0
         while not self._stop.is_set():
             with self._lock:
                 if len(self._cache) >= self._max_cached:
@@ -138,6 +139,16 @@ class _PrefetchBuffer:
                 return
 
             try:
+                now = time.monotonic()
+                if last_log_time == 0.0 or now - last_log_time >= 5.0:
+                    logger.info(
+                        "Prefetching samples: pos=%d/%d chunk_size=%d cached=%d",
+                        self._pos - len(chunk),
+                        len(self._indices),
+                        len(chunk),
+                        len(self._cache),
+                    )
+                    last_log_time = now
                 samples = self._fetch_fn(chunk)
             except Exception:
                 logger.exception(
@@ -205,7 +216,7 @@ class RDataset:
         tokenizer_or_processor_path: str = "",
         shuffle: bool = True,
         drop_last: bool = True,
-        prefetch_chunk_size: int = 1,
+        prefetch_chunk_size: int = 4,
         prefetch_max_cached: int = 512,
     ) -> None:
         """Register with *controller* and enable data fetching.
