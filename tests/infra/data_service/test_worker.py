@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from unittest.mock import patch
@@ -37,6 +38,15 @@ def _make_mock_dataset(n: int = 20) -> Dataset:
             "label": list(range(n)),
         }
     )
+
+
+class _SlowDataset:
+    def __len__(self) -> int:
+        return 4
+
+    def __getitem__(self, idx: int) -> dict[str, int]:
+        time.sleep(0.2)
+        return {"idx": idx}
 
 
 def _load_payload(**overrides: object) -> dict[str, object]:
@@ -288,6 +298,45 @@ class TestWorkerConcurrency:
         datasets_lock.release()
         unload_response = await asyncio.wait_for(unload_task, timeout=1)
         assert unload_response.status_code == 200
+
+    async def test_health_responds_while_fetch_serializes_slow_samples(
+        self, config: DataWorkerConfig
+    ):
+        with (
+            patch(
+                "areal.infra.data_service.worker.app._get_custom_dataset",
+                return_value=_SlowDataset(),
+            ),
+            patch(
+                "areal.infra.data_service.worker.app.load_hf_processor_and_tokenizer"
+            ) as mock_load,
+        ):
+            mock_load.return_value = (None, None)
+            app = create_worker_app(config)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                load_response = await client.post(
+                    "/datasets/load", json=_load_payload()
+                )
+                assert load_response.status_code == 200
+
+                fetch_task = asyncio.create_task(
+                    client.post(
+                        "/v1/samples/fetch",
+                        json={"dataset_id": DATASET_ID, "indices": [0, 1, 2]},
+                    )
+                )
+                await asyncio.sleep(0.05)
+
+                health_response = await asyncio.wait_for(
+                    client.get("/health"), timeout=0.1
+                )
+                assert health_response.status_code == 200
+
+                fetch_response = await fetch_task
+                assert fetch_response.status_code == 200
 
     async def test_unrelated_load_succeeds_while_unload_waits_on_state_lock(
         self, loaded_worker

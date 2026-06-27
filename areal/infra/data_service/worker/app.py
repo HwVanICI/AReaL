@@ -185,7 +185,11 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
     @app.post("/v1/samples/fetch")
     async def fetch_samples(body: FetchSamplesRequest):
         async with _locked_active_state(body.dataset_id) as state:
-            samples = [serialize_value(state.raw_dataset[idx]) for idx in body.indices]
+            samples = await asyncio.to_thread(
+                lambda: [
+                    serialize_value(state.raw_dataset[idx]) for idx in body.indices
+                ]
+            )
             return {"samples": samples}
 
     @app.post("/datasets/unload")

@@ -6,7 +6,10 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from areal.infra.data_service.router.app import create_router_app
+from areal.infra.data_service.router.app import (
+    _record_worker_health,
+    create_router_app,
+)
 from areal.infra.data_service.router.config import RouterConfig
 
 ADMIN_KEY = "test-admin-key"
@@ -164,6 +167,56 @@ class TestRouting:
     async def test_route_no_auth_401(self, client):
         resp = await client.post("/route")
         assert resp.status_code == 401
+
+
+class TestWorkerHealthTracking:
+    def test_transient_misses_keep_worker_healthy_until_threshold(self):
+        worker_healthy = {WORKER_1: True}
+        health_misses = {WORKER_1: 0}
+
+        _record_worker_health(
+            worker_healthy,
+            health_misses,
+            WORKER_1,
+            healthy=False,
+            unhealthy_after_misses=3,
+        )
+        _record_worker_health(
+            worker_healthy,
+            health_misses,
+            WORKER_1,
+            healthy=False,
+            unhealthy_after_misses=3,
+        )
+
+        assert worker_healthy[WORKER_1] is True
+        assert health_misses[WORKER_1] == 2
+
+        _record_worker_health(
+            worker_healthy,
+            health_misses,
+            WORKER_1,
+            healthy=False,
+            unhealthy_after_misses=3,
+        )
+
+        assert worker_healthy[WORKER_1] is False
+        assert health_misses[WORKER_1] == 3
+
+    def test_success_resets_worker_health_misses(self):
+        worker_healthy = {WORKER_1: False}
+        health_misses = {WORKER_1: 3}
+
+        _record_worker_health(
+            worker_healthy,
+            health_misses,
+            WORKER_1,
+            healthy=True,
+            unhealthy_after_misses=3,
+        )
+
+        assert worker_healthy[WORKER_1] is True
+        assert health_misses[WORKER_1] == 0
 
 
 class TestWorkersList:

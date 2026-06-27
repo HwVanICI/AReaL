@@ -13,7 +13,7 @@ def main():
     parser.add_argument("--port", type=int, default=8090)
     parser.add_argument("--admin-api-key", default="areal-data-admin")
     parser.add_argument("--router-addr", default="http://localhost:8091")
-    parser.add_argument("--router-timeout", type=float, default=2.0)
+    parser.add_argument("--router-timeout", type=float, default=30.0)
     parser.add_argument("--forward-timeout", type=float, default=60.0)
     args, _ = parser.parse_known_args()
 

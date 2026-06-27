@@ -46,9 +46,28 @@ class UnregisterWorkerRequest(BaseModel):
     worker_addr: str
 
 
+def _record_worker_health(
+    worker_healthy: dict[str, bool],
+    worker_health_misses: dict[str, int],
+    addr: str,
+    healthy: bool,
+    unhealthy_after_misses: int,
+) -> None:
+    if healthy:
+        worker_healthy[addr] = True
+        worker_health_misses[addr] = 0
+        return
+
+    misses = worker_health_misses.get(addr, 0) + 1
+    worker_health_misses[addr] = misses
+    if misses >= unhealthy_after_misses:
+        worker_healthy[addr] = False
+
+
 def create_router_app(config: RouterConfig) -> FastAPI:
     registered_workers: list[str] = []
     worker_healthy: dict[str, bool] = {}
+    worker_health_misses: dict[str, int] = {}
     rr_idx: int = 0
     lock = asyncio.Lock()
 
@@ -61,9 +80,16 @@ def create_router_app(config: RouterConfig) -> FastAPI:
             async def _check_health(addr: str) -> None:
                 try:
                     async with session.get(f"{addr}/health") as resp:
-                        worker_healthy[addr] = resp.status == 200
+                        healthy = resp.status == 200
                 except Exception:
-                    worker_healthy[addr] = False
+                    healthy = False
+                _record_worker_health(
+                    worker_healthy,
+                    worker_health_misses,
+                    addr,
+                    healthy,
+                    config.worker_unhealthy_after_misses,
+                )
 
             while True:
                 await asyncio.gather(
@@ -85,6 +111,7 @@ def create_router_app(config: RouterConfig) -> FastAPI:
 
     app = FastAPI(title="AReaL Data Router", lifespan=lifespan)
     app.state.worker_healthy = worker_healthy
+    app.state.worker_health_misses = worker_health_misses
 
     @app.get("/health")
     async def health():
@@ -101,6 +128,7 @@ def create_router_app(config: RouterConfig) -> FastAPI:
             if body.worker_addr not in registered_workers:
                 registered_workers.append(body.worker_addr)
                 worker_healthy[body.worker_addr] = True
+                worker_health_misses[body.worker_addr] = 0
                 logger.info(
                     "Worker registered: %s (total=%d)",
                     body.worker_addr,
@@ -115,6 +143,7 @@ def create_router_app(config: RouterConfig) -> FastAPI:
             if body.worker_addr in registered_workers:
                 registered_workers.remove(body.worker_addr)
                 worker_healthy.pop(body.worker_addr, None)
+                worker_health_misses.pop(body.worker_addr, None)
                 logger.info("Worker unregistered: %s", body.worker_addr)
         return {"status": "ok"}
 

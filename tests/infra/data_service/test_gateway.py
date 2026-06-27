@@ -65,6 +65,9 @@ async def _register_dataset(client, dataset_id: str = "train-sample") -> dict:
 
 
 class TestGatewayHealth:
+    def test_default_router_timeout_allows_busy_local_services(self):
+        assert GatewayConfig().router_timeout == 30.0
+
     @pytest.mark.asyncio
     async def test_health_no_auth_required(self, client):
         resp = await client.get("/health")

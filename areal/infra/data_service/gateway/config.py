@@ -12,4 +12,4 @@ class GatewayConfig:
     router_addr: str = ""
     admin_api_key: str = "areal-data-admin"
     forward_timeout: float = 60.0
-    router_timeout: float = 2.0
+    router_timeout: float = 30.0

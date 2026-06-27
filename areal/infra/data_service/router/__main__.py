@@ -12,7 +12,8 @@ def main():
     parser.add_argument("--port", type=int, default=8091)
     parser.add_argument("--admin-api-key", default="areal-data-admin")
     parser.add_argument("--poll-interval", type=float, default=5.0)
-    parser.add_argument("--worker-health-timeout", type=float, default=3.0)
+    parser.add_argument("--worker-health-timeout", type=float, default=30.0)
+    parser.add_argument("--worker-unhealthy-after-misses", type=int, default=3)
     args, _ = parser.parse_known_args()
 
     router_app_module = importlib.import_module("areal.infra.data_service.router.app")
@@ -30,6 +31,7 @@ def main():
         admin_api_key=args.admin_api_key,
         poll_interval=args.poll_interval,
         worker_health_timeout=args.worker_health_timeout,
+        worker_unhealthy_after_misses=args.worker_unhealthy_after_misses,
     )
 
     uvicorn = importlib.import_module("uvicorn")
