@@ -58,6 +58,7 @@ from areal.api import (
 )
 from areal.api.cli_args import OptimizerConfig, PerfTracerConfig, TrainEngineConfig
 from areal.api.io_struct import DeviceRuntimeInfo
+from areal.engine.awex_writer import AwexFSDPWriterAdapter
 from areal.engine.core import (
     aggregate_eval_losses,
     compute_total_loss_weight,
@@ -236,6 +237,7 @@ class FSDPEngine(TrainEngine):
         self.weight_update_groups: list = []
         self.weight_update_master_addr: str
         self.weight_update_master_port: int
+        self.awex_writer: AwexFSDPWriterAdapter | None = None
 
         self.model_config = AutoConfig.from_pretrained(
             pretrained_model_name_or_path=self.config.path,
@@ -579,6 +581,13 @@ class FSDPEngine(TrainEngine):
             rollout_engine=engine, train_engine=self
         )
 
+        if meta.type == "awex":
+            if not meta.meta_server_addr:
+                raise ValueError("meta_server_addr must be set for awex weight update.")
+            if self.awex_writer is None:
+                self.awex_writer = AwexFSDPWriterAdapter(self, meta)
+                self.awex_writer.initialize()
+
         if meta.type == "xccl" and not self.weight_update_group_initialized:
             self._init_weight_update_from_distributed(meta)
             self.weight_update_group_initialized = True
@@ -629,6 +638,8 @@ class FSDPEngine(TrainEngine):
             if meta.type == "xccl":
                 assert self.weight_update_group_initialized
                 self._update_weights_from_distributed(meta)
+            elif meta.type == "awex":
+                self._update_weights_from_awex(meta)
             elif meta.type == "disk" and meta.colocate_mode:
                 self._update_weights_from_disk_stage(meta)
             elif meta.type == "disk":
@@ -1687,6 +1698,49 @@ class FSDPEngine(TrainEngine):
 
         dist.barrier(group=self.cpu_group)
         if main_rank:
+            self.rollout_engine.continue_generation()
+
+        current_platform.synchronize()
+        dist.barrier(group=self.cpu_group)
+
+    @trace_perf("fsdp_engine.update_weights_from_awex", category="comm")
+    def _update_weights_from_awex(self, meta: WeightUpdateMeta) -> None:
+        if self.awex_writer is None:
+            raise RuntimeError("Awex writer is not initialized. Call connect_engine().")
+
+        step_id = self.get_version()
+        self.awex_writer.set_global_step(step_id)
+
+        if dist.get_rank() == 0:
+            self.rollout_engine.pause_generation()
+
+        dist.barrier(group=self.cpu_group)
+
+        comm_backend = meta.comm_backend or "file"
+        fut = None
+        if comm_backend == "file":
+            if not meta.path:
+                raise ValueError("meta.path must be set for awex file backend.")
+            self.awex_writer.write_weights(path=meta.path)
+            if dist.get_rank() == 0:
+                fut = self.rollout_engine.update_weights_from_awex(
+                    meta, step_id=step_id, kwargs={"path": meta.path}
+                )
+        else:
+            if dist.get_rank() == 0:
+                fut = self.rollout_engine.update_weights_from_awex(
+                    meta, step_id=step_id, kwargs=None
+                )
+            # Give the Awex reader a head start before FSDP shards are sent.
+            dist.barrier(group=self.cpu_group)
+            self.awex_writer.write_weights()
+
+        dist.barrier(group=self.cpu_group)
+
+        if dist.get_rank() == 0 and fut is not None:
+            fut.result()
+            self.rollout_engine.continue_generation()
+        elif dist.get_rank() == 0:
             self.rollout_engine.continue_generation()
 
         current_platform.synchronize()
