@@ -107,7 +107,10 @@ def get_clevr_count_70k_sft_dataset(
             )
 
             example["input_ids"] = processed_input["input_ids"].squeeze(0)
-            example["mm_token_type_ids"] = processed_input.get("token_type_ids", None)
+            if "mm_token_type_ids" in processed_input:
+                example["mm_token_type_ids"] = processed_input[
+                    "mm_token_type_ids"
+                ].squeeze(0)
             multi_modal_input = {}
             multi_modal_input["pixel_values"] = processed_input["pixel_values"]
             if "image_grid_thw" in processed_input:

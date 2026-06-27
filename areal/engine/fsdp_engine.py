@@ -1845,7 +1845,7 @@ class FSDPEngine(TrainEngine):
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
                 attention_mask=attn_mask,
-                mm_token_type_ids=input_["mm_token_type_ids"],
+                mm_token_type_ids=input_.get("mm_token_type_ids"),
                 inputs_embeds=None,
                 past_key_values=None,
             )
