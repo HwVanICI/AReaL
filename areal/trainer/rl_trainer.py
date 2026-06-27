@@ -822,6 +822,8 @@ class PPOTrainer:
             # Actor already onloaded; engine-internal _offload_aware_context
             # calls in update_weights/save are no-ops.
 
+            actor_stats = None
+
             with (
                 stats_tracker.record_timing("update_weights"),
                 perf_tracer.trace_scope(
@@ -835,6 +837,7 @@ class PPOTrainer:
                 versioned_meta = self.weight_update_meta.with_version(new_version)
                 self.actor.update_weights(versioned_meta)
                 if versioned_meta.colocate_mode:
+                    actor_stats = self.actor.export_stats()
                     self._offload_model(self.actor, role="actor")
                     self._onload_rollout()
                     stage_meta = versioned_meta.with_colocate_stage(1)
@@ -901,7 +904,10 @@ class PPOTrainer:
                 args={"global_step": global_step},
             ):
                 self._export_and_commit_stats(
-                    epoch=epoch, epoch_step=step, global_step=global_step
+                    epoch=epoch,
+                    epoch_step=step,
+                    global_step=global_step,
+                    actor_stats=actor_stats,
                 )
 
             # Resume rollout
@@ -1316,9 +1322,15 @@ class PPOTrainer:
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
-    def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
+    def _export_and_commit_stats(
+        self,
+        epoch: int,
+        epoch_step: int,
+        global_step: int,
+        actor_stats: dict[str, float] | None = None,
+    ):
         # Upload statistics to the logger (e.g., wandb)
-        stats = self.actor.export_stats()
+        stats = actor_stats if actor_stats is not None else self.actor.export_stats()
         stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())

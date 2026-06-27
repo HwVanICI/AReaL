@@ -33,8 +33,6 @@ else:
 
 def get_tms_env_vars() -> dict[str, str]:
     """Get environment variables for torch_memory_saver (TMS)."""
-    if not is_tms_enabled():
-        return {}
     import torch_memory_saver as tms_pkg
 
     # Locate the LD_PRELOAD shared library
