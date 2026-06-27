@@ -161,6 +161,25 @@ class TestTrainerDataServicePath:
 
         assert dataset is sentinel
 
+    def test_rdataset_dataloader_uses_main_process(self):
+        from areal.api.cli_args import TrainDatasetConfig
+        from areal.infra.data_service import RDataset
+        from areal.utils.dataloader import create_dataloader
+
+        dataset = RDataset(path="dummy", type="sft", split="train")
+        dataset._connected = True
+        dataset._total_samples = 8
+
+        cfg = TrainDatasetConfig(path="dummy", type="sft", batch_size=4, num_workers=4)
+        dataloader = create_dataloader(
+            dataset,
+            rank=0,
+            world_size=1,
+            dataset_config=cfg,
+        )
+
+        assert dataloader.num_workers == 0
+
 
 class TestGenericDatasetFallback:
     def test_none_split_uses_first_available_split(self, tmp_path: Path):

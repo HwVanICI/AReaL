@@ -46,6 +46,8 @@ def create_dataloader(
     else:
         sampler_cls = DistributedSampler
 
+    num_workers = 0 if isinstance(dataset, RDataset) else dataset_config.num_workers
+
     return StatefulDataLoader(
         dataset,
         batch_size=dataset_config.batch_size // world_size,
@@ -57,7 +59,7 @@ def create_dataloader(
             drop_last=drop_sampler_last,
         ),
         drop_last=dataset_config.drop_last,
-        num_workers=dataset_config.num_workers,
+        num_workers=num_workers,
         collate_fn=collate_fn or (lambda x: x),
     )
 

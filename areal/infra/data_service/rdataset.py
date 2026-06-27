@@ -205,7 +205,7 @@ class RDataset:
         tokenizer_or_processor_path: str = "",
         shuffle: bool = True,
         drop_last: bool = True,
-        prefetch_chunk_size: int = 64,
+        prefetch_chunk_size: int = 4,
         prefetch_max_cached: int = 512,
     ) -> None:
         """Register with *controller* and enable data fetching.
