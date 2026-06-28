@@ -292,8 +292,39 @@ class RayScheduler(Scheduler):
         worker_ids: list[str] = []
         post_init_tasks: list[ray.ObjectRef] = []
 
-        for idx, (target_wi, spec) in enumerate(zip(target_workers, schedulings)):
+        assert len(target_workers) % len(schedulings) == 0, (
+            f"check {len(target_workers)=} and {len(schedulings)=}"
+        )
+
+        stride = len(target_workers) // len(schedulings)
+
+        def get_device_envs(wgs: list[RayWorkerInfo]):
+            if len(wgs) <= 1:
+                return {}
+            resource_type = ray_resource_type()
+            if resource_type not in ["NPU", "GPU"]:
+                return {}
+            target_env_key = "ASCEND_RT_VISIBLE_DEVICES"
+            if resource_type == "GPU":
+                target_env_key = "CUDA_VISIBLE_DEVICES"
+            resource_env = {}
+            visible_devices = set()
+            for w in wgs:
+                envs = ray.get(w.actor.get_env.remote())
+                if target_env_key in envs:
+                    visible_devices.add(envs[target_env_key])
+                else:
+                    raise ValueError(f"{target_env_key} not found in envs")
+            resource_env[target_env_key] = ",".join(
+                [str(d) for d in sorted(visible_devices)]
+            )
+            return resource_env
+
+        for idx, spec in enumerate(schedulings):
             # include parent in ray name since role and iteration idx alone can cause name collision if forking multiple times
+            target_wi = target_workers[idx * stride]
+            workers_group = target_workers[idx * stride : (idx + 1) * stride]
+            devices_env = get_device_envs(workers_group)
             worker_id = f"{target_role}/{role}/{idx}"
 
             # Reuse placement group from target worker
@@ -312,10 +343,6 @@ class RayScheduler(Scheduler):
             device = ray_resource_type()
             additional_options = {}
             if spec.gpu > 0:
-                if spec.gpu > 1:
-                    raise NotImplementedError(
-                        "Colocation of multi-GPU workers together is not supported by Ray"
-                    )
                 if device == "GPU":
                     additional_options = dict(num_gpus=0.01)
                 else:
@@ -344,6 +371,8 @@ class RayScheduler(Scheduler):
                     count=len(target_wi.worker.worker_ports)
                 )
             )
+            if devices_env:
+                ray.get(actor.set_env.remote(devices_env))
             # run any post inits needed
             post_init_tasks.append(actor.post_init.remote(port=worker_ports[0]))
 
@@ -520,13 +549,6 @@ class RayScheduler(Scheduler):
                 )
 
             target_workers = self._workers[colocate_role]
-            if num_workers != len(target_workers):
-                raise WorkerCreationError(
-                    role,
-                    "Replica count mismatch",
-                    f"Colocated role must have same replica count as target "
-                    f"({num_workers} != {len(target_workers)})",
-                )
 
             # Check if fork mode is enabled
             if strategy.fork:
