@@ -34,6 +34,7 @@ from areal.api.cli_args import (
     InferenceEngineConfig,
     PerfTracerConfig,
     SchedulingSpec,
+    SchedulingStrategy,
 )
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
@@ -364,11 +365,17 @@ class RolloutController:
     async def _async_start_proxy(self) -> None:
         """Async implementation of proxy worker initialization."""
         command = "areal.experimental.openai.proxy.proxy_rollout_server"
-        worker_ids = self.scheduler.fork_workers(
+        job = Job(
             role=self._proxy_role,
-            target_role=self._worker_role,
-            command=command,
+            replicas=len(self.server_infos),
+            tasks=[SchedulingSpec(gpu=0, port_count=2)],
+            scheduling_strategy=SchedulingStrategy(
+                type="colocation",
+                target=self._worker_role,
+                fork=True,
+            ),
         )
+        worker_ids = self.scheduler.fork_workers(job, command=command)
         logger.info(f"Proxy workers forked: {worker_ids}")
 
         self.proxy_workers = self.scheduler.get_workers(role=self._proxy_role)
