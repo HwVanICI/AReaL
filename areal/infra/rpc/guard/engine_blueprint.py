@@ -37,6 +37,7 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import logging, perf_tracer, seeding
 from areal.utils.data import broadcast_tensor_container, tensor_container_to
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.offload import torch_memory_saver
 
 logger = logging.getLogger("EngineBP")
 
@@ -471,23 +472,24 @@ def call_engine_method():
                 )
                 if should_broadcast:
                     logger.debug(f"Broadcasting RPC payload for method: {method_name}")
-                    args_bcast = tensor_container_to(
-                        args, current_platform.current_device()
-                    )
-                    args_bcast = broadcast_tensor_container(
-                        args_bcast,
-                        src_rank=engine.current_data_parallel_head(),
-                        group=engine.context_and_model_parallel_group,
-                    )
-                    kwargs_bcast = tensor_container_to(
-                        kwargs, current_platform.current_device()
-                    )
-                    kwargs_bcast = broadcast_tensor_container(
-                        kwargs_bcast,
-                        src_rank=engine.current_data_parallel_head(),
-                        group=engine.context_and_model_parallel_group,
-                    )
-                    logger.debug("Broadcasting RPC payload done.")
+                    with torch_memory_saver.disable():
+                        args_bcast = tensor_container_to(
+                            args, current_platform.current_device()
+                        )
+                        args_bcast = broadcast_tensor_container(
+                            args_bcast,
+                            src_rank=engine.current_data_parallel_head(),
+                            group=engine.context_and_model_parallel_group,
+                        )
+                        kwargs_bcast = tensor_container_to(
+                            kwargs, current_platform.current_device()
+                        )
+                        kwargs_bcast = broadcast_tensor_container(
+                            kwargs_bcast,
+                            src_rank=engine.current_data_parallel_head(),
+                            group=engine.context_and_model_parallel_group,
+                        )
+                        logger.debug("Broadcasting RPC payload done.")
 
                 logger.debug(f"Calling engine '{engine_name}' method: {method_name}")
 
