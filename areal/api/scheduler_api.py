@@ -144,25 +144,21 @@ class Scheduler(abc.ABC):
     @abc.abstractmethod
     def fork_workers(
         self,
-        role: str,
-        target_role: str,
+        job: Job,
         command: str | None = None,
     ) -> list[str]:
-        """Fork new worker processes from existing workers.
-
-        Creates new worker processes by forking from existing workers of the target role.
-        The forked workers are colocated on the same nodes as their target workers.
+        """Fork worker processes from an existing role.
 
         Parameters
         ----------
-        role : str
-            Role name for the new forked workers (e.g., "proxy")
-        target_role : str
-            Role of existing workers to fork from (e.g., "rollout")
+        job : Job
+            Job configuration for the forked workers. The scheduling strategy
+            must be colocation with ``fork=True``. ``job.role`` is the new
+            role, ``job.replicas`` is the number of forked workers, and
+            ``job.scheduling_strategy.target`` is the role to fork from.
+            ``job.tasks`` describes the resources for the forked workers.
         command : str, optional
-            Custom module path to run instead of the default rpc_server.
-            If specified, the forked process runs this module (e.g.,
-            "areal.experimental.openai.proxy.proxy_rollout_server").
+            Module path to run instead of the default rpc_server.
 
         Returns
         -------
@@ -174,7 +170,7 @@ class Scheduler(abc.ABC):
         WorkerCreationError
             If fork operation fails
         WorkerNotFoundError
-            If target_role workers don't exist
+            If target workers don't exist
         """
         raise NotImplementedError()
 
