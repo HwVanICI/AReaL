@@ -257,28 +257,32 @@ class LocalScheduler(Scheduler):
     def _prepare_worker_specs(
         self, role: str, num_workers: int, schedulings: list[SchedulingSpec] | None
     ) -> list[SchedulingSpec]:
-        if not schedulings:
-            return [
-                SchedulingSpec(
-                    cpu=1,
-                    mem=1024,
-                    gpu=0,
-                    port_count=2,
-                    cmd="python -m areal.infra.rpc.rpc_server",
-                )
-            ] * num_workers
+        """Prepare scheduling specs for workers."""
+        if schedulings is None or len(schedulings) == 0:
+            raise ValueError(f"No scheduling specs provided for role '{role}'")
+
+        # Amend environment variables
+        for sch in schedulings:
+            # AReaL env var forwarding
+            if self.enable_tms_offload:
+                sch.env_vars.update(get_tms_env_vars())
+            sch.env_vars.update(get_env_vars())
+            thread_env = get_thread_env_vars(
+                cpus_per_task=sch.cpu,
+                existing_env_vars=sch.env_vars,
+            )
+            sch.env_vars.update(thread_env)
 
         if len(schedulings) == 1:
+            # Expand single spec to all workers
             return [schedulings[0]] * num_workers
-
-        if len(schedulings) == num_workers:
-            return schedulings
-
-        raise WorkerCreationError(
-            role,
-            "Invalid configuration",
-            f"schedulings length ({len(schedulings)}) must be 1 or equal to replicas ({num_workers})",
-        )
+        elif len(schedulings) == num_workers:
+            return list(schedulings)
+        else:
+            raise ValueError(
+                f"Number of scheduling specs ({len(schedulings)}) must be 1 or match "
+                f"number of workers ({num_workers})"
+            )
 
     @staticmethod
     async def _wait_for_fork_ready(
@@ -308,6 +312,7 @@ class LocalScheduler(Scheduler):
         idx: int,
         target_wi: WorkerInfo,
         target_role: str,
+        worker_spec: SchedulingSpec,
         command: str | None = None,
     ) -> WorkerInfo:
         """Fork a single worker asynchronously.
@@ -368,10 +373,20 @@ class LocalScheduler(Scheduler):
                 raw_cmd.extend(["--fileroot", str(self.fileroot)])
 
             # 3. Fork via raw_cmd
+            env_overrides = worker_spec.env_vars.copy()
+            gpu_devices = list(target_wi.gpu_devices) if worker_spec.gpu > 0 else []
+            device_env = current_platform.device_control_env_var
+            if worker_spec.gpu <= 0:
+                env_overrides["CUDA_VISIBLE_DEVICES"] = ""
+                env_overrides["ASCEND_RT_VISIBLE_DEVICES"] = ""
+            elif device_env:
+                env_overrides[device_env] = ",".join(map(str, gpu_devices))
+
             payload = {
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env_overrides,
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -431,18 +446,18 @@ class LocalScheduler(Scheduler):
             worker_ports=[str(forked_port)],
             engine_ports=[],
         )
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
+        port_cnt = worker_spec.port_count
         if port_cnt > 1:
-            worker.worker_ports += self._allocate_ports(port_cnt - 1)
+            worker.worker_ports += list(map(str, self._allocate_ports(port_cnt - 1)))
 
         return WorkerInfo(
             worker=worker,
             process=None,  # Managed by parent worker
             role=role,
-            gpu_devices=target_wi.gpu_devices,  # Inherited from target
+            gpu_devices=gpu_devices,
             created_at=time.time(),
             log_file=str(self.log_dir / f"{role}.log"),
-            env_vars=target_wi.env_vars.copy(),  # Inherited from target
+            env_vars=env_overrides,
         )
 
     async def _kill_forked_worker(
@@ -510,6 +525,7 @@ class LocalScheduler(Scheduler):
         role: str,
         target_role: str,
         target_workers: list[WorkerInfo],
+        schedulings: list[SchedulingSpec],
         command: str | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
@@ -528,7 +544,13 @@ class LocalScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    schedulings[idx],
+                    command,
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -582,21 +604,23 @@ class LocalScheduler(Scheduler):
 
     def fork_workers(
         self,
-        role: str,
-        target_role: str,
+        job: Job,
         command: str | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
-        Creates new worker processes by forking from existing workers of the target role.
-        The forked workers are colocated on the same nodes as their target workers.
+        The forked workers run as child processes of the target role's guard
+        process and are colocated one-to-one with target workers. This local
+        scheduler implementation supports CPU-only forks and TP=1 GPU forks.
 
         Parameters
         ----------
-        role : str
-            Role name for the new forked workers (e.g., "proxy")
-        target_role : str
-            Role of existing workers to fork from (e.g., "rollout")
+        job : Job
+            Job configuration for the forked workers. The scheduling strategy
+            must be colocation with ``fork=True``. ``job.role`` is the new
+            role, ``job.replicas`` is the number of forked workers, and
+            ``job.scheduling_strategy.target`` is the role to fork from.
+            ``job.tasks`` describes the forked worker resources.
         command : str, optional
             Custom module path to run instead of the default rpc_server.
             If specified, the forked process runs this module.
@@ -605,10 +629,70 @@ class LocalScheduler(Scheduler):
         -------
         list[str]
             List of worker IDs created (e.g., ["proxy/0", "proxy/1"])
+
+        Raises
+        ------
+        WorkerCreationError
+            If the strategy is invalid, the fork layout is unsupported, or
+            worker creation fails.
+        WorkerNotFoundError
+            If the target role does not exist.
         """
+        role = job.role
+        num_workers = job.replicas
+        strategy = job.scheduling_strategy
+        if SchedulingStrategyType(strategy.type) != SchedulingStrategyType.colocation:
+            raise WorkerCreationError(
+                role,
+                "Invalid strategy",
+                "fork_workers requires a colocation scheduling strategy",
+            )
+        if not strategy.fork:
+            raise WorkerCreationError(
+                role,
+                "Invalid strategy",
+                "fork_workers requires scheduling_strategy.fork=True",
+            )
+        target_role = strategy.target
+        if not target_role:
+            raise WorkerCreationError(
+                role,
+                "Invalid strategy",
+                "Colocation strategy requires target role to be specified",
+            )
+        if role in self._workers:
+            raise WorkerCreationError(role, f"Role '{role}' already exists")
+        if num_workers <= 0:
+            raise WorkerCreationError(
+                role, "Invalid configuration", "replicas must be greater than 0"
+            )
         if target_role not in self._workers:
             raise WorkerNotFoundError(f"Target role '{target_role}' not found for fork")
         target_workers = self._workers[target_role]
+        if len(target_workers) != num_workers:
+            raise WorkerCreationError(
+                role,
+                "Unsupported fork layout",
+                "LocalScheduler only supports one-to-one fork colocation "
+                f"({len(target_workers)} target workers != {num_workers} fork workers).",
+            )
+
+        schedulings = self._prepare_worker_specs(role, num_workers, job.tasks)
+        for idx, scheduling in enumerate(schedulings):
+            if scheduling.gpu not in (0, 1):
+                raise WorkerCreationError(
+                    role,
+                    "Unsupported fork layout",
+                    f"LocalScheduler only supports CPU-only forks or TP=1 GPU forks; "
+                    f"worker {idx} requested {scheduling.gpu} GPUs.",
+                )
+            if scheduling.gpu == 1 and len(target_workers[idx].gpu_devices) != 1:
+                raise WorkerCreationError(
+                    role,
+                    "Unsupported fork layout",
+                    f"LocalScheduler only supports TP=1 GPU forks; target worker "
+                    f"{target_role}/{idx} has {len(target_workers[idx].gpu_devices)} GPUs.",
+                )
 
         try:
             return run_async_task(
@@ -616,6 +700,7 @@ class LocalScheduler(Scheduler):
                 role,
                 target_role,
                 target_workers,
+                schedulings,
                 command,
             )
         except Exception:
@@ -701,10 +786,10 @@ class LocalScheduler(Scheduler):
             # Check if fork mode is enabled
             if strategy.fork:
                 # Fork mode: spawn new processes on same GPUs via /fork endpoint
-                worker_ids = self.fork_workers(role, colocate_role)
-            else:
-                # Reuse existing workers - no new processes spawned
-                worker_ids = [w.worker.id for w in target_workers]
+                return self.fork_workers(job)
+
+            # Reuse existing workers - no new processes spawned
+            worker_ids = [w.worker.id for w in target_workers]
             self._colocated_roles[role] = colocate_role
 
             logger.info(
@@ -737,25 +822,11 @@ class LocalScheduler(Scheduler):
                         role, f"Resource allocation failed for worker {idx}", str(e)
                     ) from e
 
-                env = get_env_vars(
-                    ",".join([f"{k}={v}" for k, v in scheduling.env_vars.items()]),
-                )
+                env = scheduling.env_vars.copy()
                 if current_platform.device_control_env_var:
                     env[current_platform.device_control_env_var] = ",".join(
                         map(str, gpu_devices)
                     )
-
-                thread_env = get_thread_env_vars(
-                    cpus_per_task=scheduling.cpu,
-                    existing_env_vars=scheduling.env_vars,
-                )
-                env.update(thread_env)
-
-                if self.enable_tms_offload:
-                    env.update(get_tms_env_vars())
-
-                if scheduling.env_vars:
-                    env.update(scheduling.env_vars)
 
                 log_file = self.log_dir / f"{role}.log"
                 merged_log = self.log_dir / "merged.log"
