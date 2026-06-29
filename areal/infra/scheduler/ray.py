@@ -405,6 +405,7 @@ class RayWorkerInfo:
     launchers: list[ActorHandle] = field(default_factory=list)
     spec: SchedulingSpec | None = None
     gpu_devices: list[str] = field(default_factory=list)
+    fork_parent_index: int | None = None
 
 
 class RayMultiNodeRolloutCoordinator:
@@ -968,6 +969,7 @@ class RayScheduler(Scheduler):
         target_wi: RayWorkerInfo,
         target_role: str,
         worker_spec: SchedulingSpec,
+        gpu_devices: list[str],
         command: str | None = None,
     ) -> RayWorkerInfo:
         """Fork a single worker asynchronously.
@@ -1029,10 +1031,8 @@ class RayScheduler(Scheduler):
 
             # 3. Fork via raw_cmd
             env_overrides = worker_spec.env_vars.copy()
-            if worker_spec.gpu > 0 and target_wi.gpu_devices:
-                env_overrides[self.device_control_env_var] = ",".join(
-                    target_wi.gpu_devices
-                )
+            if gpu_devices:
+                env_overrides[self.device_control_env_var] = ",".join(gpu_devices)
             elif worker_spec.gpu <= 0:
                 env_overrides[self.device_control_env_var] = ""
 
@@ -1083,13 +1083,15 @@ class RayScheduler(Scheduler):
 
             logger.info(
                 f"Forked worker {worker_id} created at {forked_host}:{forked_port} "
-                f"(pid={forked_pid}) from {target_role}/{idx}"
+                f"(pid={forked_pid}) from {target_role}/{target_wi.task_index} "
+                f"with devices {gpu_devices}"
             )
 
         except aiohttp.ClientError as e:
             raise WorkerCreationError(
                 role,
-                f"Failed to fork worker {idx} from {target_role}/{idx}",
+                f"Failed to fork worker {idx} from "
+                f"{target_role}/{target_wi.task_index}",
                 str(e),
             ) from e
 
@@ -1121,7 +1123,8 @@ class RayScheduler(Scheduler):
             task_index=idx,
             launchers=target_wi.launchers,
             spec=worker_spec,
-            gpu_devices=target_wi.gpu_devices if worker_spec.gpu > 0 else [],
+            gpu_devices=gpu_devices,
+            fork_parent_index=target_wi.task_index,
         )
 
     async def _kill_forked_worker(
@@ -1176,10 +1179,18 @@ class RayScheduler(Scheduler):
             tasks = []
             for worker_info in workers:
                 worker_index = int(worker_info.worker.id.split("/")[-1])
-                if worker_index < len(target_workers):
+                parent_index = (
+                    worker_info.fork_parent_index
+                    if worker_info.fork_parent_index is not None
+                    else worker_index
+                )
+                if parent_index < len(target_workers):
                     tasks.append(
                         self._kill_forked_worker(
-                            session, role, worker_index, target_workers[worker_index]
+                            session,
+                            role,
+                            worker_index,
+                            target_workers[parent_index],
                         )
                     )
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1188,7 +1199,7 @@ class RayScheduler(Scheduler):
         self,
         role: str,
         target_role: str,
-        target_workers: list[RayWorkerInfo],
+        target_worker_groups: list[list[RayWorkerInfo]],
         schedulings: list[SchedulingSpec],
         command: str | None = None,
     ) -> list[str]:
@@ -1206,18 +1217,28 @@ class RayScheduler(Scheduler):
             connector=get_default_connector(),
         ) as session:
             # Launch all fork requests concurrently with exception handling
-            tasks = [
-                self._fork_single_worker(
-                    session,
-                    role,
-                    idx,
-                    target_wi,
-                    target_role,
-                    schedulings[idx],
-                    command,
+            tasks = []
+            for idx, group in enumerate(target_worker_groups):
+                target_wi = group[0]
+                gpu_devices = []
+                if schedulings[idx].gpu > 0:
+                    gpu_devices = [
+                        gpu_device
+                        for worker in group
+                        for gpu_device in worker.gpu_devices
+                    ]
+                tasks.append(
+                    self._fork_single_worker(
+                        session=session,
+                        role=role,
+                        idx=idx,
+                        target_wi=target_wi,
+                        target_role=target_role,
+                        worker_spec=schedulings[idx],
+                        gpu_devices=gpu_devices,
+                        command=command,
+                    )
                 )
-                for idx, target_wi in enumerate(target_workers)
-            ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Separate successful workers from failures
@@ -1226,8 +1247,10 @@ class RayScheduler(Scheduler):
         for idx, result in enumerate(results):
             if isinstance(result, Exception):
                 failed_indices.append(idx)
+                parent_index = target_worker_groups[idx][0].task_index
                 logger.error(
-                    f"Failed to fork worker {role}/{idx} from {target_role}/{idx}: {result}"
+                    f"Failed to fork worker {role}/{idx} from "
+                    f"{target_role}/{parent_index}: {result}"
                 )
             else:
                 workers.append(result)
@@ -1246,7 +1269,8 @@ class RayScheduler(Scheduler):
 
             raise WorkerCreationError(
                 role,
-                f"Failed to fork {len(failed_indices)} out of {len(target_workers)} workers",
+                f"Failed to fork {len(failed_indices)} out of "
+                f"{len(target_worker_groups)} workers",
                 f"Failed indices: {failed_indices}",
             )
 
@@ -1358,13 +1382,14 @@ class RayScheduler(Scheduler):
                     "RayScheduler only supports TP=1 GPU forks; target worker "
                     f"{target_role}/{idx} has {target_gpus} GPUs.",
                 )
+        target_worker_groups = [[target_wi] for target_wi in target_workers]
 
         try:
             return run_async_task(
                 self._create_forked_workers_async,
                 role,
                 target_role,
-                target_workers,
+                target_worker_groups,
                 schedulings,
                 command,
             )
