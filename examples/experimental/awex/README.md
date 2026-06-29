@@ -4,10 +4,12 @@ This folder provides a minimal AWEX config for GSM8K GRPO in single-controller m
 
 ## Files
 
-| File                              | Purpose                                        |
-| --------------------------------- | ---------------------------------------------- |
-| `gsm8k_grpo_awex_sample.yaml`     | Minimal config for local validation on 2 GPUs. |
-| `gsm8k_grpo_awex_npu_sample.yaml` | Minimal config for local validation on 2 NPUs. |
+| File                                       | Purpose                                                      |
+| ------------------------------------------ | ------------------------------------------------------------ |
+| `gsm8k_grpo_awex_sample.yaml`              | Minimal config for local validation on 2 GPUs.               |
+| `gsm8k_grpo_awex_npu_sample.yaml`          | Minimal config for local validation on 2 NPUs.               |
+| `gsm8k_grpo_awex_colocate_sample.yaml`     | Minimal config with colocate for local validation on 2 NPUs. |
+| `gsm8k_grpo_awex_npu_colocate_sample.yaml` | Minimal config with colocatefor local validation on 2 NPUs.  |
 
 ## Install Awex
 

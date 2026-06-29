@@ -58,9 +58,12 @@ class AwexMegatronWriterAdapter:
         if self.weights_exchange_writer is not None:
             return
         self.weights_exchange_writer = self._get_writer(self)
-        self.weights_exchange_writer.initialize()
         if self.enable_colocate_mode:
-            self.release_memory_occupation()
+            from areal.engine.patch_awex_for_colocate import patch_awex
+
+            patch_awex()
+            logger.info("patching awex success for megatron process.")
+        self.weights_exchange_writer.initialize()
 
     def set_global_step(self, global_step: int) -> None:
         # Awex writer uses this for logging and synchronization metadata.
@@ -76,19 +79,17 @@ class AwexMegatronWriterAdapter:
     def save_hf_checkpoint(self, path: str) -> None:
         self._engine._save_model_to_hf(path)
 
-    def release_memory_occupation(self, tags: list[str] | None = None) -> None:
+    def release_memory_occupation(self, tags: list[str] | str | None = None) -> None:
         if self.enable_colocate_mode:
-            logger.warning(
-                "Awex colocate mode requested, but MegatronEngine does not "
-                "support fine-grained memory release. No-op."
-            )
+            if isinstance(tags, str):
+                tags = [tags]
+            self._engine.release_memory_occupation(tags)
 
-    def resume_memory_occupation(self, tags: list[str] | None = None) -> None:
+    def resume_memory_occupation(self, tags: list[str] | str | None = None) -> None:
         if self.enable_colocate_mode:
-            logger.warning(
-                "Awex colocate mode requested, but MegatronEngine does not "
-                "support fine-grained memory resume. No-op."
-            )
+            if isinstance(tags, str):
+                tags = [tags]
+            self._engine.resume_memory_occupation(tags)
 
     def release_grad_memory(self, empty_cache: bool = True) -> None:
         # Placeholder to satisfy Awex TrainingEngine API.

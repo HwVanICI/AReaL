@@ -217,6 +217,8 @@ class MegatronEngine(TrainEngine):
         self.processor = None
         self.awex_writer: AwexMegatronWriterAdapter | None = None
 
+        self.released_tags: set[str] = set()
+
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         if parallel_strategy is None:
             parallel_strategy = ParallelStrategy()
@@ -1144,9 +1146,7 @@ class MegatronEngine(TrainEngine):
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py
         """
         if not is_tms_enabled():
-            raise RuntimeError(
-                "torch_memory_saver requires `enable_offload=True` in yaml config."
-            )
+            return self.release_memory_occupation()
 
         self.get_device_stats().log("before offload model")
 
@@ -1175,6 +1175,8 @@ class MegatronEngine(TrainEngine):
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py
         """
+        if not is_tms_enabled():
+            return self.resume_memory_occupation()
 
         torch_memory_saver.resume()
 
@@ -1192,6 +1194,346 @@ class MegatronEngine(TrainEngine):
         self.get_device_stats().log("after onload model")
 
         self.is_offload = False
+
+    def release_memory_occupation(self, tags: list[str] | None = None) -> None:
+        """Release GPU memory for specified tags by offloading to CPU.
+
+        Supported tags:
+            - "optimizer": Offload optimizer state tensors (exp_avg, exp_avg_sq, etc.)
+            - "weights": Offload model parameters
+        """
+        tags = tags or ["optimizer", "weights"]
+        tags_to_release = [t for t in tags if t not in self.released_tags]
+        if not tags_to_release:
+            self.logger.info("release_memory: tags=%s already released, skipping", tags)
+            return
+        self.get_device_stats().log("before release model")
+
+        self.logger.info("release_memory: offloading tags=%s", tags_to_release)
+
+        if "optimizer" in tags_to_release:
+            self._release_optimizer_states()
+            self.released_tags.add("optimizer")
+
+        if "weights" in tags_to_release:
+            self._release_model_weights()
+            self.released_tags.add("weights")
+
+        current_platform.clear_memory()
+        self.get_device_stats().log("after release model")
+        self.logger.info("release_memory: done for tags=%s", tags_to_release)
+
+    def resume_memory_occupation(self, tags: list[str] | None = None) -> None:
+        """Resume GPU memory for specified tags by reloading from CPU.
+
+        Supported tags:
+            - "optimizer": Reload optimizer state tensors to GPU
+            - "weights": Reload model parameters to GPU
+        """
+        tags = tags or ["optimizer", "weights"]
+        tags_to_resume = [t for t in tags if t in self.released_tags]
+        if not tags_to_resume:
+            self.logger.info("resume_memory: tags=%s not released, skipping", tags)
+            return
+
+        self.logger.info("resume_memory: reloading tags=%s", tags_to_resume)
+
+        if "weights" in tags_to_resume:
+            self._resume_model_weights()
+            self.released_tags.discard("weights")
+
+        if "optimizer" in tags_to_resume:
+            self._resume_optimizer_states()
+            self.released_tags.discard("optimizer")
+
+        current_platform.synchronize()
+        self.get_device_stats().log("after resume model")
+        self.logger.info("resume_memory: done for tags=%s", tags_to_resume)
+
+    @torch.no_grad()
+    def _offload_megatron_copy_params(self, optimizers):
+        from megatron.core.optimizer import ChainedOptimizer
+
+        def _iter_opts(opt):
+            if isinstance(opt, ChainedOptimizer):
+                return opt.chained_optimizers
+            return [opt]
+
+        def offload_tensor_to_cpu(tensor):
+            if tensor is None:
+                return
+            tensor.data = tensor.data.to("cpu", non_blocking=True)
+
+        def offload_group_to_cpu(group):
+            if group is None:
+                return
+
+            if isinstance(group, list):
+                for param_group in group:
+                    if isinstance(param_group, list):
+                        for param in param_group:
+                            offload_tensor_to_cpu(param)
+                    else:
+                        offload_tensor_to_cpu(param_group)
+            else:
+                offload_tensor_to_cpu(group)
+
+        # Offload all parameter groups to CPU for each underlying optimizer
+
+        for _opt in _iter_opts(optimizers):
+            if hasattr(_opt, "shard_fp32_from_float16_groups"):
+                offload_group_to_cpu(_opt.shard_fp32_from_float16_groups)
+
+    def _release_optimizer_states(self) -> None:
+        """Move optimizer state tensors to CPU, keeping references for reload."""
+        optimizers = self.optimizer
+        if optimizers is None:
+            self.logger.warning("No optimizer found, skipping optimizer offload")
+            return
+        from megatron.core.optimizer import ChainedOptimizer
+        from megatron.core.parallel_state import get_global_memory_buffer
+
+        def _iter_opts(opt):
+            if isinstance(opt, ChainedOptimizer):
+                return opt.chained_optimizers
+            return [opt]
+
+        for _opt in _iter_opts(optimizers):
+            self._offload_megatron_copy_params(_opt)
+            ## worker may hold zero parameter when enabling custom pipeline layout
+            if _opt.optimizer is not None:
+                # HybridDeviceOptimizer: offload all sub-optimizer states to CPU
+                # TODO: this should be a method in Megatron-LM's HybridDeviceOptimizer
+                hdo = _opt.optimizer
+                if all(
+                    hasattr(hdo, attr)
+                    for attr in ("sub_optimizers", "inner_param_to_orig_param", "state")
+                ):
+                    for optimizer in hdo.sub_optimizers:
+                        for param, state in optimizer.state.items():
+                            for k, v in state.items():
+                                if not isinstance(v, torch.Tensor):
+                                    continue
+                                orig_param = hdo.inner_param_to_orig_param.get(
+                                    param, param
+                                )
+                                hdo.state[orig_param][k] = state[k] = v.to("cpu")
+                else:
+                    opt_state_dict_values = _opt.optimizer.state.values()
+                    for v in opt_state_dict_values:
+                        if "exp_avg" in v:
+                            v["exp_avg"] = v["exp_avg"].to("cpu", non_blocking=True)
+                        if "exp_avg_sq" in v:
+                            v["exp_avg_sq"] = v["exp_avg_sq"].to(
+                                "cpu", non_blocking=True
+                            )
+
+            try:
+                # Free TransformerEngine's dummy weight gradients cache
+                # https://github.com/NVIDIA/TransformerEngine/blob/release_v2.10/transformer_engine/pytorch/module/base.py#L64
+                from transformer_engine.pytorch.module.base import _dummy_wgrads
+
+                _dummy_wgrads.clear()
+            except ImportError:
+                pass
+
+            # Free Megatron-LM's global memory buffer
+            get_global_memory_buffer().buffer.clear()
+
+        self.logger.info("Released optimizer states.")
+
+    @torch.no_grad()
+    def _load_megatron_copy_params(self, optimizers):
+        from megatron.core.optimizer import ChainedOptimizer
+
+        """
+        Load optimizer parameters back to GPU. Handles ChainedOptimizer.
+
+        Args:
+            optimizers: Optimizer or ChainedOptimizer instance.
+        """
+
+        def _iter_opts(opt):
+            if isinstance(opt, ChainedOptimizer):
+                return opt.chained_optimizers
+            return [opt]
+
+        def load_tensor_to_gpu(tensor):
+            if tensor is None:
+                return
+            tensor.data = tensor.data.to(self.device, non_blocking=True)
+
+        def load_group_to_gpu(group):
+            if group is None:
+                return
+
+            if isinstance(group, list):
+                for param_group in group:
+                    if isinstance(param_group, list):
+                        for param in param_group:
+                            load_tensor_to_gpu(param)
+                    else:
+                        load_tensor_to_gpu(param_group)
+            else:
+                load_tensor_to_gpu(group)
+
+        # Load all parameter groups to GPU for each underlying optimizer
+
+        for _opt in _iter_opts(optimizers):
+            if hasattr(_opt, "shard_fp32_from_float16_groups"):
+                load_group_to_gpu(_opt.shard_fp32_from_float16_groups)
+
+    def _resume_optimizer_states(self) -> None:
+        """Restore optimizer state tensors from CPU back to GPU."""
+        optimizers = self.optimizer
+        if optimizers is None:
+            return
+        from megatron.core.optimizer import ChainedOptimizer
+
+        def _iter_opts(opt):
+            if isinstance(opt, ChainedOptimizer):
+                return opt.chained_optimizers
+            return [opt]
+
+        for _opt in _iter_opts(optimizers):
+            self._load_megatron_copy_params(_opt)
+            ## worker may hold zero parameter when enabling custom pipeline layout
+            if _opt.optimizer is not None:
+                # if we are using HybridDeviceOptimizer, we need to only move gpu optimizer state to gpu
+                if hasattr(_opt.optimizer, "_move_new_state_to_right_device"):
+                    _opt.optimizer._move_new_state_to_right_device()
+                else:
+                    opt_state_dict_values = _opt.optimizer.state.values()
+                    for v in opt_state_dict_values:
+                        if "exp_avg" in v:
+                            v["exp_avg"] = v["exp_avg"].to(
+                                self.device, non_blocking=True
+                            )
+                        if "exp_avg_sq" in v:
+                            v["exp_avg_sq"] = v["exp_avg_sq"].to(
+                                self.device, non_blocking=True
+                            )
+
+        self.logger.info("Resume optimizer states to GPU")
+
+    @torch.no_grad()
+    def _release_model_weights(self) -> None:
+        """Move model parameters to CPU, keeping references for reload."""
+        if self.model is None:
+            return
+        for model_chunk in self.model:
+            if isinstance(model_chunk, DDP):
+                model_chunk_all_buffers = [
+                    model_chunk.buffers,
+                    model_chunk.expert_parallel_buffers,
+                ]
+                for buffers in model_chunk_all_buffers:
+                    for buffer in buffers:
+                        # offload parameters
+                        if buffer.param_data.storage().size() > 0:
+                            existing = getattr(buffer.param_data, "cpu_data", None)
+                            if existing is None:
+                                buffer.param_data.cpu_data = torch.empty(
+                                    buffer.param_data.size(),
+                                    dtype=buffer.param_data.dtype,
+                                    device="cpu",
+                                    pin_memory=True,
+                                )
+                                buffer.param_data_size = (
+                                    buffer.param_data.storage().size()
+                                )
+                            else:
+                                assert existing.shape == buffer.param_data.shape, (
+                                    f"cpu_data shape {tuple(existing.shape)} != "
+                                    f"param_data shape {tuple(buffer.param_data.shape)}; "
+                                    "reallocating would reintroduce the 2x peak."
+                                )
+                                assert existing.dtype == buffer.param_data.dtype, (
+                                    f"cpu_data dtype {existing.dtype} != "
+                                    f"param_data dtype {buffer.param_data.dtype}; "
+                                    "reallocating would reintroduce the 2x peak."
+                                )
+
+                            buffer.param_data.cpu_data.copy_(
+                                buffer.param_data.data, non_blocking=False
+                            )
+                            buffer.param_data.storage().resize_(0)
+
+                        assert (
+                            buffer.param_data_size
+                            == buffer.param_data.cpu_data.storage().size()
+                        )
+
+                        if buffer.grad_data.storage().size() > 0:
+                            # if the grad_data size is already zero, we assume that it is already offloaded
+                            buffer.grad_data_size = buffer.grad_data.storage().size()
+                            buffer.grad_data.storage().resize_(0)
+
+                for param in model_chunk.module.parameters():
+                    if not param.requires_grad and param.device.type != "cpu":
+                        param.data = param.data.to("cpu", non_blocking=True)
+            else:
+                # we need this for ref module
+                for _, param in model_chunk.named_parameters():
+                    param.data = param.data.to("cpu", non_blocking=True)
+                    if param.grad is not None:
+                        param.grad = param.grad.to("cpu", non_blocking=True)
+
+        self.logger.info("Offloaded model weight tensors to CPU")
+
+    def _resume_model_weights(self) -> None:
+        """Restore model parameters from CPU back to GPU."""
+        if self.model is None:
+            return
+        load_grad = True
+        load_frozen_params = True
+
+        device_id = self.device
+        for model_chunk in self.model:
+            if isinstance(model_chunk, DDP):
+                model_chunk_all_buffers = [
+                    model_chunk.buffers,
+                    model_chunk.expert_parallel_buffers,
+                ]
+                for buffers in model_chunk_all_buffers:
+                    for buffer in buffers:
+                        # sometimes, we don't want to load grad for pure inference
+                        if load_grad and hasattr(buffer, "grad_data_size"):
+                            current_storage_size = buffer.grad_data.storage().size()
+                            if (
+                                current_storage_size == 0
+                                or current_storage_size == buffer.grad_data_size
+                            ):
+                                buffer.grad_data.storage().resize_(
+                                    buffer.grad_data_size
+                                )
+                                buffer.grad_data.zero_()
+                            else:
+                                # Non-standard layers (e.g. GatedDeltaNet) may have grad
+                                # buffers with mismatched storage size; skip resize and
+                                # zero in-place with current storage.
+                                buffer.grad_data.zero_()
+
+                        if buffer.param_data.storage().size() == 0:
+                            buffer.param_data.storage().resize_(buffer.param_data_size)
+                            # copy data from cpu to cuda
+                            buffer.param_data.copy_(
+                                buffer.param_data.cpu_data, non_blocking=True
+                            )
+
+                # Load frozen parameters that were offloaded (e.g. base model in LoRA/PEFT)
+                if load_frozen_params:
+                    for param in model_chunk.module.parameters():
+                        if not param.requires_grad and param.device.type == "cpu":
+                            param.data = param.data.to(device_id, non_blocking=True)
+            else:
+                # we need this for ref module
+                for _, param in model_chunk.named_parameters():
+                    param.data = param.data.to(device_id, non_blocking=True)
+                    if param.grad is not None:
+                        param.grad = param.grad.to(device_id, non_blocking=True)
+
+        self.logger.info("Resume model weights to GPU")
 
     def clear_batches(self, shard_ids: list[str] | None = None) -> None:
         """Drain this worker's client-side RTensor fetch buffer.

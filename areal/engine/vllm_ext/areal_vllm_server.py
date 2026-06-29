@@ -33,6 +33,19 @@ _generation_run_event = asyncio.Event()
 _generation_run_event.set()  # Initially not paused
 
 
+def _apply_ascend_patch_awex():
+    try:
+        from areal.engine.patch_awex_for_colocate import patch_awex
+
+        patch_awex()
+        print("patching awex success for vllm server process.", flush=True)
+    except ImportError:
+        print("Failed to import awex, skip patching awex.", flush=True)
+
+
+_apply_ascend_patch_awex()
+
+
 class UpdateWeightsRequest(OpenAIBaseModel):
     # The model path with the new weights
     model_path: str
