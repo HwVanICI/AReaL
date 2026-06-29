@@ -411,6 +411,14 @@ class SlurmScheduler(Scheduler):
                 f"number of workers ({num_workers})"
             )
 
+    @staticmethod
+    def _build_fork_env(worker_spec: SchedulingSpec) -> dict[str, str]:
+        env = worker_spec.env_vars.copy()
+        if worker_spec.gpu <= 0:
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            env["ASCEND_RT_VISIBLE_DEVICES"] = ""
+        return env
+
     def _get_colocation_nodes(self, target_role: str, replicas: int) -> tuple[int, str]:
         """Get node allocation for colocation strategy."""
         if target_role not in self._jobs:
@@ -468,6 +476,7 @@ class SlurmScheduler(Scheduler):
         idx: int,
         target_wi: SlurmWorkerInfo,
         target_role: str,
+        worker_spec: SchedulingSpec,
         command: str | None = None,
     ) -> SlurmWorkerInfo:
         """Fork a single worker asynchronously.
@@ -528,10 +537,12 @@ class SlurmScheduler(Scheduler):
                 raw_cmd.extend(["--fileroot", str(self.fileroot)])
 
             # 3. Fork via raw_cmd
+            env_overrides = self._build_fork_env(worker_spec)
             payload = {
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env_overrides,
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -590,7 +601,7 @@ class SlurmScheduler(Scheduler):
             worker_ports=[str(forked_port)],
             engine_ports=[],
         )
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
+        port_cnt = worker_spec.port_count
         if port_cnt > 1:
             async with session.post(
                 f"http://{format_hostport(forked_host, forked_port)}/alloc_ports",
@@ -612,7 +623,7 @@ class SlurmScheduler(Scheduler):
             slurm_job_id=-1,  # Not a separate Slurm job
             task_index=idx,
             discovered=True,  # Already discovered during fork
-            spec=target_wi.spec,  # Inherit from target
+            spec=worker_spec,
             node=target_wi.node,  # Same node as target
         )
 
@@ -681,6 +692,7 @@ class SlurmScheduler(Scheduler):
         role: str,
         target_role: str,
         target_workers: list[SlurmWorkerInfo],
+        schedulings: list[SchedulingSpec],
         command: str | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
@@ -699,7 +711,13 @@ class SlurmScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    schedulings[idx],
+                    command,
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -753,21 +771,24 @@ class SlurmScheduler(Scheduler):
 
     def fork_workers(
         self,
-        role: str,
-        target_role: str,
+        job: Job,
         command: str | None = None,
     ) -> list[str]:
-        """Fork new worker processes from existing workers.
+        """Fork worker processes from an existing Slurm role.
 
-        Creates new worker processes by forking from existing workers of the target role.
-        The forked workers are colocated on the same nodes as their target workers.
+        The forked workers run as child processes of the target Slurm
+        workers' guard processes and are colocated one-to-one with target
+        workers. This Slurm implementation supports CPU-only forks and TP=1
+        GPU forks.
 
         Parameters
         ----------
-        role : str
-            Role name for the new forked workers (e.g., "proxy")
-        target_role : str
-            Role of existing workers to fork from (e.g., "rollout")
+        job : Job
+            Job configuration for the forked workers. The scheduling strategy
+            must be colocation with ``fork=True``. ``job.role`` is the new
+            role, ``job.replicas`` is the number of forked workers, and
+            ``job.scheduling_strategy.target`` is the role to fork from.
+            ``job.tasks`` describes the forked worker resources.
         command : str, optional
             Custom module path to run instead of the default rpc_server.
             If specified, the forked process runs this module.
@@ -776,10 +797,72 @@ class SlurmScheduler(Scheduler):
         -------
         list[str]
             List of worker IDs created (e.g., ["proxy/0", "proxy/1"])
+
+        Raises
+        ------
+        WorkerCreationError
+            If the strategy is invalid, the fork layout is unsupported, or
+            worker creation fails.
+        WorkerNotFoundError
+            If the target role does not exist.
         """
+        role = job.role
+        num_workers = job.replicas
+        strategy = job.scheduling_strategy
+        if SchedulingStrategyType(strategy.type) != SchedulingStrategyType.colocation:
+            raise WorkerCreationError(
+                role,
+                "Invalid strategy",
+                "fork_workers requires a colocation scheduling strategy",
+            )
+        if not strategy.fork:
+            raise WorkerCreationError(
+                role,
+                "Invalid strategy",
+                "fork_workers requires scheduling_strategy.fork=True",
+            )
+        target_role = strategy.target
+        if not target_role:
+            raise WorkerCreationError(
+                role,
+                "Invalid strategy",
+                "Colocation strategy requires target role to be specified",
+            )
+        if role in self._workers:
+            raise WorkerCreationError(role, f"Role '{role}' already exists")
+        if num_workers <= 0:
+            raise WorkerCreationError(
+                role, "Invalid configuration", "replicas must be greater than 0"
+            )
         if target_role not in self._workers:
             raise WorkerNotFoundError(f"Target role '{target_role}' not found for fork")
         target_workers = self._workers[target_role]
+        if len(target_workers) != num_workers:
+            raise WorkerCreationError(
+                role,
+                "Unsupported fork layout",
+                "SlurmScheduler only supports one-to-one fork colocation "
+                f"({len(target_workers)} target workers != {num_workers} fork workers).",
+            )
+
+        schedulings = self._prepare_worker_specs(role, num_workers, job.tasks)
+        for idx, scheduling in enumerate(schedulings):
+            if scheduling.gpu not in (0, 1):
+                raise WorkerCreationError(
+                    role,
+                    "Unsupported fork layout",
+                    f"SlurmScheduler only supports CPU-only forks or TP=1 GPU forks; "
+                    f"worker {idx} requested {scheduling.gpu} GPUs.",
+                )
+            target_spec = target_workers[idx].spec
+            target_gpus = target_spec.gpu if target_spec is not None else None
+            if scheduling.gpu == 1 and target_gpus != 1:
+                raise WorkerCreationError(
+                    role,
+                    "Unsupported fork layout",
+                    "SlurmScheduler only supports TP=1 GPU forks; target worker "
+                    f"{target_role}/{idx} has {target_gpus} GPUs.",
+                )
 
         try:
             return run_async_task(
@@ -787,6 +870,7 @@ class SlurmScheduler(Scheduler):
                 role,
                 target_role,
                 target_workers,
+                schedulings,
                 command,
             )
         except Exception:
@@ -1006,7 +1090,7 @@ class SlurmScheduler(Scheduler):
             # Check if fork mode is enabled
             if strategy.fork:
                 # Fork mode: spawn new processes on same nodes via /fork endpoint
-                return self.fork_workers(role, colocate_role)
+                return self.fork_workers(job)
 
             # Reuse existing workers - no new Slurm job submitted
             worker_ids = [w.worker.id for w in target_workers]
