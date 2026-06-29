@@ -404,6 +404,7 @@ class RayWorkerInfo:
     task_index: int
     launchers: list[ActorHandle] = field(default_factory=list)
     spec: SchedulingSpec | None = None
+    gpu_devices: list[str] = field(default_factory=list)
 
 
 class RayMultiNodeRolloutCoordinator:
@@ -966,6 +967,7 @@ class RayScheduler(Scheduler):
         idx: int,
         target_wi: RayWorkerInfo,
         target_role: str,
+        worker_spec: SchedulingSpec,
         command: str | None = None,
     ) -> RayWorkerInfo:
         """Fork a single worker asynchronously.
@@ -1026,10 +1028,19 @@ class RayScheduler(Scheduler):
                 raw_cmd.extend(["--fileroot", str(self.fileroot)])
 
             # 3. Fork via raw_cmd
+            env_overrides = worker_spec.env_vars.copy()
+            if worker_spec.gpu > 0 and target_wi.gpu_devices:
+                env_overrides[self.device_control_env_var] = ",".join(
+                    target_wi.gpu_devices
+                )
+            elif worker_spec.gpu <= 0:
+                env_overrides[self.device_control_env_var] = ""
+
             payload = {
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env_overrides,
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -1088,7 +1099,7 @@ class RayScheduler(Scheduler):
             worker_ports=[str(forked_port)],
             engine_ports=[],
         )
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
+        port_cnt = worker_spec.port_count
         if port_cnt > 1:
             async with session.post(
                 f"http://{format_hostport(forked_host, forked_port)}/alloc_ports",
@@ -1109,7 +1120,8 @@ class RayScheduler(Scheduler):
             role=role,
             task_index=idx,
             launchers=target_wi.launchers,
-            spec=target_wi.spec,  # Inherit from target
+            spec=worker_spec,
+            gpu_devices=target_wi.gpu_devices if worker_spec.gpu > 0 else [],
         )
 
     async def _kill_forked_worker(
@@ -1177,6 +1189,7 @@ class RayScheduler(Scheduler):
         role: str,
         target_role: str,
         target_workers: list[RayWorkerInfo],
+        schedulings: list[SchedulingSpec],
         command: str | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
@@ -1195,7 +1208,13 @@ class RayScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    schedulings[idx],
+                    command,
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -1248,21 +1267,23 @@ class RayScheduler(Scheduler):
 
     def fork_workers(
         self,
-        role: str,
-        target_role: str,
+        job: Job,
         command: str | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
-        Creates new worker processes by forking from existing workers of the target role.
-        The forked workers are colocated on the same nodes as their target workers.
+        The forked workers run as child processes of the target Ray workers'
+        guard processes and are colocated one-to-one with target workers.
+        This Ray implementation supports CPU-only forks and TP=1 GPU forks.
 
         Parameters
         ----------
-        role : str
-            Role name for the new forked workers (e.g., "proxy")
-        target_role : str
-            Role of existing workers to fork from (e.g., "rollout")
+        job : Job
+            Job configuration for the forked workers. The scheduling strategy
+            must be colocation with ``fork=True``. ``job.role`` is the new
+            role, ``job.replicas`` is the number of forked workers, and
+            ``job.scheduling_strategy.target`` is the role to fork from.
+            ``job.tasks`` describes the forked worker resources.
         command : str, optional
             Custom module path to run instead of the default rpc_server.
             If specified, the forked process runs this module.
@@ -1271,10 +1292,72 @@ class RayScheduler(Scheduler):
         -------
         list[str]
             List of worker IDs created (e.g., ["proxy/0", "proxy/1"])
+
+        Raises
+        ------
+        WorkerCreationError
+            If the strategy is invalid, the fork layout is unsupported, or
+            worker creation fails.
+        WorkerNotFoundError
+            If the target role does not exist.
         """
+        role = job.role
+        num_workers = job.replicas
+        strategy = job.scheduling_strategy
+        if SchedulingStrategyType(strategy.type) != SchedulingStrategyType.colocation:
+            raise WorkerCreationError(
+                role,
+                "Invalid strategy",
+                "fork_workers requires a colocation scheduling strategy",
+            )
+        if not strategy.fork:
+            raise WorkerCreationError(
+                role,
+                "Invalid strategy",
+                "fork_workers requires scheduling_strategy.fork=True",
+            )
+        target_role = strategy.target
+        if not target_role:
+            raise WorkerCreationError(
+                role,
+                "Invalid strategy",
+                "Colocation strategy requires target role to be specified",
+            )
+        if role in self._workers:
+            raise WorkerCreationError(role, f"Role '{role}' already exists")
+        if num_workers <= 0:
+            raise WorkerCreationError(
+                role, "Invalid configuration", "replicas must be greater than 0"
+            )
         if target_role not in self._workers:
             raise WorkerNotFoundError(f"Target role '{target_role}' not found for fork")
         target_workers = self._workers[target_role]
+        if len(target_workers) != num_workers:
+            raise WorkerCreationError(
+                role,
+                "Unsupported fork layout",
+                "RayScheduler only supports one-to-one fork colocation "
+                f"({len(target_workers)} target workers != {num_workers} fork workers).",
+            )
+
+        schedulings = self._prepare_worker_specs(role, num_workers, job.tasks)
+        for idx, scheduling in enumerate(schedulings):
+            if scheduling.gpu not in (0, 1):
+                raise WorkerCreationError(
+                    role,
+                    "Unsupported fork layout",
+                    f"RayScheduler only supports CPU-only forks or TP=1 GPU forks; "
+                    f"worker {idx} requested {scheduling.gpu} GPUs.",
+                )
+            target_spec = target_workers[idx].spec
+            target_gpus = target_spec.gpu if target_spec is not None else None
+            if scheduling.gpu == 1 and target_gpus != 1:
+                raise WorkerCreationError(
+                    role,
+                    "Unsupported fork layout",
+                    "RayScheduler only supports TP=1 GPU forks; target worker "
+                    f"{target_role}/{idx} has {target_gpus} GPUs.",
+                )
 
         try:
             return run_async_task(
@@ -1282,6 +1365,7 @@ class RayScheduler(Scheduler):
                 role,
                 target_role,
                 target_workers,
+                schedulings,
                 command,
             )
         except Exception:
@@ -1503,7 +1587,7 @@ class RayScheduler(Scheduler):
             # Check if fork mode is enabled
             if strategy.fork:
                 # Fork mode: spawn new processes on same nodes via /fork endpoint
-                return self.fork_workers(role, colocate_role)
+                return self.fork_workers(job)
 
             # Reuse existing workers - no new Ray launchers created
             worker_ids = [w.worker.id for w in target_workers]
@@ -1601,6 +1685,7 @@ class RayScheduler(Scheduler):
                 worker_idx: int,
                 worker_launchers: list[ActorHandle],
                 worker_spec: SchedulingSpec,
+                gpu_devices: list[str],
             ) -> RayWorkerInfo:
                 worker_id = f"{role}/{worker_idx}"
                 worker = Worker(
@@ -1615,6 +1700,7 @@ class RayScheduler(Scheduler):
                     launchers=worker_launchers,
                     task_index=worker_idx,
                     spec=worker_spec,
+                    gpu_devices=gpu_devices,
                 )
 
             if nodes_per_worker > 1:
@@ -1643,6 +1729,11 @@ class RayScheduler(Scheduler):
                             worker_idx,
                             [launcher for _, launcher, _ in node_group],
                             worker_spec,
+                            [
+                                gpu_device
+                                for _, _, visible_devices in node_group
+                                for gpu_device in visible_devices
+                            ],
                         )
                     )
 
@@ -1663,7 +1754,9 @@ class RayScheduler(Scheduler):
                             build_worker_spec(worker_idx, gpu_devices, worker_spec)
                         )
                         workers.append(
-                            build_worker_info(worker_idx, [launcher], worker_spec)
+                            build_worker_info(
+                                worker_idx, [launcher], worker_spec, gpu_devices
+                            )
                         )
                     if batch:
                         start_refs.append(launcher.start_workers.remote(batch))
