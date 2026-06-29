@@ -1297,8 +1297,11 @@ class RayScheduler(Scheduler):
         """Fork new worker processes from existing workers.
 
         The forked workers run as child processes of the target Ray workers'
-        guard processes and are colocated one-to-one with target workers.
-        This Ray implementation supports CPU-only forks and TP=1 GPU forks.
+        guard processes. Target workers are split into fixed contiguous groups
+        by target group size:
+        ``target_group_size = len(target_workers) // job.replicas``. CPU-only
+        forks use no visible devices; GPU forks use all devices from the
+        target group.
 
         Parameters
         ----------
@@ -1355,34 +1358,70 @@ class RayScheduler(Scheduler):
             )
         if target_role not in self._workers:
             raise WorkerNotFoundError(f"Target role '{target_role}' not found for fork")
+
         target_workers = self._workers[target_role]
-        if len(target_workers) != num_workers:
+        if len(target_workers) % num_workers != 0:
             raise WorkerCreationError(
                 role,
                 "Unsupported fork layout",
-                "RayScheduler only supports one-to-one fork colocation "
-                f"({len(target_workers)} target workers != {num_workers} fork workers).",
+                "RayScheduler grouped fork requires target replica count to be "
+                "divisible by forked replica count "
+                f"({len(target_workers)} target replicas, "
+                f"{num_workers} forked replicas).",
             )
 
+        target_group_size = len(target_workers) // num_workers
         schedulings = self._prepare_worker_specs(role, num_workers, job.tasks)
         for idx, scheduling in enumerate(schedulings):
-            if scheduling.gpu not in (0, 1):
+            if scheduling.gpu > 0 and scheduling.gpu != target_group_size:
                 raise WorkerCreationError(
                     role,
                     "Unsupported fork layout",
-                    f"RayScheduler only supports CPU-only forks or TP=1 GPU forks; "
-                    f"worker {idx} requested {scheduling.gpu} GPUs.",
+                    "RayScheduler grouped GPU fork requires each forked "
+                    "worker's GPU request to match the target group size "
+                    f"(worker {idx} requested {scheduling.gpu} GPUs, "
+                    f"target group size is {target_group_size}).",
                 )
-            target_spec = target_workers[idx].spec
-            target_gpus = target_spec.gpu if target_spec is not None else None
-            if scheduling.gpu == 1 and target_gpus != 1:
+
+        target_worker_groups = [
+            target_workers[idx * target_group_size : (idx + 1) * target_group_size]
+            for idx in range(num_workers)
+        ]
+
+        for idx, group in enumerate(target_worker_groups):
+            gpu_devices = [
+                gpu_device for worker in group for gpu_device in worker.gpu_devices
+            ]
+            if schedulings[idx].gpu > 0 and len(gpu_devices) != schedulings[idx].gpu:
                 raise WorkerCreationError(
                     role,
                     "Unsupported fork layout",
-                    "RayScheduler only supports TP=1 GPU forks; target worker "
-                    f"{target_role}/{idx} has {target_gpus} GPUs.",
+                    "RayScheduler grouped GPU fork requires the target group "
+                    "visible device count to match the forked worker GPU "
+                    f"request (target group {idx} exposes {len(gpu_devices)} "
+                    f"devices, expected {schedulings[idx].gpu}).",
                 )
-        target_worker_groups = [[target_wi] for target_wi in target_workers]
+            if target_group_size > 1:
+                head_launchers = group[0].launchers
+                if not head_launchers:
+                    raise WorkerCreationError(
+                        role,
+                        "Unsupported fork layout",
+                        "RayScheduler grouped fork requires the head target "
+                        f"worker to have a Ray launcher (target group {idx}).",
+                    )
+                head_launcher = head_launchers[0]
+                if any(
+                    not worker.launchers or worker.launchers[0] is not head_launcher
+                    for worker in group
+                ):
+                    raise WorkerCreationError(
+                        role,
+                        "Unsupported fork layout",
+                        "RayScheduler grouped fork requires all target workers "
+                        f"in a group to share the same Ray launcher "
+                        f"(target group {idx}).",
+                    )
 
         try:
             return run_async_task(
@@ -1575,9 +1614,6 @@ class RayScheduler(Scheduler):
                 role, "Invalid configuration", "replicas must be greater than 0"
             )
 
-        # Prepare scheduling specs
-        schedulings = self._prepare_worker_specs(role, num_workers, job.tasks)
-
         strategy = job.scheduling_strategy
         strategy_type = SchedulingStrategyType(strategy.type)
         colocate_role = strategy.target
@@ -1600,6 +1636,11 @@ class RayScheduler(Scheduler):
                     f"Cannot colocate with role '{colocate_role}' - role not found"
                 )
 
+            # Check if fork mode is enabled
+            if strategy.fork:
+                # Fork mode: spawn new processes on same nodes via /fork endpoint
+                return self.fork_workers(job)
+
             target_workers = self._workers[colocate_role]
             if num_workers != len(target_workers):
                 raise WorkerCreationError(
@@ -1608,11 +1649,6 @@ class RayScheduler(Scheduler):
                     f"Colocated role must have same replica count as target "
                     f"({num_workers} != {len(target_workers)})",
                 )
-
-            # Check if fork mode is enabled
-            if strategy.fork:
-                # Fork mode: spawn new processes on same nodes via /fork endpoint
-                return self.fork_workers(job)
 
             # Reuse existing workers - no new Ray launchers created
             worker_ids = [w.worker.id for w in target_workers]
@@ -1626,6 +1662,10 @@ class RayScheduler(Scheduler):
 
         if strategy_type != SchedulingStrategyType.separation:
             raise ValueError(f"Unknown scheduling strategy type: {strategy_type}")
+
+        # Prepare scheduling specs
+        schedulings = self._prepare_worker_specs(role, num_workers, job.tasks)
+
         # Non-colocated: calculate nodes needed and create new Ray launchers
         spec = schedulings[0]
         total_gpus = spec.gpu * replicas
