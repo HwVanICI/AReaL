@@ -97,13 +97,17 @@ class SessionData:
         session_id: str,
         processor_cache: ProcessorCallCache | None = None,
         processor_cache_group_id: str | None = None,
+        prefix_matcher=None,
     ):
         self.session_id = session_id
         self.processor_cache = processor_cache
         self.processor_cache_group_id = processor_cache_group_id
 
         self._completed = False
-        self._completions = InteractionCache()
+        self._completions = InteractionCache(
+            session_id=session_id,
+            prefix_matcher=prefix_matcher,
+        )
         self._completed_event = threading.Event()
         self._start_time = time.time()
         self._last_access_time = time.time()
