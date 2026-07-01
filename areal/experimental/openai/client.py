@@ -1368,9 +1368,17 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 )
 
             # Tool calls chunks (if any)
+            # Split each tool call into two chunks (name then arguments) to
+            # match standard OpenAI streaming behavior. LiteLLM's Anthropic
+            # streaming adapter treats the first chunk with a function name as
+            # a content_block_start trigger and discards the processed delta
+            # from that same chunk. If name and arguments are combined in a
+            # single chunk, the arguments are lost and Anthropic clients see
+            # input={}.
             if tool_calls:
                 for idx, tool_call in enumerate(tool_calls):
                     tool_call = cast(ChatCompletionMessageFunctionToolCall, tool_call)
+                    # Chunk 1: name + id, with empty arguments.
                     yield ChatCompletionChunk(
                         id=completion_id,
                         choices=[
@@ -1383,6 +1391,30 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                                             type="function",
                                             function=ChoiceDeltaToolCallFunction(
                                                 name=tool_call.function.name,
+                                                arguments="",
+                                            ),
+                                        )
+                                    ]
+                                ),
+                                index=0,
+                                finish_reason=None,
+                            )
+                        ],
+                        created=current_time,
+                        model="None",
+                        object="chat.completion.chunk",
+                    )
+                    # Chunk 2: arguments only, emitted as input_json_delta by
+                    # Anthropic adapters after the tool_use block has started.
+                    yield ChatCompletionChunk(
+                        id=completion_id,
+                        choices=[
+                            ChunkChoice(
+                                delta=ChoiceDelta(
+                                    tool_calls=[
+                                        ChoiceDeltaToolCall(
+                                            index=idx,
+                                            function=ChoiceDeltaToolCallFunction(
                                                 arguments=tool_call.function.arguments,
                                             ),
                                         )
