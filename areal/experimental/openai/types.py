@@ -41,6 +41,7 @@ class InteractionWithTokenLogpReward:
     reward: float | None = None
     parent: InteractionWithTokenLogpReward | None = None
     chat_template_type: str = "hf"
+    trajectory_metadata: dict[str, str] = field(default_factory=dict)
     _cache: dict[str, torch.Tensor] | None = None
 
     # Fields used for parent-child relationship resolving
@@ -229,3 +230,31 @@ def concat_string_interactions(
             for v in interactions.values()
         ]
     }
+
+
+def interactions_to_trajectory(
+    interactions: dict[str, InteractionWithTokenLogpReward],
+) -> dict:
+    """Convert proxy interactions to the trajectory format used by trainers."""
+    if all(interaction.has_tensor_data for interaction in interactions.values()):
+        from areal.utils.data import concat_padded_tensors
+
+        trajectory = concat_padded_tensors(
+            [interaction.to_tensor_dict() for interaction in interactions.values()]
+        )
+    else:
+        trajectory = concat_string_interactions(interactions)
+
+    if interactions:
+        interaction_values = list(interactions.values())
+        common_keys = set(interaction_values[0].trajectory_metadata)
+        for interaction in interaction_values[1:]:
+            common_keys.intersection_update(interaction.trajectory_metadata)
+        for key in common_keys:
+            value = interaction_values[0].trajectory_metadata[key]
+            if all(
+                interaction.trajectory_metadata[key] == value
+                for interaction in interaction_values[1:]
+            ):
+                trajectory.setdefault(key, value)
+    return trajectory

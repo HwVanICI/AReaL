@@ -4,12 +4,18 @@ __all__ = [
     "RLVRWorkflow",
     "MultiTurnWorkflow",
     "VisionRLVRWorkflow",
+    "DomainRouterWorkflow",
+    "DomainRouterRolloutWorkflow",
+    "DomainWorkflowSpec",
 ]
 
 _LAZY_IMPORTS = {
     "RLVRWorkflow": "areal.workflow.rlvr",
     "MultiTurnWorkflow": "areal.workflow.multi_turn",
     "VisionRLVRWorkflow": "areal.workflow.vision_rlvr",
+    "DomainRouterWorkflow": "areal.workflow.domain_router",
+    "DomainRouterRolloutWorkflow": "areal.workflow.domain_router",
+    "DomainWorkflowSpec": "areal.workflow.domain_router",
 }
 
 

@@ -486,12 +486,36 @@ def grpo_loss_fn(
         # Coefficients for RL and Knowledge Distillation
         rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
         distill_loss_weight = input_data.get("distill_loss_weight", 0.005)
+        distill_loss_type = input_data.get("distill_loss_type", "reverse_kl")
+        mopd_adv_clip = input_data.get("mopd_adv_clip", 5.0)
 
         teacher_logp = (
             teacher_logp.detach()
         )  # detach to prevent gradient backprop to teacher
 
-        if rl_loss_weight == 0:
+        if distill_loss_type == "mopd_pg":
+            behavior_importance_weight = stat.get("behave_imp_weight")
+            mopd_loss, mopd_stat = mopd_pg_loss_fn(
+                logprobs=logprobs,
+                old_logprobs=old_logp,
+                teacher_logprobs=teacher_logp,
+                loss_mask=loss_mask,
+                adv_clip=mopd_adv_clip,
+                proximal_logprobs=(
+                    prox_logp if behavior_importance_weight is not None else None
+                ),
+                behavior_importance_weight=behavior_importance_weight,
+            )
+            loss = rl_loss_weight * loss + distill_loss_weight * mopd_loss
+            stat.update(
+                mopd_loss=mopd_stat["loss"],
+                mopd_advantage=mopd_stat["advantage"],
+                mopd_raw_advantage=mopd_stat["raw_advantage"],
+                mopd_adv_clip_mask=mopd_stat["adv_clip_mask"],
+                mopd_importance_weight=mopd_stat["importance_weight"],
+                mopd_approx_kl=mopd_stat["approx_kl"],
+            )
+        elif distill_loss_type == "reverse_kl" and rl_loss_weight == 0:
             # Pure KD using reverse KL (importance-sampling)
             rkl_reward = teacher_logp - logprobs.detach()
             importance_weight = torch.exp(logprobs - old_logp)
@@ -502,7 +526,7 @@ def grpo_loss_fn(
             loss = kd_coef * rkl_weighted_term.sum() / loss_mask.sum().clamp(min=1)
 
             rkl_stat = -1 * rkl_weighted_term
-        else:
+        elif distill_loss_type == "reverse_kl":
             # KDRL: Knowledge Distillation + Reinforcement Learning (joint loss)
             rkl_penalty_per_token = (logprobs - teacher_logp) * loss_mask
             rkl_penalty = rkl_penalty_per_token.sum() / loss_mask.sum().clamp(min=1)
@@ -510,6 +534,11 @@ def grpo_loss_fn(
             loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
 
             rkl_stat = rkl_penalty_per_token
+        else:
+            raise ValueError(
+                "distill_loss_type must be 'reverse_kl' or 'mopd_pg', "
+                f"got {distill_loss_type!r}."
+            )
 
     # Log training statistics
     stats_tracker.denominator(
@@ -523,6 +552,22 @@ def grpo_loss_fn(
         stats_tracker.stat(
             rkl_loss=rkl_stat,
             denominator="n_valid_tokens",
+        )
+    if "mopd_advantage" in stat:
+        stats_tracker.denominator(
+            mopd_adv_clipped_tokens=stat["mopd_adv_clip_mask"],
+        )
+        stats_tracker.stat(
+            mopd_loss=stat["mopd_loss"],
+            mopd_advantage=stat["mopd_advantage"],
+            mopd_raw_advantage=stat["mopd_raw_advantage"],
+            mopd_importance_weight=stat["mopd_importance_weight"],
+            mopd_approx_kl=stat["mopd_approx_kl"],
+            denominator="n_valid_tokens",
+        )
+        stats_tracker.stat(
+            mopd_clipped_advantage=stat["mopd_advantage"],
+            denominator="mopd_adv_clipped_tokens",
         )
 
     stats_tracker.stat(
@@ -594,6 +639,57 @@ def grpo_loss_fn(
         )
 
     return loss
+
+
+def mopd_pg_loss_fn(
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    adv_clip: float,
+    proximal_logprobs: torch.Tensor | None = None,
+    behavior_importance_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """MOPD policy-gradient loss adapted to off-policy rollouts.
+
+    The stopped-gradient advantage measures the teacher's log-probability gap
+    from the current student policy. The rollout policy is used only for the
+    per-token importance correction. When PPO rejection sampling is active,
+    ``behavior_importance_weight`` is its filtered or clamped
+    ``pi_proximal / pi_behavior`` correction. Multiplying it by the differentiable
+    ``pi_current / pi_proximal`` ratio applies the same rejection decision to MOPD
+    while preserving gradients through the current policy.
+    """
+    old_logprobs = old_logprobs.detach()
+    teacher_logprobs = teacher_logprobs.detach()
+    if (proximal_logprobs is None) != (behavior_importance_weight is None):
+        raise ValueError(
+            "proximal_logprobs and behavior_importance_weight must be provided together"
+        )
+
+    raw_advantage = teacher_logprobs - logprobs.detach()
+    advantage = raw_advantage.clamp(min=-adv_clip, max=adv_clip)
+    log_ratio = logprobs - old_logprobs
+    if behavior_importance_weight is None:
+        importance_weight = torch.exp(log_ratio)
+    else:
+        current_to_proximal = torch.exp(logprobs - proximal_logprobs.detach())
+        importance_weight = current_to_proximal * behavior_importance_weight.detach()
+    pg_loss = -importance_weight * advantage
+
+    mask = loss_mask.to(pg_loss.dtype)
+    loss = (pg_loss * mask).sum() / mask.sum().clamp_min(1)
+    effective_mask = loss_mask.bool().logical_and(importance_weight.detach() > 0)
+
+    stat = dict(
+        loss=pg_loss.detach(),
+        advantage=advantage.detach(),
+        raw_advantage=raw_advantage.detach(),
+        importance_weight=importance_weight.detach(),
+        approx_kl=log_ratio.detach(),
+        adv_clip_mask=(raw_advantage.abs() > adv_clip).logical_and(effective_mask),
+    )
+    return loss, stat
 
 
 # =============================================================================

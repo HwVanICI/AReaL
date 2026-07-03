@@ -10,7 +10,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from logging import Logger
 from threading import Lock
@@ -182,7 +182,7 @@ class RemoteInfBackendProtocol(Protocol):
     def parse_score_response(
         self, response: dict[str, Any], target_len: int
     ) -> list[float]:
-        """Parse token log-prob scoring response."""
+        """Parse token-aligned scores for the final ``target_len`` input tokens."""
         ...
 
     def build_disk_weight_update_requests(
@@ -538,52 +538,135 @@ class RemoteInfEngine(InferenceEngine):
             return self._version
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        """Score masked tokens and return prediction-position-aligned log-probs.
+
+        Remote backends return token-aligned prompt scores. This method maps each
+        selected token at position ``t`` to its causal prediction position ``t - 1``
+        to satisfy :meth:`InferenceEngine.compute_logp`.
+        """
         results: list[torch.Tensor] = []
+        score_jobs: list[
+            tuple[int, int, list[int], int, list[int], list[int], str]
+        ] = []
         timeout = self.config.request_timeout
         version = self.get_version()
-        for traj in data:
+        for traj_idx, traj in enumerate(data):
             input_ids = traj["input_ids"]
             loss_mask = traj["loss_mask"]
             if input_ids.dim() != 2 or loss_mask.dim() != 2:
                 raise ValueError("input_ids and loss_mask must be 2D tensors")
             bs = input_ids.shape[0]
             out = torch.zeros_like(loss_mask, dtype=torch.float32)
+            results.append(out)
             for i in range(bs):
-                token_ids = input_ids[i].tolist()
-                target_len = int(loss_mask[i].sum().item())
-                if target_len <= 0:
+                target_raw_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
+                if target_raw_idx.numel() == 0:
                     continue
                 if "attention_mask" in traj:
                     attn_mask = traj["attention_mask"][i]
                     active_idx = torch.nonzero(attn_mask, as_tuple=False).squeeze(-1)
-                    token_ids = input_ids[i, active_idx].tolist()
                 else:
-                    token_ids = input_ids[i].tolist()
-                server_addr = self.choose_server()
-                http_req = self.backend.build_score_request(
-                    input_ids=token_ids,
-                    target_len=target_len,
-                    with_lora=self.config.use_lora,
-                    version=version,
-                )
-                response = requests.request(
-                    http_req.method,
-                    f"http://{server_addr}{http_req.endpoint}",
-                    json=http_req.payload,
-                    timeout=timeout,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                token_logps = self.backend.parse_score_response(payload, target_len)
-                if len(token_logps) != target_len:
-                    raise ValueError(
-                        f"Expected {target_len} token logprobs, got {len(token_logps)}"
+                    active_idx = torch.arange(
+                        input_ids.shape[1], device=input_ids.device
                     )
-                write_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
-                out[i, write_idx] = torch.tensor(
-                    token_logps, device=out.device, dtype=out.dtype
+
+                active_position = torch.full(
+                    (input_ids.shape[1],),
+                    -1,
+                    dtype=torch.long,
+                    device=input_ids.device,
                 )
-            results.append(out)
+                active_position[active_idx] = torch.arange(
+                    active_idx.numel(), device=input_ids.device
+                )
+                target_active_idx = active_position[target_raw_idx]
+                if torch.any(target_active_idx < 0):
+                    raise ValueError(
+                        "loss_mask can only select tokens included by attention_mask"
+                    )
+                if torch.any(target_active_idx == 0):
+                    raise ValueError(
+                        "loss_mask cannot select the first active token when computing "
+                        "causal teacher log-probabilities"
+                    )
+
+                first_target = int(target_active_idx.min().item())
+                last_target = int(target_active_idx.max().item())
+                score_len = last_target - first_target + 1
+                token_ids = input_ids[i, active_idx[: last_target + 1]].tolist()
+                target_offsets = (target_active_idx - first_target).tolist()
+                prediction_idx = (target_raw_idx - 1).tolist()
+                score_jobs.append(
+                    (
+                        traj_idx,
+                        i,
+                        token_ids,
+                        score_len,
+                        target_offsets,
+                        prediction_idx,
+                        self.choose_server(),
+                    )
+                )
+
+        def score_sequence(
+            job: tuple[int, int, list[int], int, list[int], list[int], str],
+        ) -> tuple[int, int, list[float], list[int]]:
+            (
+                traj_idx,
+                row_idx,
+                token_ids,
+                score_len,
+                target_offsets,
+                prediction_idx,
+                server_addr,
+            ) = job
+            http_req = self.backend.build_score_request(
+                input_ids=token_ids,
+                target_len=score_len,
+                with_lora=self.config.use_lora,
+                version=version,
+            )
+            response = requests.request(
+                http_req.method,
+                f"http://{server_addr}{http_req.endpoint}",
+                json=http_req.payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            span_logps = self.backend.parse_score_response(payload, score_len)
+            if len(span_logps) != score_len:
+                raise ValueError(
+                    f"Expected {score_len} token logprobs, got {len(span_logps)}"
+                )
+            token_logps = [span_logps[offset] for offset in target_offsets]
+            return traj_idx, row_idx, token_logps, prediction_idx
+
+        if not score_jobs:
+            return results
+
+        max_workers = self.config.max_concurrent_rollouts
+        if max_workers is None:
+            max_workers = self.config.consumer_batch_size
+        max_workers = max(1, min(max_workers, len(score_jobs)))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            scored_sequences = executor.map(score_sequence, score_jobs)
+            for (
+                traj_idx,
+                row_idx,
+                token_logps,
+                prediction_idx,
+            ) in scored_sequences:
+                # Remote backends return token-centric log-probabilities: the value
+                # for input_ids[..., i] belongs to the model prediction at i - 1.
+                # Train-engine compute_logp already follows this prediction-position
+                # convention because it gathers against labels rolled by one.
+                results[traj_idx][row_idx, prediction_idx] = torch.tensor(
+                    token_logps,
+                    device=results[traj_idx].device,
+                    dtype=results[traj_idx].dtype,
+                )
         return results
 
     def set_proxy_gateway_addr(self, addr: str) -> None:
@@ -631,6 +714,24 @@ class RemoteInfEngine(InferenceEngine):
     ) -> RolloutWorkflow:
         resolved: RolloutWorkflow
 
+        def instantiate_rollout_workflow(
+            workflow_cls: type[RolloutWorkflow],
+            kwargs: dict[str, Any],
+        ) -> RolloutWorkflow:
+            resolver_factory = getattr(workflow_cls, "_from_workflow_resolver", None)
+            if callable(resolver_factory):
+                return resolver_factory(
+                    workflow_resolver=lambda child, child_kwargs: (
+                        self._resolve_workflow(
+                            child,
+                            child_kwargs,
+                            proxy_addr=proxy_addr,
+                        )
+                    ),
+                    **kwargs,
+                )
+            return workflow_cls(**kwargs)
+
         # 0. None workflow = online mode (config-driven)
         if workflow is None:
             agent_cfg = self.config.agent
@@ -661,7 +762,7 @@ class RemoteInfEngine(InferenceEngine):
                     f"workflow_kwargs is required when workflow is a class. "
                     f"Got workflow={workflow}, but workflow_kwargs=None."
                 )
-            resolved = workflow(**workflow_kwargs)
+            resolved = instantiate_rollout_workflow(workflow, workflow_kwargs)
 
         # 3. String import path
         elif isinstance(workflow, str):
@@ -681,7 +782,7 @@ class RemoteInfEngine(InferenceEngine):
                         f"workflow_kwargs is required when workflow is a class or string. "
                         f"Got workflow={workflow}, but workflow_kwargs=None."
                     )
-                resolved = imported_obj(**workflow_kwargs)
+                resolved = instantiate_rollout_workflow(imported_obj, workflow_kwargs)
 
             # Check if it's a RolloutWorkflow instance
             elif isinstance(imported_obj, RolloutWorkflow):

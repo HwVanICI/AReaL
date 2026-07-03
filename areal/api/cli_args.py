@@ -2856,6 +2856,50 @@ class SchedulerConfig:
 
 
 @dataclass
+class DatasetSourceConfig:
+    """One source within a multi-dataset training or validation set."""
+
+    name: str = field(
+        default=MISSING,
+        metadata={"help": "Dataset source name used for provenance and metrics."},
+    )
+    domain: str = field(
+        default=MISSING,
+        metadata={
+            "help": "Semantic routing key for workflows and future domain teachers."
+        },
+    )
+    path: str = field(
+        default=MISSING,
+        metadata={
+            "help": "Path to the dataset. Can be a local path or a HuggingFace "
+            "dataset name."
+        },
+    )
+    type: str = field(
+        default=MISSING,
+        metadata={"help": "Type of training method, e.g., 'sft', 'rl', etc."},
+    )
+    split: str | None = field(
+        default=None,
+        metadata={
+            "help": "Dataset split to use. Defaults to the parent dataset split."
+        },
+    )
+    max_length: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum token length for this source. Defaults to the "
+            "parent max_length."
+        },
+    )
+    dataset_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"help": "Additional keyword arguments for this dataset source."},
+    )
+
+
+@dataclass
 class _DatasetConfig:
     """Configuration for dataset loading and preprocessing."""
 
@@ -2863,15 +2907,30 @@ class _DatasetConfig:
         default="train",
         metadata={"help": "Dataset split to use, e.g., 'train', 'test'."},
     )
-    path: str = field(
-        default=MISSING,
+    path: str | None = field(
+        default=None,
         metadata={
-            "help": "Path to the dataset. Can be a local path or a HuggingFace dataset name."
+            "help": "Path to the dataset. Can be a local path or a HuggingFace "
+            "dataset name."
         },
     )
-    type: str = field(
-        default=MISSING,
+    type: str | None = field(
+        default=None,
         metadata={"help": "Type of training method, e.g., 'sft', 'rl', etc."},
+    )
+    datasets: list[DatasetSourceConfig] = field(
+        default_factory=list,
+        metadata={
+            "help": "Optional list of dataset sources. Each source is tagged with "
+            "domain and dataset_name, then concatenated into one dataset."
+        },
+    )
+    upsample_to_largest: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to upsample smaller sources in a mixed dataset to "
+            "the size of the largest source."
+        },
     )
     batch_size: int = field(
         default=1, metadata={"help": "Batch size for the dataloader"}
@@ -3113,6 +3172,13 @@ class DPOConfig(BaseExperimentConfig):
 
 @dataclass
 class TeacherConfig:
+    domain: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional task domain handled by this teacher. Required when "
+            "teacher.routing_mode='domain'."
+        },
+    )
     engine_type: str = field(
         default="rollout",
         metadata={
@@ -3122,6 +3188,20 @@ class TeacherConfig:
         },
     )
     rollout: InferenceEngineConfig | None = field(default=None)
+    vllm: vLLMConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Optional vLLM runtime override for this teacher. Defaults "
+            "to the top-level vllm config."
+        },
+    )
+    sglang: SGLangConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Optional SGLang runtime override for this teacher. Defaults "
+            "to the top-level sglang config."
+        },
+    )
     train: PPOActorConfig | None = field(
         default=None,
         metadata={
@@ -3157,6 +3237,19 @@ class TeacherConfig:
                 "teacher.rollout must be provided when engine_type='rollout'."
             )
 
+        if self.engine_type == "rollout" and self.rollout is not None:
+            backend = self.rollout.backend.split(":", maxsplit=1)[0]
+            if self.vllm is not None and backend != "vllm":
+                raise ValueError(
+                    "teacher.vllm can only be set when teacher.rollout.backend "
+                    "uses vllm."
+                )
+            if self.sglang is not None and backend != "sglang":
+                raise ValueError(
+                    "teacher.sglang can only be set when teacher.rollout.backend "
+                    "uses sglang."
+                )
+
         if self.engine_type == "train" and self.train is None:
             raise ValueError("teacher.train must be provided when engine_type='train'.")
 
@@ -3164,6 +3257,20 @@ class TeacherConfig:
 @dataclass
 class DistillationConfig:
     teachers: list[TeacherConfig] = field(default_factory=list)
+    routing_mode: str = field(
+        default="mixture",
+        metadata={
+            "help": "How to choose teachers for a trajectory. 'mixture' sends "
+            "every trajectory to every teacher and mixes log-probs by weight. "
+            "'domain' sends each trajectory only to the teacher whose domain "
+            "matches the trajectory domain.",
+            "choices": ["mixture", "domain"],
+        },
+    )
+    domain_key: str = field(
+        default="domain",
+        metadata={"help": "Trajectory metadata key used when routing_mode='domain'."},
+    )
     rl_loss_weight: float = field(
         default=1.0,
         metadata={"help": "RL loss weight."},
@@ -3172,10 +3279,46 @@ class DistillationConfig:
         default=5e-3,
         metadata={"help": "Distillation loss weight."},
     )
+    distill_loss_type: str = field(
+        default="reverse_kl",
+        metadata={
+            "help": (
+                "Distillation loss. 'reverse_kl' keeps the existing reverse-KL "
+                "penalty; 'mopd_pg' uses the policy-gradient MOPD loss with "
+                "clipped teacher-student log-probability advantage."
+            ),
+            "choices": ["reverse_kl", "mopd_pg"],
+        },
+    )
+    mopd_adv_clip: float = field(
+        default=5.0,
+        metadata={
+            "help": (
+                "Symmetric clipping bound for MOPD policy-gradient advantages. "
+                "Only used when distill_loss_type='mopd_pg'."
+            )
+        },
+    )
 
     def __post_init__(self):
         if len(self.teachers) == 0:
             raise ValueError("At least one teacher must be provided.")
+
+        if self.distill_loss_type not in ("reverse_kl", "mopd_pg"):
+            raise ValueError(
+                "teacher.distill_loss_type must be 'reverse_kl' or 'mopd_pg', "
+                f"got {self.distill_loss_type!r}."
+            )
+        if self.mopd_adv_clip <= 0:
+            raise ValueError(
+                f"teacher.mopd_adv_clip must be positive, got {self.mopd_adv_clip}."
+            )
+
+        if self.routing_mode not in ("mixture", "domain"):
+            raise ValueError(
+                "teacher.routing_mode must be 'mixture' or 'domain', "
+                f"got {self.routing_mode!r}."
+            )
 
         engine_types = {t.engine_type for t in self.teachers}
         if len(engine_types) != 1:
@@ -3189,6 +3332,17 @@ class DistillationConfig:
         total_w = sum(t.weight for t in self.teachers)
         if total_w <= 0:
             raise ValueError("Sum of teacher weights must be positive.")
+
+        if self.routing_mode == "domain":
+            domains = [t.domain for t in self.teachers]
+            if any(domain is None or domain == "" for domain in domains):
+                raise ValueError(
+                    "All teachers must set domain when teacher.routing_mode='domain'."
+                )
+            if len(set(domains)) != len(domains):
+                raise ValueError(
+                    "Teacher domains must be unique when teacher.routing_mode='domain'."
+                )
 
 
 @dataclass
