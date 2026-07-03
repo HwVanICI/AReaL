@@ -720,6 +720,10 @@ class PPOTrainer:
                         traj["distill_loss_weight"] = (
                             self.config.teacher.distill_loss_weight
                         )
+                        traj["distill_loss_type"] = (
+                            self.config.teacher.distill_loss_type
+                        )
+                        traj["mopd_adv_clip"] = self.config.teacher.mopd_adv_clip
                 if self._should_offload_teacher:
                     self._offload_model(self.teacher, role="teacher")
 

@@ -486,12 +486,31 @@ def grpo_loss_fn(
         # Coefficients for RL and Knowledge Distillation
         rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
         distill_loss_weight = input_data.get("distill_loss_weight", 0.005)
+        distill_loss_type = input_data.get("distill_loss_type", "reverse_kl")
+        mopd_adv_clip = input_data.get("mopd_adv_clip", 5.0)
 
         teacher_logp = (
             teacher_logp.detach()
         )  # detach to prevent gradient backprop to teacher
 
-        if rl_loss_weight == 0:
+        if distill_loss_type == "mopd_pg":
+            mopd_loss, mopd_stat = mopd_pg_loss_fn(
+                logprobs=logprobs,
+                student_logprobs=old_logp,
+                teacher_logprobs=teacher_logp,
+                loss_mask=loss_mask,
+                adv_clip=mopd_adv_clip,
+            )
+            loss = rl_loss_weight * loss + distill_loss_weight * mopd_loss
+            stat.update(
+                mopd_loss=mopd_stat["loss"],
+                mopd_advantage=mopd_stat["advantage"],
+                mopd_raw_advantage=mopd_stat["raw_advantage"],
+                mopd_adv_clip_mask=mopd_stat["adv_clip_mask"],
+                mopd_importance_weight=mopd_stat["importance_weight"],
+                mopd_approx_kl=mopd_stat["approx_kl"],
+            )
+        elif distill_loss_type == "reverse_kl" and rl_loss_weight == 0:
             # Pure KD using reverse KL (importance-sampling)
             rkl_reward = teacher_logp - logprobs.detach()
             importance_weight = torch.exp(logprobs - old_logp)
@@ -502,7 +521,7 @@ def grpo_loss_fn(
             loss = kd_coef * rkl_weighted_term.sum() / loss_mask.sum().clamp(min=1)
 
             rkl_stat = -1 * rkl_weighted_term
-        else:
+        elif distill_loss_type == "reverse_kl":
             # KDRL: Knowledge Distillation + Reinforcement Learning (joint loss)
             rkl_penalty_per_token = (logprobs - teacher_logp) * loss_mask
             rkl_penalty = rkl_penalty_per_token.sum() / loss_mask.sum().clamp(min=1)
@@ -510,6 +529,11 @@ def grpo_loss_fn(
             loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
 
             rkl_stat = rkl_penalty_per_token
+        else:
+            raise ValueError(
+                "distill_loss_type must be 'reverse_kl' or 'mopd_pg', "
+                f"got {distill_loss_type!r}."
+            )
 
     # Log training statistics
     stats_tracker.denominator(
@@ -523,6 +547,22 @@ def grpo_loss_fn(
         stats_tracker.stat(
             rkl_loss=rkl_stat,
             denominator="n_valid_tokens",
+        )
+    if "mopd_advantage" in stat:
+        stats_tracker.denominator(
+            mopd_adv_clipped_tokens=stat["mopd_adv_clip_mask"],
+        )
+        stats_tracker.stat(
+            mopd_loss=stat["mopd_loss"],
+            mopd_advantage=stat["mopd_advantage"],
+            mopd_raw_advantage=stat["mopd_raw_advantage"],
+            mopd_importance_weight=stat["mopd_importance_weight"],
+            mopd_approx_kl=stat["mopd_approx_kl"],
+            denominator="n_valid_tokens",
+        )
+        stats_tracker.stat(
+            mopd_clipped_advantage=stat["mopd_advantage"],
+            denominator="mopd_adv_clipped_tokens",
         )
 
     stats_tracker.stat(
@@ -594,6 +634,37 @@ def grpo_loss_fn(
         )
 
     return loss
+
+
+def mopd_pg_loss_fn(
+    logprobs: torch.Tensor,
+    student_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    adv_clip: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """MOPD policy-gradient distillation loss.
+
+    Implements the MOPD objective with the teacher-student log-probability
+    difference as a per-token advantage and two-sided advantage clipping.
+    """
+    loss_mask_count = loss_mask.count_nonzero() or 1
+    raw_advantage = teacher_logprobs.detach() - student_logprobs.detach()
+    advantage = raw_advantage.clamp(min=-adv_clip, max=adv_clip)
+    importance_weight = torch.exp(logprobs - student_logprobs.detach())
+    pg_loss = -importance_weight * advantage
+    logging_loss = pg_loss.detach()
+    loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+
+    stat = dict(
+        loss=logging_loss,
+        advantage=advantage.detach(),
+        raw_advantage=raw_advantage.detach(),
+        importance_weight=importance_weight.detach(),
+        approx_kl=(logprobs - student_logprobs.detach()).detach(),
+        adv_clip_mask=(raw_advantage.detach().abs() > adv_clip).logical_and(loss_mask),
+    )
+    return loss, stat
 
 
 # =============================================================================
