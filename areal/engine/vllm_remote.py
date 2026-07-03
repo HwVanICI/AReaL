@@ -35,6 +35,7 @@ from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.utils.network import format_host_for_url
+from areal.utils.offload import sanitize_tms_env_vars
 
 logger = logging.getLogger("vLLMEngine")
 
@@ -44,7 +45,7 @@ class VLLMBackend:
 
     @staticmethod
     def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
-        _env = dict(env)
+        _env = sanitize_tms_env_vars(env)
         triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
         _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
 
