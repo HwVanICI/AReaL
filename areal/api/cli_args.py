@@ -2856,6 +2856,50 @@ class SchedulerConfig:
 
 
 @dataclass
+class DatasetSourceConfig:
+    """One source within a multi-dataset training or validation set."""
+
+    name: str = field(
+        default=MISSING,
+        metadata={"help": "Dataset source name used for provenance and metrics."},
+    )
+    domain: str = field(
+        default=MISSING,
+        metadata={
+            "help": "Semantic routing key for workflows and future domain teachers."
+        },
+    )
+    path: str = field(
+        default=MISSING,
+        metadata={
+            "help": "Path to the dataset. Can be a local path or a HuggingFace "
+            "dataset name."
+        },
+    )
+    type: str = field(
+        default=MISSING,
+        metadata={"help": "Type of training method, e.g., 'sft', 'rl', etc."},
+    )
+    split: str | None = field(
+        default=None,
+        metadata={
+            "help": "Dataset split to use. Defaults to the parent dataset split."
+        },
+    )
+    max_length: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum token length for this source. Defaults to the "
+            "parent max_length."
+        },
+    )
+    dataset_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"help": "Additional keyword arguments for this dataset source."},
+    )
+
+
+@dataclass
 class _DatasetConfig:
     """Configuration for dataset loading and preprocessing."""
 
@@ -2863,15 +2907,23 @@ class _DatasetConfig:
         default="train",
         metadata={"help": "Dataset split to use, e.g., 'train', 'test'."},
     )
-    path: str = field(
-        default=MISSING,
+    path: str | None = field(
+        default=None,
         metadata={
-            "help": "Path to the dataset. Can be a local path or a HuggingFace dataset name."
+            "help": "Path to the dataset. Can be a local path or a HuggingFace "
+            "dataset name."
         },
     )
-    type: str = field(
-        default=MISSING,
+    type: str | None = field(
+        default=None,
         metadata={"help": "Type of training method, e.g., 'sft', 'rl', etc."},
+    )
+    datasets: list[DatasetSourceConfig] = field(
+        default_factory=list,
+        metadata={
+            "help": "Optional list of dataset sources. Each source is tagged with "
+            "domain and dataset_name, then concatenated into one dataset."
+        },
     )
     batch_size: int = field(
         default=1, metadata={"help": "Batch size for the dataloader"}
