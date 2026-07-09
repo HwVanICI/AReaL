@@ -924,14 +924,6 @@ class MegatronEngineConfig:
 
     # FP8 Training Configuration
     fp8_config: FP8EngineConfig | None = None
-    num_layers_in_first_pipeline_stage: int | None = field(
-        default=None, metadata={"help": "Number of layers in the first pipeline stage"}
-    )
-    num_layers_in_last_pipeline_stage: int | None = field(
-        default=None, metadata={"help": "Number of layers in the last pipeline stage"}
-    )
-    account_for_embedding_in_pipeline_split: bool = field(default=False)
-    account_for_loss_in_pipeline_split: bool = field(default=False)
 
     # Bridge backend used for HF<->Megatron conversion/model creation.
     bridge_type: str = field(
@@ -976,70 +968,6 @@ class MegatronEngineConfig:
             "(bridge_type=megatron-bridge only). Default False drops it.",
         },
     )
-
-    freeze_vision_model: bool = field(
-        default=False,
-        metadata={"help": "Freeze the vision portion of a VL model (vision encoder)"},
-    )
-
-    freeze_vision_projection: bool = field(
-        default=False, metadata={"help": "Freeze the vision projection layer"}
-    )
-
-
-@dataclass
-class MindSpeedEngineConfig:
-    """Additional config options for MindSpeed's Megatron adapter
-    Any Megatron-specific settings will be taken from the MegatronEngineConfig
-    Any MindSpeed-exclusive features will be supported here
-    Other MindSpeed parameters can be added below
-    """
-
-    # should always be true in mindspeed
-    use_flash_attn: bool = True
-    context_parallel_algo: str = field(
-        default="megatron_cp_algo",
-        metadata={
-            "help": "Context parallel algorithm used by MindSpeed. "
-            "Options: 'megatron_cp_algo', 'hybrid_cp_algo', 'ulysses_cp_algo"
-        },
-    )
-    sequence_parallel: bool = False
-    use_legacy_models: bool = False
-
-    swap_optimizer: bool = False
-    use_fused_rotary_pos_emb: bool = False
-    use_fused_swiglu: bool = False
-    use_cp_send_recv_overlap: bool = False
-    use_fused_ring_attention_update: bool = False
-    cp_window_size: int = 1
-    moe_alltoall_overlap_comm: bool = False
-    moe_grouped_gemm: bool = True
-    moe_zero_memory: str = field(
-        default="disable",
-        metadata={
-            "help": "MoE zero memory level. Defines how much recomputation occurs in "
-            "experts when using communications overlaps. "
-            "Requires moe_alltoall_overlap_comm. Options: 'disable', 'level0', 'level1'."
-        },
-    )
-    moe_permute_fusion: bool = False
-    gemm_gradient_accumulation_fusion: bool = False
-    position_embedding_type: str = field(
-        default="rope",
-        metadata={"help": "Position embedding type. Options: 'rope', 'alibi'"},
-    )
-    moe_aux_loss_coeff: float = field(default=0.0)
-    moe_router_load_balancing_type: str = field(default="aux_loss")
-    moe_token_dispatcher_type: str = field(
-        default="allgather",
-        metadata={
-            "help": "Type of token dispatcher. Options: 'allgather','alltoall' and 'flex'."
-        },
-    )
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 class SchedulingStrategyType(str, Enum):
@@ -1135,6 +1063,25 @@ class SchedulingSpec:
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
     )
+    ray_placement_strategy: str = field(
+        default="shared",
+        metadata={
+            "help": "Which placement strategy to use for Ray scheduling. "
+            "Shared will produce 1 placement group for all workers in the role (training). "
+            "Separate will 1 placement group per worker (rollout). "
+            "Deferred will do the same as separate but defers accelerator scheduling (multinode rollout). ",
+            "choices": ["shared", "separate", "deferred"],
+        },
+    )
+
+    def __post_init__(self):
+        """Validate scheduling spec configuration."""
+        valid_strategies = {"shared", "separate", "deferred"}
+        if self.ray_placement_strategy not in valid_strategies:
+            raise ValueError(
+                f"ray_placement_strategy must be one of {valid_strategies}, "
+                f"got '{self.ray_placement_strategy}'"
+            )
 
 
 @dataclass
@@ -1220,15 +1167,11 @@ class TrainEngineConfig:
 
     weight_update_mode: str = field(
         default="xccl",
-        metadata={
-            "help": "Weight update backend type.",
-            "choices": ["disk", "xccl", "awex"],
-        },
+        metadata={"help": "Weight update backend type.", "choices": ["disk", "xccl"]},
     )
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     archon: ArchonEngineConfig = field(default_factory=ArchonEngineConfig)
     megatron: MegatronEngineConfig = field(default_factory=MegatronEngineConfig)
-    mindspeed: MindSpeedEngineConfig = field(default_factory=MindSpeedEngineConfig)
 
     # offload
     offload: bool = field(
@@ -1753,10 +1696,6 @@ class PPOCriticConfig(TrainEngineConfig):
 def get_py_cmd(module: str, args: dict[str, Any]):
     # convert to flags
     cmd = ["python3", "-m", module]
-    return process_args(cmd, args)
-
-
-def process_args(cmd, args):
     for k, v in args.items():
         if v is None or v is False or v == "" or (isinstance(v, list) and not v):
             continue
@@ -1784,9 +1723,7 @@ class vLLMConfig:
     enforce_eager: bool = False
     dtype: str = "bfloat16"
     distributed_executor_backend: str = "mp"
-    load_format: str = "auto"
     # original
-    max_num_batched_tokens: int = 2048
     max_num_seqs: int = 256
     # kv_cache_type: str = "auto"
     block_size: int = 16
@@ -1828,23 +1765,6 @@ class vLLMConfig:
     max_lora_rank: int = 16  # vllm's default
     max_loras: int = 8  # override default
     lora_modules: list[str] | None = None  # lora_modules is automatically filled
-    data_parallel_size: int = 1
-    # will use explicit vllm config tp and pp if specified otherwise use allocmode
-    tensor_parallel_size: int | None = None
-    pipeline_parallel_size: int | None = None
-    enable_expert_parallel: bool = False
-    compilation_config: dict | None = None
-    additional_config: dict | None = None
-    no_async_scheduling: bool = False
-
-    def __post_init__(self):
-        # convert vLLM config dictionaries to a string since we don't need to read
-        # these values and just pass directly to vLLM
-        if self.compilation_config:
-            self.compilation_config = json.dumps(self.compilation_config)
-
-        if self.additional_config:
-            self.additional_config = json.dumps(self.additional_config)
 
     @staticmethod
     def build_args(
@@ -1861,16 +1781,12 @@ class vLLMConfig:
         args = dict(
             # Model and tokenizer
             tokenizer=vllm_config.model,
+            load_format="auto",
             trust_remote_code=True,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
             **args,
         )
-
-        # only add the given distributed sizes if not specified in config
-        if args["tensor_parallel_size"] is None:
-            args["tensor_parallel_size"] = tp_size
-        if args["pipeline_parallel_size"] is None:
-            args["pipeline_parallel_size"] = pp_size
-
         if port is not None:
             args["port"] = port
         if host is not None:
@@ -2074,75 +1990,6 @@ class SGLangConfig:
 
 
 @dataclass
-class AwexConfig:
-    """Configuration for Awex weight updates."""
-
-    device_backend: str = field(
-        default="cuda",
-        metadata={"help": "Device backend for Awex. Options: cuda/npu."},
-    )
-    use_mindspeed: bool = field(
-        default=False,
-        metadata={"help": "Enable MindSpeed patches when device_backend=npu."},
-    )
-    meta_server_addr: str = field(
-        default="",
-        metadata={"help": "Awex meta server address, e.g. 127.0.0.1:12345."},
-    )
-    comm_backend: str = field(
-        default="file",
-        metadata={"help": "Awex comm backend. Options: file/nccl/hccl/astate."},
-    )
-    weights_exchange_ipc_backend: str = field(
-        default="cuda",
-        metadata={"help": "IPC backend for Awex weights exchange."},
-    )
-    weights_comm_nccl_group_size: int = field(
-        default=1,
-        metadata={"help": "NCCL group size for Awex weights exchange."},
-    )
-    enable_debug_mode: bool = field(
-        default=False, metadata={"help": "Enable Awex debug mode."}
-    )
-    debug_mode_config: dict[str, Any] = field(
-        default_factory=dict,
-        metadata={"help": "Extra debug config passed to Awex."},
-    )
-    disable_weights_exchange_pipeline: bool = field(
-        default=False,
-        metadata={"help": "Disable Awex pipelined weights exchange."},
-    )
-    enable_colocate_mode: bool = field(
-        default=False,
-        metadata={"help": "Enable Awex colocate mode."},
-    )
-    weights_validation_steps: int = field(
-        default=0,
-        metadata={"help": "Number of steps to validate weights on inference side."},
-    )
-    validate_weights_every_n_steps: int = field(
-        default=1,
-        metadata={"help": "Validate weights every N steps when enabled."},
-    )
-    dump_weights_list_for_validation: list[str] = field(
-        default_factory=list,
-        metadata={"help": "List of parameter names to dump for validation."},
-    )
-    dump_weights_dir_for_validation: str = field(
-        default="",
-        metadata={"help": "Directory to dump weights for validation."},
-    )
-    nnodes: int | None = field(
-        default=None,
-        metadata={"help": "Total number of nodes for vLLM server (optional)."},
-    )
-    node_rank: int | None = field(
-        default=None,
-        metadata={"help": "Node rank for vLLM server (optional)."},
-    )
-
-
-@dataclass
 class AgentConfig:
     """Configuration for agent workflows and the experimental agent service controller.
 
@@ -2208,25 +2055,6 @@ class AgentConfig:
         metadata={
             "help": "Chat template type: 'hf' (standard) or 'concat' (multi-turn concatenation).",
             "choices": ["hf", "concat"],
-        },
-    )
-    chat_template_kwargs: dict[str, Any] = field(
-        default_factory=dict,
-        metadata={
-            "help": (
-                "Default keyword arguments passed to tokenizer.apply_chat_template "
-                "for agent requests. Per-request extra_body.chat_template_kwargs "
-                "override these defaults."
-            )
-        },
-    )
-    keep_all_reasoning: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Retain reasoning content from all assistant turns when the model "
-                "chat template supports it."
-            )
         },
     )
     engine_max_tokens: int | None = field(
@@ -3031,7 +2859,6 @@ class BaseExperimentConfig:
 
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
     vllm: vLLMConfig = field(default_factory=vLLMConfig)
-    awex: AwexConfig = field(default_factory=AwexConfig)
 
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
@@ -3136,16 +2963,12 @@ class TeacherConfig:
     )
     offload: bool = field(
         default=False,
-        metadata={"help": "Whether to offload teacher rollout model between steps"},
-    )
-    rl_loss_weight: float = field(
-        default=1.0,
-        metadata={"help": "RL loss weight"},
+        metadata={"help": "Whether to offload teacher model between steps"},
     )
 
-    distill_loss_weight: float = field(
-        default=0.005,
-        metadata={"help": "Distillation loss weight"},
+    weight: float = field(
+        default=1.0,
+        metadata={"help": "Teacher mixture weight."},
     )
 
     def __post_init__(self):
@@ -3155,14 +2978,44 @@ class TeacherConfig:
                 f"teacher.engine_type={self.engine_type!r} selects which one is used.",
                 stacklevel=2,
             )
+
         if self.engine_type == "rollout" and self.rollout is None:
             raise ValueError(
-                "teacher.rollout must be provided when teacher.engine_type='rollout'."
+                "teacher.rollout must be provided when engine_type='rollout'."
             )
+
         if self.engine_type == "train" and self.train is None:
+            raise ValueError("teacher.train must be provided when engine_type='train'.")
+
+
+@dataclass
+class DistillationConfig:
+    teachers: list[TeacherConfig] = field(default_factory=list)
+    rl_loss_weight: float = field(
+        default=1.0,
+        metadata={"help": "RL loss weight."},
+    )
+    distill_loss_weight: float = field(
+        default=5e-3,
+        metadata={"help": "Distillation loss weight."},
+    )
+
+    def __post_init__(self):
+        if len(self.teachers) == 0:
+            raise ValueError("At least one teacher must be provided.")
+
+        engine_types = {t.engine_type for t in self.teachers}
+        if len(engine_types) != 1:
             raise ValueError(
-                "teacher.train must be provided when teacher.engine_type='train'."
+                f"All teachers must have the same engine_type, got: {engine_types}"
             )
+
+        if any(t.weight < 0 for t in self.teachers):
+            raise ValueError("Teacher weights must be non-negative.")
+
+        total_w = sum(t.weight for t in self.teachers)
+        if total_w <= 0:
+            raise ValueError("Sum of teacher weights must be positive.")
 
 
 @dataclass
@@ -3182,11 +3035,11 @@ class PPOConfig(BaseExperimentConfig):
     actor: PPOActorConfig = field(default_factory=PPOActorConfig)
     ref: PPOActorConfig | None = field(default=None)
     critic: PPOCriticConfig | None = field(default=None)
-    teacher: TeacherConfig | None = field(
+    teacher: DistillationConfig | None = field(
         default=None,
         metadata={
             "help": (
-                "Optional teacher model configuration used for on-policy "
+                "Optional distillation configuration used for on-policy "
                 "distillation during PPO training. If provided, the actor "
                 "may be trained to match the teacher in addition to the "
                 "standard PPO objective."
