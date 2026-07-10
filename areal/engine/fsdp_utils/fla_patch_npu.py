@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from typing import Any
 
 import torch
@@ -23,6 +24,8 @@ from areal.models.fsdp.ulysses import (
 from areal.utils import logging
 
 logger = logging.getLogger("FLAPatchNPU")
+
+_NPU_GDN_CAUSAL_CONV1D = None
 
 
 def import_optional_module(module_name: str) -> Any | None:
@@ -158,8 +161,25 @@ def _get_gdn_cu_seqlens(
     return cu_seqlens.reshape(-1).to(device=device, dtype=torch.int64)
 
 
-def _get_local_gdn_conv1d_param(
+def _maybe_append_padded_total(
+    cu_seqlens: torch.Tensor | None, total_len: int
+) -> torch.Tensor | None:
+    if cu_seqlens is None or cu_seqlens.numel() == 0:
+        return cu_seqlens
+    final_len = int(cu_seqlens[-1].item())
+    if final_len == total_len:
+        return cu_seqlens
+    if final_len > total_len:
+        raise ValueError(
+            f"cu_seqlens last value {final_len} exceeds GDN sequence length "
+            f"{total_len}."
+        )
+    return torch.cat([cu_seqlens, cu_seqlens.new_tensor([total_len])], dim=0)
+
+
+def _get_local_gdn_qkv_param(
     param: torch.Tensor | None,
+    param_name: str,
     key_dim: int,
     value_dim: int,
     local_key_dim: int,
@@ -168,12 +188,108 @@ def _get_local_gdn_conv1d_param(
 ) -> torch.Tensor | None:
     if param is None:
         return None
+    expected_dim = key_dim * 2 + value_dim
+    if param.shape[0] != expected_dim:
+        raise ValueError(
+            f"{param_name} dim ({param.shape[0]}) must match "
+            f"(2 * key_dim + value_dim) ({expected_dim})."
+        )
     k_off = ulysses_rank * local_key_dim
     v_off = ulysses_rank * local_value_dim
     q_param = param[k_off : k_off + local_key_dim]
     k_param = param[key_dim + k_off : key_dim + local_key_dim + k_off]
     v_param = param[2 * key_dim + v_off : 2 * key_dim + local_value_dim + v_off]
     return torch.cat([q_param, k_param, v_param], dim=0)
+
+
+def _get_local_gdn_conv1d_weight(
+    self, ulysses_rank: int, local_key_dim: int, local_value_dim: int
+) -> torch.Tensor:
+    if self.conv1d.weight.shape[0] == 1:
+        return self.conv1d.weight
+    return _get_local_gdn_qkv_param(
+        self.conv1d.weight,
+        "conv1d weight",
+        self.key_dim,
+        self.value_dim,
+        local_key_dim,
+        local_value_dim,
+        ulysses_rank,
+    )
+
+
+def _get_local_gdn_conv1d_bias(
+    self, ulysses_rank: int, local_key_dim: int, local_value_dim: int
+) -> torch.Tensor | None:
+    if self.conv1d.bias is None or self.conv1d.bias.shape[0] == 1:
+        return self.conv1d.bias
+    return _get_local_gdn_qkv_param(
+        self.conv1d.bias,
+        "conv1d bias",
+        self.key_dim,
+        self.value_dim,
+        local_key_dim,
+        local_value_dim,
+        ulysses_rank,
+    )
+
+
+def _expand_shared_gdn_conv1d_weight(
+    weight: torch.Tensor, local_dim: int
+) -> torch.Tensor:
+    if weight.shape[0] == local_dim:
+        return weight
+    if weight.shape[0] == 1:
+        return weight.expand(local_dim, *weight.shape[1:]).contiguous()
+    raise ValueError(
+        f"conv1d weight dim ({weight.shape[0]}) must be 1 or local GDN dim "
+        f"({local_dim})."
+    )
+
+
+def _expand_shared_gdn_conv1d_bias(
+    bias: torch.Tensor | None, local_dim: int
+) -> torch.Tensor | None:
+    if bias is None or bias.shape[0] == local_dim:
+        return bias
+    if bias.shape[0] == 1:
+        return bias.expand(local_dim).contiguous()
+    raise ValueError(
+        f"conv1d bias dim ({bias.shape[0]}) must be 1 or local GDN dim "
+        f"({local_dim})."
+    )
+
+
+def _as_gdn_triton_conv1d_weight(
+    weight: torch.Tensor, local_dim: int
+) -> torch.Tensor:
+    if weight.ndim == 3:
+        if weight.shape[0] == local_dim:
+            return weight.squeeze(1).transpose(-1, -2).contiguous()
+        if weight.shape[0] == 1:
+            weight = weight.expand(local_dim, *weight.shape[1:])
+            return weight.squeeze(1).transpose(-1, -2).contiguous()
+    if weight.ndim == 2:
+        if weight.shape[0] == local_dim:
+            return weight.transpose(-1, -2).contiguous()
+        if weight.shape[0] == 1:
+            weight = weight.expand(local_dim, weight.shape[1])
+            return weight.transpose(-1, -2).contiguous()
+        if weight.shape[-1] == local_dim:
+            return weight.contiguous()
+    raise ValueError(
+        "conv1d weight must be depthwise [D, 1, W]/[D, W], shared "
+        f"[1, 1, W]/[1, W], or kernel [W, D], got {tuple(weight.shape)} "
+        f"for local GDN dim {local_dim}."
+    )
+
+
+def _as_torch_conv1d_weight(weight: torch.Tensor) -> torch.Tensor:
+    if weight.ndim == 3:
+        return weight
+    if weight.ndim == 2:
+        return weight.unsqueeze(1)
+    raise ValueError(f"conv1d weight must be 2D or 3D, got {tuple(weight.shape)}.")
 
 
 def qwen3_5_gated_deltanet_forward(
@@ -264,7 +380,9 @@ def qwen3_5_gated_deltanet_forward(
         local_value_dim = self.value_dim
 
     gdn_seq_len = mixed_qkv.shape[1]
-    cu_seqlens = _get_gdn_cu_seqlens(kwargs, hidden_states.device)
+    cu_seqlens = _maybe_append_padded_total(
+        _get_gdn_cu_seqlens(kwargs, hidden_states.device), gdn_seq_len
+    )
 
     if use_precomputed_states:
         mixed_qkv = self.causal_conv1d_update(
@@ -278,23 +396,18 @@ def qwen3_5_gated_deltanet_forward(
         conv_weight = self.conv1d.weight
         conv_bias = self.conv1d.bias
         if use_ulysses:
-            conv_weight = _get_local_gdn_conv1d_param(
-                conv_weight,
-                self.key_dim,
-                self.value_dim,
+            conv_weight = _get_local_gdn_conv1d_weight(
+                self,
+                ulysses_rank,
                 local_key_dim,
                 local_value_dim,
-                ulysses_rank,
             )
-            conv_bias = _get_local_gdn_conv1d_param(
-                conv_bias,
-                self.key_dim,
-                self.value_dim,
+            conv_bias = _get_local_gdn_conv1d_bias(
+                self,
+                ulysses_rank,
                 local_key_dim,
                 local_value_dim,
-                ulysses_rank,
             )
-
         if cache_params is not None:
             conv_state = F.pad(
                 mixed_qkv.transpose(1, 2),
@@ -302,35 +415,55 @@ def qwen3_5_gated_deltanet_forward(
             )
             _update_cache_state(cache_params, self.layer_idx, "conv_states", conv_state)
 
-        conv_weight_2d = conv_weight.squeeze(1)
-        causal_conv = getattr(self, "causal_conv1d_fn", None)
+        causal_conv = _NPU_GDN_CAUSAL_CONV1D
         if causal_conv is not None:
             try:
+                local_conv_dim = local_key_dim * 2 + local_value_dim
+                triton_conv_weight = _as_gdn_triton_conv1d_weight(
+                    conv_weight, local_conv_dim
+                )
+                triton_conv_bias = _expand_shared_gdn_conv1d_bias(
+                    conv_bias, local_conv_dim
+                )
                 mixed_qkv, _ = causal_conv(
                     x=mixed_qkv,
-                    weight=conv_weight_2d,
-                    bias=conv_bias,
+                    weight=triton_conv_weight,
+                    bias=triton_conv_bias,
                     activation=self.activation,
                     initial_state=None,
                     output_final_state=False,
                     cu_seqlens=cu_seqlens,
                 )
-            except TypeError:
-                mixed_qkv = causal_conv(
-                    x=mixed_qkv,
-                    weight=conv_weight_2d,
-                    bias=conv_bias,
-                    activation=self.activation,
-                    seq_idx=None,
-                ).transpose(1, 2)
+            except NotImplementedError:
+                local_conv_dim = local_key_dim * 2 + local_value_dim
+                torch_conv_weight = _expand_shared_gdn_conv1d_weight(
+                    conv_weight, local_conv_dim
+                )
+                torch_conv_bias = _expand_shared_gdn_conv1d_bias(
+                    conv_bias, local_conv_dim
+                )
+                mixed_qkv_t = mixed_qkv.transpose(1, 2)
+                mixed_qkv = F.conv1d(
+                    mixed_qkv_t,
+                    weight=_as_torch_conv1d_weight(torch_conv_weight),
+                    bias=torch_conv_bias,
+                    padding=self.conv_kernel_size - 1,
+                    groups=local_conv_dim,
+                )[:, :, :gdn_seq_len]
+                mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
         else:
+            local_conv_dim = local_key_dim * 2 + local_value_dim
+            torch_conv_weight = _expand_shared_gdn_conv1d_weight(
+                conv_weight, local_conv_dim
+            )
+            torch_conv_bias = _expand_shared_gdn_conv1d_bias(conv_bias, local_conv_dim)
             mixed_qkv_t = mixed_qkv.transpose(1, 2)
             mixed_qkv = F.conv1d(
                 mixed_qkv_t,
-                weight=conv_weight,
-                bias=conv_bias,
+                weight=_as_torch_conv1d_weight(torch_conv_weight),
+                bias=torch_conv_bias,
                 padding=self.conv_kernel_size - 1,
-                groups=local_key_dim * 2 + local_value_dim,
+                groups=local_conv_dim,
             )[:, :, :gdn_seq_len]
             mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
 
@@ -408,6 +541,7 @@ def qwen3_5_gated_deltanet_forward(
 
 
 def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
+    global _NPU_GDN_CAUSAL_CONV1D
     try:
         # patch L2 norm before importing GDN
         import areal.engine.megatron_utils.triton_l2norm_patch  # noqa: F401, I001
@@ -417,6 +551,19 @@ def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
             "Failed to import embedded MindSpeed chunk_gated_delta_rule: %s", exc
         )
         raise
+
+    causal_conv1d = None
+    if os.environ.get("AREAL_DISABLE_NPU_GDN_CAUSAL_CONV1D") != "1":
+        try:
+            from areal.engine.fsdp_utils.gdn_triton.causal_conv1d import causal_conv1d
+        except ImportError as exc:
+            logger.warning(
+                "Failed to import vendored NPU GDN causal_conv1d: %s. "
+                "Falling back to torch conv1d.",
+                exc,
+            )
+        else:
+            _NPU_GDN_CAUSAL_CONV1D = causal_conv1d
 
     patched_modules = []
     for module_name in (
@@ -433,6 +580,8 @@ def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
         # so keep the native Qwen3.5 torch implementation on NPU.
         setattr(module, "FusedRMSNormGated", None)
         setattr(module, "chunk_gated_delta_rule", chunk_gated_delta_rule)
+        if causal_conv1d is not None:
+            setattr(module, "causal_conv1d_fn", causal_conv1d)
         if hasattr(module, "Qwen3_5GatedDeltaNet"):
             module.Qwen3_5GatedDeltaNet.forward = qwen3_5_gated_deltanet_forward
         if hasattr(module, "Qwen3_5MoeGatedDeltaNet"):
@@ -444,6 +593,8 @@ def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
             "Patched Qwen3.5 chunk_gated_delta_rule to embedded MindSpeed implementation: %s.",
             ", ".join(patched_modules),
         )
+        if causal_conv1d is not None:
+            logger.info("Patched Qwen3.5 GatedDeltaNet to MindSpeed-MM causal_conv1d.")
 
 
 QWEN3_5_PATCHES = {
