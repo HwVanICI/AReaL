@@ -970,6 +970,8 @@ class RayScheduler(Scheduler):
         target_role: str,
         worker_spec: SchedulingSpec,
         gpu_devices: list[str],
+        local_gpu_devices: list[str],
+        launchers: list[ActorHandle],
         command: str | None = None,
     ) -> RayWorkerInfo:
         """Fork a single worker asynchronously.
@@ -1031,8 +1033,8 @@ class RayScheduler(Scheduler):
 
             # 3. Fork via raw_cmd
             env_overrides = worker_spec.env_vars.copy()
-            if gpu_devices:
-                env_overrides[self.device_control_env_var] = ",".join(gpu_devices)
+            if local_gpu_devices:
+                env_overrides[self.device_control_env_var] = ",".join(local_gpu_devices)
             elif worker_spec.gpu <= 0:
                 env_overrides[self.device_control_env_var] = ""
 
@@ -1121,7 +1123,7 @@ class RayScheduler(Scheduler):
             worker=worker,
             role=role,
             task_index=idx,
-            launchers=target_wi.launchers,
+            launchers=launchers,
             spec=worker_spec,
             gpu_devices=gpu_devices,
             fork_parent_index=target_wi.task_index,
@@ -1195,6 +1197,33 @@ class RayScheduler(Scheduler):
                     )
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def _collect_group_launchers(
+        self, role: str, group: list[RayWorkerInfo]
+    ) -> tuple[list[ActorHandle], list[list[str]]]:
+        launchers: list[ActorHandle] = []
+        launcher_gpu_devices: list[list[str]] = []
+
+        for worker in group:
+            if not worker.launchers:
+                raise WorkerCreationError(
+                    role,
+                    "Unsupported fork layout",
+                    "RayScheduler grouped fork requires every target worker "
+                    f"to have at least one Ray launcher ({worker.worker.id}).",
+                )
+
+            target_launcher = worker.launchers[0]
+            for launcher_idx, launcher in enumerate(launchers):
+                if launcher is target_launcher:
+                    break
+            else:
+                launchers.append(worker.launchers[0])
+                launcher_gpu_devices.append([])
+                launcher_idx = len(launchers) - 1
+            launcher_gpu_devices[launcher_idx].extend(worker.gpu_devices)
+
+        return launchers, launcher_gpu_devices
+
     async def _create_forked_workers_async(
         self,
         role: str,
@@ -1220,13 +1249,21 @@ class RayScheduler(Scheduler):
             tasks = []
             for idx, group in enumerate(target_worker_groups):
                 target_wi = group[0]
+                uses_gpu = schedulings[idx].gpu > 0
                 gpu_devices = []
-                if schedulings[idx].gpu > 0:
+                local_gpu_devices = []
+                if uses_gpu:
+                    launchers, launcher_gpu_devices = self._collect_group_launchers(
+                        role, group
+                    )
                     gpu_devices = [
                         gpu_device
-                        for worker in group
-                        for gpu_device in worker.gpu_devices
+                        for devices in launcher_gpu_devices
+                        for gpu_device in devices
                     ]
+                    local_gpu_devices = launcher_gpu_devices[0]
+                else:
+                    launchers = [target_wi.launchers[0]]
                 tasks.append(
                     self._fork_single_worker(
                         session=session,
@@ -1236,6 +1273,8 @@ class RayScheduler(Scheduler):
                         target_role=target_role,
                         worker_spec=schedulings[idx],
                         gpu_devices=gpu_devices,
+                        local_gpu_devices=local_gpu_devices,
+                        launchers=launchers,
                         command=command,
                     )
                 )
@@ -1301,7 +1340,9 @@ class RayScheduler(Scheduler):
         by target group size:
         ``target_group_size = len(target_workers) // job.replicas``. CPU-only
         forks use no visible devices; GPU forks use all devices from the
-        target group.
+        target group. If a GPU group spans multiple Ray launchers, the forked
+        head worker runs on the first launcher and keeps the remaining
+        launchers for multi-node rollout backend workers.
 
         Parameters
         ----------
@@ -1389,39 +1430,62 @@ class RayScheduler(Scheduler):
         ]
 
         for idx, group in enumerate(target_worker_groups):
+            launchers, launcher_gpu_devices = self._collect_group_launchers(role, group)
             gpu_devices = [
-                gpu_device for worker in group for gpu_device in worker.gpu_devices
+                gpu_device for devices in launcher_gpu_devices for gpu_device in devices
             ]
-            if schedulings[idx].gpu > 0 and len(gpu_devices) != schedulings[idx].gpu:
+            if schedulings[idx].gpu > 0:
+                if len(gpu_devices) != schedulings[idx].gpu:
+                    raise WorkerCreationError(
+                        role,
+                        "Unsupported fork layout",
+                        "RayScheduler grouped GPU fork requires the target group "
+                        "visible device count to match the forked worker GPU "
+                        f"request (target group {idx} exposes {len(gpu_devices)} "
+                        f"devices, expected {schedulings[idx].gpu}).",
+                    )
+                if schedulings[idx].gpu > self.n_gpus_per_node:
+                    if schedulings[idx].gpu % self.n_gpus_per_node != 0:
+                        raise WorkerCreationError(
+                            role,
+                            "Unsupported fork layout",
+                            "RayScheduler multi-node grouped GPU fork requires "
+                            "each forked worker's GPU request to use full nodes "
+                            f"(worker {idx} requested {schedulings[idx].gpu} GPUs, "
+                            f"n_gpus_per_node={self.n_gpus_per_node}).",
+                        )
+                    expected_launchers = schedulings[idx].gpu // self.n_gpus_per_node
+                    if len(launchers) != expected_launchers or any(
+                        len(devices) != self.n_gpus_per_node
+                        for devices in launcher_gpu_devices
+                    ):
+                        raise WorkerCreationError(
+                            role,
+                            "Unsupported fork layout",
+                            "RayScheduler multi-node grouped GPU fork requires "
+                            "each target group to cover complete Ray launchers "
+                            f"(target group {idx} covers {len(launchers)} launchers "
+                            f"with device counts {[len(d) for d in launcher_gpu_devices]}, "
+                            f"expected {expected_launchers} launchers with "
+                            f"{self.n_gpus_per_node} GPUs each).",
+                        )
+                elif len(launchers) != 1:
+                    raise WorkerCreationError(
+                        role,
+                        "Unsupported fork layout",
+                        "RayScheduler grouped GPU fork requires single-node "
+                        "target groups unless the forked worker uses more than "
+                        f"n_gpus_per_node GPUs (target group {idx} covers "
+                        f"{len(launchers)} launchers).",
+                    )
+            elif target_group_size > 1 and len(launchers) != 1:
                 raise WorkerCreationError(
                     role,
                     "Unsupported fork layout",
-                    "RayScheduler grouped GPU fork requires the target group "
-                    "visible device count to match the forked worker GPU "
-                    f"request (target group {idx} exposes {len(gpu_devices)} "
-                    f"devices, expected {schedulings[idx].gpu}).",
+                    "RayScheduler grouped fork requires all target workers "
+                    f"in a CPU-only group to share the same Ray launcher "
+                    f"(target group {idx}).",
                 )
-            if target_group_size > 1:
-                head_launchers = group[0].launchers
-                if not head_launchers:
-                    raise WorkerCreationError(
-                        role,
-                        "Unsupported fork layout",
-                        "RayScheduler grouped fork requires the head target "
-                        f"worker to have a Ray launcher (target group {idx}).",
-                    )
-                head_launcher = head_launchers[0]
-                if any(
-                    not worker.launchers or worker.launchers[0] is not head_launcher
-                    for worker in group
-                ):
-                    raise WorkerCreationError(
-                        role,
-                        "Unsupported fork layout",
-                        "RayScheduler grouped fork requires all target workers "
-                        f"in a group to share the same Ray launcher "
-                        f"(target group {idx}).",
-                    )
 
         try:
             return run_async_task(
