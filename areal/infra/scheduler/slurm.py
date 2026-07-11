@@ -51,7 +51,7 @@ from areal.infra.utils.slurm import (
 from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
 from areal.utils.network import format_hostport, split_hostport
-from areal.utils.offload import get_tms_env_vars
+from areal.utils.offload import get_tms_env_vars, should_enable_tms_offload
 
 logger = logging.getLogger("SlurmScheduler")
 
@@ -104,7 +104,7 @@ class SlurmScheduler(Scheduler):
             self.trial_name = exp_config.trial_name
             self.fileroot = exp_config.cluster.fileroot
             self.cluster_name = exp_config.cluster.cluster_name
-            self.enable_tms_offload = exp_config.enable_offload
+            self.enable_tms_offload = should_enable_tms_offload(exp_config)
         if self.experiment_name is None or self.trial_name is None:
             raise ValueError("experiment_name and trial_name must be provided")
 

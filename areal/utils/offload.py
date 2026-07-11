@@ -9,6 +9,10 @@ properly with LD_PRELOAD hooks.
 import os
 from collections.abc import Mapping
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from areal.api.cli_args import BaseExperimentConfig
 
 _TMS_ENV_VARS = (
     "TMS_INIT_ENABLE",
@@ -62,6 +66,24 @@ def get_tms_env_vars() -> dict[str, str]:
         "TMS_INIT_ENABLE_CPU_BACKUP": "1",
     }
     return env_vars
+
+
+def should_enable_tms_offload(config: "BaseExperimentConfig") -> bool:
+    """Return whether train-engine offload should use TMS for this config."""
+    if not config.enable_offload:
+        return False
+
+    from areal.api.alloc_mode import ModelAllocation
+
+    actor_backend = ModelAllocation.from_str(config.actor.backend, name="actor").backend
+    weight_update_mode = config.actor.weight_update_mode.lower()
+
+    # megatron+awex uses Megatron/Awex-managed memory release instead of TMS.
+    if actor_backend == "megatron" and weight_update_mode == "awex":
+        return False
+
+    # Others use TMS.
+    return True
 
 
 def sanitize_tms_env_vars(env: Mapping[str, str] | None) -> dict[str, str]:

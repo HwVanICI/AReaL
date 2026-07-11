@@ -52,7 +52,7 @@ from areal.utils.network import (
     format_hostport,
     gethostip,
 )
-from areal.utils.offload import get_tms_env_vars
+from areal.utils.offload import get_tms_env_vars, should_enable_tms_offload
 
 logger = logging.getLogger("LocalScheduler")
 
@@ -124,7 +124,7 @@ class LocalScheduler(Scheduler):
             self.experiment_name = exp_config.experiment_name
             self.trial_name = exp_config.trial_name
             self.fileroot = exp_config.cluster.fileroot
-            self.enable_tms_offload = exp_config.enable_offload
+            self.enable_tms_offload = should_enable_tms_offload(exp_config)
 
         # name_resolve config (exp_config overwrites direct params)
         self.name_resolve_config = NameResolveConfig(
