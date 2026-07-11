@@ -12,7 +12,7 @@ import re
 import struct
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -747,12 +747,17 @@ class MegatronEngine(TrainEngine):
 
     def update_weights(self, meta: WeightUpdateMeta):
         self._check_rollout_engine_connected()
-        with self._offload_aware_context():
+        context = self._offload_aware_context()
+        if meta.colocate_mode and meta.colocate_stage == 1 and meta.type == "disk":
+            context = nullcontext()
+        with context:
             if meta.type == "xccl":
                 assert self.weight_update_group_initialized
                 self._update_weights_from_distributed(meta)
             elif meta.type == "awex":
                 self._update_weights_from_awex(meta)
+            elif meta.type == "disk" and meta.colocate_mode:
+                self._update_weights_from_disk_stage(meta)
             elif meta.type == "disk":
                 self._update_weights_from_disk(meta)
             else:
@@ -1989,6 +1994,36 @@ class MegatronEngine(TrainEngine):
         dist.barrier(group=self.cpu_group)
 
     @trace_perf("megatron_engine.update_weights_from_disk", category="io")
+    def _update_weights_from_disk_stage(self, meta: WeightUpdateMeta) -> None:
+        if meta.colocate_stage == 0:
+            assert meta.path is not None
+            self._save_model_to_hf(meta.path, self.tokenizer, self.processor)
+            current_platform.synchronize()
+            dist.barrier(group=self.cpu_group)
+            self.logger.info(
+                f"{dist.get_rank()=} [stage0]-----actor end writing weights to disk."
+            )
+        else:
+            fut = Future()
+            if dist.get_rank() == 0:
+                fut = self.rollout_engine.update_weights_from_disk(meta)
+                update_name = names.update_weights_from_disk(
+                    self.config.experiment_name,
+                    self.config.trial_name,
+                    self.get_version(),
+                )
+                name_resolve.add(
+                    update_name, str(datetime.now().timestamp()), keepalive_ttl=120
+                )
+
+                fut.result()
+                self.logger.info(
+                    f"{dist.get_rank()=} [stage1]-----rollout end reading weights from disk."
+                )
+            current_platform.synchronize()
+            dist.barrier(group=self.cpu_group)
+
+    @trace_perf("megatron_engine.update_weights_from_disk", category="io")
     def _update_weights_from_disk(self, meta: WeightUpdateMeta) -> None:
         fut = Future()
 
@@ -1996,6 +2031,7 @@ class MegatronEngine(TrainEngine):
             self.rollout_engine.pause_generation()
             fut = self.rollout_engine.update_weights_from_disk(meta)
 
+        assert meta.path is not None
         self._save_model_to_hf(meta.path, self.tokenizer, self.processor)
         # dist.barrier() are called when _save_model_to_hf finished
 
