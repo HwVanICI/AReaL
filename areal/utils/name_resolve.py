@@ -541,7 +541,10 @@ class Etcd3NameRecordRepository(NameRecordRepository):
                 lease_id=lease_id,
                 keepalive_ttl=keepalive_ttl,
                 keeper=(
-                    timeutil.FrequencyControl(frequency_seconds=keepalive_ttl / 3)
+                    timeutil.FrequencyControl(
+                        frequency_seconds=keepalive_ttl / 3,
+                        sync_distributed=False,
+                    )
                     if keepalive_ttl
                     else None
                 ),
@@ -993,7 +996,10 @@ class RayNameResolveRepository:
                 lease_id=lease_id,
                 keepalive_ttl=keepalive_ttl,
                 keeper=(
-                    timeutil.FrequencyControl(frequency_seconds=keepalive_ttl / 3)
+                    timeutil.FrequencyControl(
+                        frequency_seconds=keepalive_ttl / 3,
+                        sync_distributed=False,
+                    )
                     if keepalive_ttl
                     else None
                 ),

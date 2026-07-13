@@ -24,6 +24,7 @@ class FrequencyControl:
         frequency_steps: int | None = None,
         initial_value: bool = False,
         group: dist.ProcessGroup | None = None,
+        sync_distributed: bool = True,
     ):
         """Initialization method of FrequencyControl.
         Args:
@@ -33,6 +34,8 @@ class FrequencyControl:
             group: If torch distributed is initialized, time intervals will be synchronized
                 across processes in the specified distributed group. If group is None, the
                 default process group will be used.
+            sync_distributed: Whether to synchronize time intervals across torch
+                distributed processes.
 
         NOTE:
             - If both frequency_seconds and frequency_steps are None, the checking will always return False except
@@ -43,6 +46,7 @@ class FrequencyControl:
         self.frequency_seconds = frequency_seconds
         self.frequency_steps = frequency_steps
         self.group = group
+        self.sync_distributed = sync_distributed
         self.__start_time = datetime.now()
         self.__steps = 0
         self.__last_time = datetime.now()
@@ -115,9 +119,10 @@ class FrequencyControl:
             if self.frequency_steps is None and self.frequency_seconds is None:
                 return False
             if self.frequency_seconds is not None:
-                if dist.is_initialized():
+                interval_seconds = self.__interval_seconds
+                if self.sync_distributed and dist.is_initialized():
                     interval_seconds = torch.tensor(
-                        self.__interval_seconds, device=current_platform.device_type
+                        interval_seconds, device=current_platform.device_type
                     )
                     dist.all_reduce(
                         interval_seconds, op=dist.ReduceOp.MAX, group=self.group
