@@ -12,6 +12,12 @@ from areal.api.workflow_api import RolloutWorkflow
 from areal.utils.dynamic_import import import_from_string
 
 
+def _tag_result_domain(result: Any, domain_key: str, domain: str) -> Any:
+    if isinstance(result, dict):
+        result.setdefault(domain_key, domain)
+    return result
+
+
 @dataclass
 class DomainWorkflowSpec:
     """Configuration for one domain-routed agent workflow."""
@@ -122,7 +128,8 @@ class DomainRouterRolloutWorkflow(RolloutWorkflow):
                 f"No workflow configured for domain {domain!r}. "
                 f"Available domains: {sorted(self.workflows)}"
             )
-        return await self.workflows[domain].arun_episode(engine, data)
+        result = await self.workflows[domain].arun_episode(engine, data)
+        return _tag_result_domain(result, self.domain_key, domain)
 
     @staticmethod
     def _build_workflow(domain: str, spec: Any) -> RolloutWorkflow:

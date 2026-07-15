@@ -100,4 +100,4 @@ def test_domain_router_rollout_routes_by_domain():
         router.arun_episode(None, {"domain": "geometry3k", "value": "proof"})
     )
 
-    assert result == {"value": "g:proof"}
+    assert result == {"value": "g:proof", "domain": "geometry3k"}

@@ -192,11 +192,17 @@ class PPOTrainer:
         self.teacher_configs = teacher_configs
         self.teacher_allocs = []
         self.teacher_mixture_weights: list[float] = []
+        self.teacher_domain_to_idx: dict[str, int] = {}
         if len(self.teacher_configs) > 0:
             total_weight = sum(t.weight for t in self.teacher_configs)
             self.teacher_mixture_weights = [
                 t.weight / total_weight for t in self.teacher_configs
             ]
+            self.teacher_domain_to_idx = {
+                t_config.domain: idx
+                for idx, t_config in enumerate(self.teacher_configs)
+                if t_config.domain is not None
+            }
             for idx, t_config in enumerate(self.teacher_configs):
                 if t_config.engine_type == "rollout":
                     self.teacher_allocs.append(
@@ -543,6 +549,101 @@ class PPOTrainer:
             if teacher_config.offload:
                 self._offload_model(teacher, role=f"teacher-{idx}")
 
+    def _set_distillation_fields(
+        self,
+        traj: dict[str, Any],
+        teacher_config: TeacherConfig,
+    ) -> None:
+        assert self.config.teacher is not None
+        traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
+        traj["distill_loss_weight"] = self.config.teacher.distill_loss_weight
+        traj["distill_loss_type"] = teacher_config.distill_loss_type
+        traj["mopd_adv_clip"] = teacher_config.mopd_adv_clip
+
+    def _trajectory_for_teacher(self, traj: dict[str, Any]) -> dict[str, Any]:
+        assert self.config.teacher is not None
+        domain_key = self.config.teacher.domain_key
+        if domain_key not in traj:
+            return traj
+        return {k: v for k, v in traj.items() if k != domain_key}
+
+    def _assign_mixed_teacher_logps(self, rollout_batch: list[dict[str, Any]]) -> None:
+        teacher_batch = [self._trajectory_for_teacher(traj) for traj in rollout_batch]
+        with ThreadPoolExecutor(max_workers=len(self.teachers)) as executor:
+            futures = [
+                executor.submit(teacher.compute_logp, teacher_batch)
+                for teacher in self.teachers
+            ]
+            per_teacher_logps = [future.result() for future in futures]
+        per_teacher_logps = RTensor.localize(per_teacher_logps)
+        log_weights = torch.log(
+            torch.tensor(
+                self.teacher_mixture_weights,
+                dtype=torch.float32,
+                device=per_teacher_logps[0][0].device,
+            )
+        )
+        teacher_config = self.teacher_configs[0]
+        for traj_idx, traj in enumerate(rollout_batch):
+            stacked = torch.stack(
+                [teacher_logps[traj_idx] for teacher_logps in per_teacher_logps],
+                dim=0,
+            )
+            traj["teacher_logp"] = torch.logsumexp(
+                stacked + log_weights[:, None, None], dim=0
+            )
+            self._set_distillation_fields(traj, teacher_config)
+
+    def _assign_domain_teacher_logps(self, rollout_batch: list[dict[str, Any]]) -> None:
+        assert self.config.teacher is not None
+        domain_key = self.config.teacher.domain_key
+        teacher_to_traj_indices: dict[int, list[int]] = {}
+        for traj_idx, traj in enumerate(rollout_batch):
+            domain = traj.get(domain_key)
+            if domain is None:
+                raise ValueError(
+                    f"Trajectory is missing domain key {domain_key!r}; use a "
+                    "domain router workflow or add domain metadata to trajectories."
+                )
+            if domain not in self.teacher_domain_to_idx:
+                raise ValueError(
+                    f"No teacher configured for domain {domain!r}. Available "
+                    f"teacher domains: {sorted(self.teacher_domain_to_idx)}"
+                )
+            teacher_idx = self.teacher_domain_to_idx[domain]
+            teacher_to_traj_indices.setdefault(teacher_idx, []).append(traj_idx)
+
+        with ThreadPoolExecutor(max_workers=len(teacher_to_traj_indices)) as executor:
+            futures = {}
+            for teacher_idx, traj_indices in teacher_to_traj_indices.items():
+                teacher_batch = [
+                    self._trajectory_for_teacher(rollout_batch[i]) for i in traj_indices
+                ]
+                futures[teacher_idx] = executor.submit(
+                    self.teachers[teacher_idx].compute_logp,
+                    teacher_batch,
+                )
+
+            for teacher_idx, future in futures.items():
+                teacher_logps = RTensor.localize(future.result())
+                teacher_config = self.teacher_configs[teacher_idx]
+                traj_indices = teacher_to_traj_indices[teacher_idx]
+                for traj_idx, teacher_logp in zip(
+                    traj_indices,
+                    teacher_logps,
+                    strict=True,
+                ):
+                    traj = rollout_batch[traj_idx]
+                    traj["teacher_logp"] = teacher_logp
+                    self._set_distillation_fields(traj, teacher_config)
+
+    def _assign_teacher_logps(self, rollout_batch: list[dict[str, Any]]) -> None:
+        assert self.config.teacher is not None
+        if self.config.teacher.routing_mode == "domain":
+            self._assign_domain_teacher_logps(rollout_batch)
+        else:
+            self._assign_mixed_teacher_logps(rollout_batch)
+
     def _offload_rollout(self, is_eval: bool = False):
         rollout = self.rollout if not is_eval else self.eval_rollout
         if rollout is None:
@@ -751,40 +852,7 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    with ThreadPoolExecutor(max_workers=len(self.teachers)) as executor:
-                        futures = [
-                            executor.submit(teacher.compute_logp, rollout_batch)
-                            for teacher in self.teachers
-                        ]
-                        per_teacher_logps = [future.result() for future in futures]
-                    per_teacher_logps = RTensor.localize(per_teacher_logps)
-                    log_weights = torch.log(
-                        torch.tensor(
-                            self.teacher_mixture_weights,
-                            dtype=torch.float32,
-                            device=per_teacher_logps[0][0].device,
-                        )
-                    )
-                    for traj_idx, traj in enumerate(rollout_batch):
-                        stacked = torch.stack(
-                            [
-                                teacher_logps[traj_idx]
-                                for teacher_logps in per_teacher_logps
-                            ],
-                            dim=0,
-                        )
-                        mixed_logp = torch.logsumexp(
-                            stacked + log_weights[:, None, None], dim=0
-                        )
-                        traj["teacher_logp"] = mixed_logp
-                        traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
-                        traj["distill_loss_weight"] = (
-                            self.config.teacher.distill_loss_weight
-                        )
-                        traj["distill_loss_type"] = (
-                            self.config.teacher.distill_loss_type
-                        )
-                        traj["mopd_adv_clip"] = self.config.teacher.mopd_adv_clip
+                    self._assign_teacher_logps(rollout_batch)
                 if self._should_offload_teacher:
                     self._offload_teachers()
 
