@@ -46,6 +46,19 @@ def default_data_extract_prompt_fn(data: dict[str, Any]) -> Any:
     return data["messages"]
 
 
+def log_reward_metrics(reward: float, task_data: dict[str, Any]) -> None:
+    tracker = stats_tracker.get(workflow_context.stat_scope())
+    tracker.scalar(reward=reward)
+
+    domain = task_data.get("domain")
+    if domain:
+        tracker.scalar(**{f"reward/{domain}": reward})
+
+    dataset_name = task_data.get("dataset_name")
+    if dataset_name:
+        tracker.scalar(**{f"reward_dataset/{dataset_name}": reward})
+
+
 class RLVRWorkflow(RolloutWorkflow):
     """Single-turn reward learning workflow supporting optional thinking tokens."""
 
@@ -132,7 +145,7 @@ class RLVRWorkflow(RolloutWorkflow):
 
         reward = await self._compute_rewards(resp, prompt_str, task_data)
 
-        stats_tracker.get(workflow_context.stat_scope()).scalar(reward=reward)
+        log_reward_metrics(reward, task_data)
 
         return resp, reward
 
