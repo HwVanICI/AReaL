@@ -496,7 +496,7 @@ def grpo_loss_fn(
         if distill_loss_type == "mopd_pg":
             mopd_loss, mopd_stat = mopd_pg_loss_fn(
                 logprobs=logprobs,
-                student_logprobs=old_logp,
+                old_logprobs=old_logp,
                 teacher_logprobs=teacher_logp,
                 loss_mask=loss_mask,
                 adv_clip=mopd_adv_clip,
@@ -638,31 +638,36 @@ def grpo_loss_fn(
 
 def mopd_pg_loss_fn(
     logprobs: torch.Tensor,
-    student_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
     teacher_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
     adv_clip: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """MOPD policy-gradient distillation loss.
+    """MOPD policy-gradient loss adapted to off-policy rollouts.
 
-    Implements the MOPD objective with the teacher-student log-probability
-    difference as a per-token advantage and two-sided advantage clipping.
+    The stopped-gradient advantage measures the teacher's log-probability gap
+    from the current student policy. The rollout policy is used only for the
+    per-token importance correction.
     """
-    loss_mask_count = loss_mask.count_nonzero() or 1
-    raw_advantage = teacher_logprobs.detach() - student_logprobs.detach()
+    old_logprobs = old_logprobs.detach()
+    teacher_logprobs = teacher_logprobs.detach()
+
+    raw_advantage = teacher_logprobs - logprobs.detach()
     advantage = raw_advantage.clamp(min=-adv_clip, max=adv_clip)
-    importance_weight = torch.exp(logprobs - student_logprobs.detach())
+    log_ratio = logprobs - old_logprobs
+    importance_weight = torch.exp(log_ratio)
     pg_loss = -importance_weight * advantage
-    logging_loss = pg_loss.detach()
-    loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+
+    mask = loss_mask.to(pg_loss.dtype)
+    loss = (pg_loss * mask).sum() / mask.sum().clamp_min(1)
 
     stat = dict(
-        loss=logging_loss,
+        loss=pg_loss.detach(),
         advantage=advantage.detach(),
         raw_advantage=raw_advantage.detach(),
         importance_weight=importance_weight.detach(),
-        approx_kl=(logprobs - student_logprobs.detach()).detach(),
-        adv_clip_mask=(raw_advantage.detach().abs() > adv_clip).logical_and(loss_mask),
+        approx_kl=log_ratio.detach(),
+        adv_clip_mask=(raw_advantage.abs() > adv_clip).logical_and(loss_mask.bool()),
     )
     return loss, stat
 
