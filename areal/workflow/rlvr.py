@@ -54,10 +54,6 @@ def log_reward_metrics(reward: float, task_data: dict[str, Any]) -> None:
     if domain:
         tracker.scalar(**{f"reward/{domain}": reward})
 
-    dataset_name = task_data.get("dataset_name")
-    if dataset_name:
-        tracker.scalar(**{f"reward_dataset/{dataset_name}": reward})
-
 
 class RLVRWorkflow(RolloutWorkflow):
     """Single-turn reward learning workflow supporting optional thinking tokens."""
