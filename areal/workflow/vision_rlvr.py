@@ -7,10 +7,9 @@ from typing import Any, cast
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerFast
 
-from areal import workflow_context
 from areal.api import AsyncRewardWrapper, InferenceEngine, ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
-from areal.utils import logging, stats_tracker
+from areal.utils import logging
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.image import image2base64
 from areal.utils.perf_tracer import (
@@ -18,7 +17,7 @@ from areal.utils.perf_tracer import (
     session_context,
     trace_session,
 )
-from areal.workflow.rlvr import RLVRWorkflow
+from areal.workflow.rlvr import RLVRWorkflow, log_reward_metrics
 
 logger = logging.getLogger("VisionRLVRWorkflow")
 
@@ -96,7 +95,7 @@ class VisionRLVRWorkflow(RLVRWorkflow):
 
         reward = await self._compute_rewards(resp, prompt_str, task_data)
 
-        stats_tracker.get(workflow_context.stat_scope()).scalar(reward=reward)
+        log_reward_metrics(reward, task_data)
 
         return resp, reward
 
