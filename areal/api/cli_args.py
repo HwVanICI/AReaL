@@ -3165,6 +3165,13 @@ class DPOConfig(BaseExperimentConfig):
 
 @dataclass
 class TeacherConfig:
+    domain: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional task domain handled by this teacher. Required when "
+            "teacher.routing_mode='domain'."
+        },
+    )
     engine_type: str = field(
         default="rollout",
         metadata={
@@ -3245,6 +3252,20 @@ class TeacherConfig:
 @dataclass
 class DistillationConfig:
     teachers: list[TeacherConfig] = field(default_factory=list)
+    routing_mode: str = field(
+        default="mixture",
+        metadata={
+            "help": "How to choose teachers for a trajectory. 'mixture' sends "
+            "every trajectory to every teacher and mixes log-probs by weight. "
+            "'domain' sends each trajectory only to the teacher whose domain "
+            "matches the trajectory domain.",
+            "choices": ["mixture", "domain"],
+        },
+    )
+    domain_key: str = field(
+        default="domain",
+        metadata={"help": "Trajectory metadata key used when routing_mode='domain'."},
+    )
     rl_loss_weight: float = field(
         default=1.0,
         metadata={"help": "RL loss weight."},
@@ -3258,6 +3279,12 @@ class DistillationConfig:
         if len(self.teachers) == 0:
             raise ValueError("At least one teacher must be provided.")
 
+        if self.routing_mode not in ("mixture", "domain"):
+            raise ValueError(
+                "teacher.routing_mode must be 'mixture' or 'domain', "
+                f"got {self.routing_mode!r}."
+            )
+
         engine_types = {t.engine_type for t in self.teachers}
         if len(engine_types) != 1:
             raise ValueError(
@@ -3270,6 +3297,17 @@ class DistillationConfig:
         total_w = sum(t.weight for t in self.teachers)
         if total_w <= 0:
             raise ValueError("Sum of teacher weights must be positive.")
+
+        if self.routing_mode == "domain":
+            domains = [t.domain for t in self.teachers]
+            if any(domain is None or domain == "" for domain in domains):
+                raise ValueError(
+                    "All teachers must set domain when teacher.routing_mode='domain'."
+                )
+            if len(set(domains)) != len(domains):
+                raise ValueError(
+                    "Teacher domains must be unique when teacher.routing_mode='domain'."
+                )
 
 
 @dataclass
