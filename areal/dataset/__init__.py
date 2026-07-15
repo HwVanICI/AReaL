@@ -54,6 +54,19 @@ def _concatenate_tagged_datasets(datasets: list["Dataset"]) -> "Dataset":
         return Dataset.from_list(rows)
 
 
+def _repeat_dataset_to_length(dataset: "Dataset", target_size: int) -> "Dataset":
+    if len(dataset) == 0:
+        raise ValueError("Cannot equalize an empty dataset source.")
+    if len(dataset) == target_size:
+        return dataset
+
+    repeats, remainder = divmod(target_size, len(dataset))
+    parts = [dataset] * repeats
+    if remainder:
+        parts.append(dataset.shuffle(seed=0).select(range(remainder)))
+    return _concatenate_tagged_datasets(parts)
+
+
 def _get_custom_dataset(
     path: str,
     type: str = "sft",
@@ -198,6 +211,7 @@ def _get_mixed_dataset(
     max_length: int | None = None,
     tokenizer: Optional["PreTrainedTokenizerFast"] = None,
     processor: Optional["ProcessorMixin"] = None,
+    upsample_to_largest: bool = False,
     **kwargs,
 ) -> "Dataset":
     if len(sources) == 0:
@@ -223,6 +237,21 @@ def _get_mixed_dataset(
         dataset = _add_or_replace_column(dataset, "domain", source.domain)
         dataset = _add_or_replace_column(dataset, "dataset_name", source.name)
         datasets.append(dataset)
+
+    if upsample_to_largest:
+        empty_sources = [
+            source.name
+            for source, dataset in zip(sources, datasets)
+            if len(dataset) == 0
+        ]
+        if empty_sources:
+            raise ValueError(
+                "Cannot equalize empty dataset sources: " + ", ".join(empty_sources)
+            )
+        target_size = max(len(dataset) for dataset in datasets)
+        datasets = [
+            _repeat_dataset_to_length(dataset, target_size) for dataset in datasets
+        ]
 
     return _concatenate_tagged_datasets(datasets)
 
@@ -276,6 +305,7 @@ def get_custom_dataset(
                 max_length=dataset_config.max_length,
                 tokenizer=tokenizer,
                 processor=processor,
+                upsample_to_largest=dataset_config.upsample_to_largest,
                 **dataset_kwargs,
             )
 
