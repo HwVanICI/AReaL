@@ -2925,6 +2925,13 @@ class _DatasetConfig:
             "domain and dataset_name, then concatenated into one dataset."
         },
     )
+    upsample_to_largest: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to upsample smaller sources in a mixed dataset to "
+            "the size of the largest source."
+        },
+    )
     batch_size: int = field(
         default=1, metadata={"help": "Batch size for the dataloader"}
     )

@@ -124,6 +124,7 @@ vllm:
 train_dataset:
   batch_size: 32
   shuffle: true
+  upsample_to_largest: false
   pin_memory: true
   num_workers: 4
   scheduling_spec: null

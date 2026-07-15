@@ -153,3 +153,92 @@ def test_get_custom_dataset_with_sources_rejects_remote_rdataset(monkeypatch):
 
     with pytest.raises(ValueError, match="Remote RDataset loading does not support"):
         get_custom_dataset(split="train", dataset_config=cfg)
+
+
+def test_get_custom_dataset_with_sources_equalizes_sizes(monkeypatch):
+    """Smaller mixed-dataset sources are repeated to the largest source size."""
+
+    def _fake_get_custom_dataset(**kwargs):
+        size = 3 if kwargs["path"] == "large-path" else 2
+        return Dataset.from_dict({"value": list(range(size))})
+
+    monkeypatch.setenv("AREAL_SPMD_MODE", "1")
+    monkeypatch.setattr("areal.dataset._get_custom_dataset", _fake_get_custom_dataset)
+    cfg = TrainDatasetConfig(
+        path=None,
+        type=None,
+        scheduling_spec=None,
+        upsample_to_largest=True,
+        datasets=[
+            DatasetSourceConfig(
+                name="large", domain="math", path="large-path", type="rl"
+            ),
+            DatasetSourceConfig(
+                name="small", domain="coding", path="small-path", type="rl"
+            ),
+        ],
+    )
+
+    dataset = get_custom_dataset(split="train", dataset_config=cfg)
+
+    assert len(dataset) == 6
+    assert dataset["dataset_name"].count("large") == 3
+    assert dataset["dataset_name"].count("small") == 3
+
+
+def test_get_custom_dataset_with_sources_keeps_sizes_by_default(monkeypatch):
+    """Mixed-dataset source sizes remain unchanged unless equalization is enabled."""
+
+    def _fake_get_custom_dataset(**kwargs):
+        size = 3 if kwargs["path"] == "large-path" else 2
+        return Dataset.from_dict({"value": list(range(size))})
+
+    monkeypatch.setenv("AREAL_SPMD_MODE", "1")
+    monkeypatch.setattr("areal.dataset._get_custom_dataset", _fake_get_custom_dataset)
+    cfg = TrainDatasetConfig(
+        path=None,
+        type=None,
+        scheduling_spec=None,
+        datasets=[
+            DatasetSourceConfig(
+                name="large", domain="math", path="large-path", type="rl"
+            ),
+            DatasetSourceConfig(
+                name="small", domain="coding", path="small-path", type="rl"
+            ),
+        ],
+    )
+
+    dataset = get_custom_dataset(split="train", dataset_config=cfg)
+
+    assert len(dataset) == 5
+    assert dataset["dataset_name"].count("large") == 3
+    assert dataset["dataset_name"].count("small") == 2
+
+
+def test_get_custom_dataset_with_sources_rejects_empty_equalized_source(monkeypatch):
+    """Equalization rejects empty sources with a clear source-specific error."""
+
+    def _fake_get_custom_dataset(**kwargs):
+        size = 1 if kwargs["path"] == "nonempty-path" else 0
+        return Dataset.from_dict({"value": list(range(size))})
+
+    monkeypatch.setenv("AREAL_SPMD_MODE", "1")
+    monkeypatch.setattr("areal.dataset._get_custom_dataset", _fake_get_custom_dataset)
+    cfg = TrainDatasetConfig(
+        path=None,
+        type=None,
+        scheduling_spec=None,
+        upsample_to_largest=True,
+        datasets=[
+            DatasetSourceConfig(
+                name="nonempty", domain="math", path="nonempty-path", type="rl"
+            ),
+            DatasetSourceConfig(
+                name="empty", domain="coding", path="empty-path", type="rl"
+            ),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="empty dataset sources: empty"):
+        get_custom_dataset(split="train", dataset_config=cfg)
