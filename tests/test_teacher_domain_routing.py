@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from areal.api.cli_args import DistillationConfig
+from areal.api.cli_args import (
+    DistillationConfig,
+    InferenceEngineConfig,
+    SGLangConfig,
+    TeacherConfig,
+    vLLMConfig,
+)
 from areal.trainer.rl_trainer import PPOTrainer
 
 
@@ -48,6 +54,71 @@ def test_distillation_config_owns_loss_settings():
 def test_distillation_config_rejects_invalid_loss_settings(kwargs, message):
     with pytest.raises(ValueError, match=message):
         DistillationConfig(teachers=[_distillation_teacher()], **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("backend", "override", "message"),
+    [
+        ("sglang:d1", {"vllm": vLLMConfig()}, "teacher.vllm"),
+        ("vllm:d1", {"sglang": SGLangConfig()}, "teacher.sglang"),
+    ],
+)
+def test_teacher_config_rejects_backend_override_mismatch(backend, override, message):
+    with pytest.raises(ValueError, match=message):
+        TeacherConfig(
+            rollout=InferenceEngineConfig(backend=backend),
+            **override,
+        )
+
+
+class _FakeRolloutEngine:
+    def __init__(self, config):
+        self.config = config
+        self.train_data_parallel_size = None
+
+    def initialize(self, train_data_parallel_size):
+        self.train_data_parallel_size = train_data_parallel_size
+
+
+@pytest.mark.parametrize("use_override", [False, True])
+def test_init_teacher_rollout_uses_teacher_vllm_override(monkeypatch, use_override):
+    shared_vllm = vLLMConfig(gpu_memory_utilization=0.9)
+    teacher_vllm = vLLMConfig(gpu_memory_utilization=0.5) if use_override else None
+    teacher_config = TeacherConfig(
+        path="teacher-model",
+        rollout=InferenceEngineConfig(backend="vllm:d1"),
+        vllm=teacher_vllm,
+    )
+    trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer.config = SimpleNamespace(vllm=shared_vllm)
+    trainer.teacher_allocs = [
+        SimpleNamespace(
+            backend="vllm",
+            parallel=SimpleNamespace(tp_size=1, pp_size=1),
+        )
+    ]
+    trainer.actor_alloc = SimpleNamespace(parallel=SimpleNamespace(dp_size=2))
+    captured = {}
+
+    def _build_args(vllm_config, tp_size, pp_size):
+        captured["config"] = vllm_config
+        captured["tp_size"] = tp_size
+        captured["pp_size"] = pp_size
+        return {}
+
+    monkeypatch.setattr("areal.trainer.rl_trainer.is_single_controller", lambda: False)
+    monkeypatch.setattr("areal.trainer.rl_trainer.RemotevLLMEngine", _FakeRolloutEngine)
+    monkeypatch.setattr(vLLMConfig, "build_args", _build_args)
+
+    engine = trainer._init_teacher_rollout(teacher_config, 0)
+
+    expected_utilization = 0.5 if use_override else 0.9
+    assert captured["config"].gpu_memory_utilization == expected_utilization
+    assert captured["config"].model == "teacher-model"
+    assert captured["tp_size"] == 1
+    assert captured["pp_size"] == 1
+    assert engine.config.tokenizer_path == "teacher-model"
+    assert engine.train_data_parallel_size == 2
 
 
 def test_assign_domain_teacher_logps_routes_each_trajectory_to_matching_teacher():

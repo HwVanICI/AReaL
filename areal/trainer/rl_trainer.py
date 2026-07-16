@@ -1286,7 +1286,7 @@ class PPOTrainer:
         config = deepcopy(rollout_config)
         if rollout_alloc.backend == "sglang":
             engine_cls = RemoteSGLangEngine
-            teacher_sglang_cfg = deepcopy(self.config.sglang)
+            teacher_sglang_cfg = deepcopy(teacher_config.sglang or self.config.sglang)
             if teacher_config.path:
                 teacher_sglang_cfg.model_path = teacher_config.path
             server_args = SGLangConfig.build_args(
@@ -1297,7 +1297,7 @@ class PPOTrainer:
             )
         elif rollout_alloc.backend == "vllm":
             engine_cls = RemotevLLMEngine
-            teacher_vllm_cfg = deepcopy(self.config.vllm)
+            teacher_vllm_cfg = deepcopy(teacher_config.vllm or self.config.vllm)
             if teacher_config.path:
                 teacher_vllm_cfg.model = teacher_config.path
                 if not rollout_config.tokenizer_path:
