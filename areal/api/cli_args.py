@@ -3209,37 +3209,8 @@ class TeacherConfig:
         default=1.0,
         metadata={"help": "Teacher mixture weight."},
     )
-    distill_loss_type: str = field(
-        default="reverse_kl",
-        metadata={
-            "help": (
-                "Teacher distillation loss. 'reverse_kl' keeps the existing "
-                "reverse-KL penalty; 'mopd_pg' uses the policy-gradient MOPD "
-                "loss with clipped teacher-student log-probability advantage."
-            ),
-            "choices": ["reverse_kl", "mopd_pg"],
-        },
-    )
-    mopd_adv_clip: float = field(
-        default=5.0,
-        metadata={
-            "help": (
-                "Symmetric clipping bound for MOPD policy-gradient advantages. "
-                "Only used when distill_loss_type='mopd_pg'."
-            )
-        },
-    )
 
     def __post_init__(self):
-        if self.distill_loss_type not in ("reverse_kl", "mopd_pg"):
-            raise ValueError(
-                "teacher.distill_loss_type must be 'reverse_kl' or 'mopd_pg', "
-                f"got {self.distill_loss_type!r}."
-            )
-        if self.mopd_adv_clip <= 0:
-            raise ValueError(
-                f"teacher.mopd_adv_clip must be positive, got {self.mopd_adv_clip}."
-            )
         if self.rollout is not None and self.train is not None:
             warnings.warn(
                 "Both teacher.rollout and teacher.train are configured; "
@@ -3281,10 +3252,40 @@ class DistillationConfig:
         default=5e-3,
         metadata={"help": "Distillation loss weight."},
     )
+    distill_loss_type: str = field(
+        default="reverse_kl",
+        metadata={
+            "help": (
+                "Distillation loss. 'reverse_kl' keeps the existing reverse-KL "
+                "penalty; 'mopd_pg' uses the policy-gradient MOPD loss with "
+                "clipped teacher-student log-probability advantage."
+            ),
+            "choices": ["reverse_kl", "mopd_pg"],
+        },
+    )
+    mopd_adv_clip: float = field(
+        default=5.0,
+        metadata={
+            "help": (
+                "Symmetric clipping bound for MOPD policy-gradient advantages. "
+                "Only used when distill_loss_type='mopd_pg'."
+            )
+        },
+    )
 
     def __post_init__(self):
         if len(self.teachers) == 0:
             raise ValueError("At least one teacher must be provided.")
+
+        if self.distill_loss_type not in ("reverse_kl", "mopd_pg"):
+            raise ValueError(
+                "teacher.distill_loss_type must be 'reverse_kl' or 'mopd_pg', "
+                f"got {self.distill_loss_type!r}."
+            )
+        if self.mopd_adv_clip <= 0:
+            raise ValueError(
+                f"teacher.mopd_adv_clip must be positive, got {self.mopd_adv_clip}."
+            )
 
         if self.routing_mode not in ("mixture", "domain"):
             raise ValueError(

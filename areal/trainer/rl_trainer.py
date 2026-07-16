@@ -147,9 +147,6 @@ class PPOTrainer:
             config.critic is not None and config.critic.offload
         )
         self._should_offload_ref = config.ref is not None and config.ref.offload
-        self._should_offload_teacher = (
-            config.teacher is not None and config.teacher.offload
-        )
         teacher_configs = config.teacher.teachers if config.teacher is not None else []
         self._should_offload_teacher = any(t.offload for t in teacher_configs)
 
@@ -549,16 +546,12 @@ class PPOTrainer:
             if teacher_config.offload:
                 self._offload_model(teacher, role=f"teacher-{idx}")
 
-    def _set_distillation_fields(
-        self,
-        traj: dict[str, Any],
-        teacher_config: TeacherConfig,
-    ) -> None:
+    def _set_distillation_fields(self, traj: dict[str, Any]) -> None:
         assert self.config.teacher is not None
         traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
         traj["distill_loss_weight"] = self.config.teacher.distill_loss_weight
-        traj["distill_loss_type"] = teacher_config.distill_loss_type
-        traj["mopd_adv_clip"] = teacher_config.mopd_adv_clip
+        traj["distill_loss_type"] = self.config.teacher.distill_loss_type
+        traj["mopd_adv_clip"] = self.config.teacher.mopd_adv_clip
 
     def _trajectory_for_teacher(self, traj: dict[str, Any]) -> dict[str, Any]:
         assert self.config.teacher is not None
@@ -583,7 +576,6 @@ class PPOTrainer:
                 device=per_teacher_logps[0][0].device,
             )
         )
-        teacher_config = self.teacher_configs[0]
         for traj_idx, traj in enumerate(rollout_batch):
             stacked = torch.stack(
                 [teacher_logps[traj_idx] for teacher_logps in per_teacher_logps],
@@ -592,7 +584,7 @@ class PPOTrainer:
             traj["teacher_logp"] = torch.logsumexp(
                 stacked + log_weights[:, None, None], dim=0
             )
-            self._set_distillation_fields(traj, teacher_config)
+            self._set_distillation_fields(traj)
 
     def _assign_domain_teacher_logps(self, rollout_batch: list[dict[str, Any]]) -> None:
         assert self.config.teacher is not None
@@ -626,7 +618,6 @@ class PPOTrainer:
 
             for teacher_idx, future in futures.items():
                 teacher_logps = RTensor.localize(future.result())
-                teacher_config = self.teacher_configs[teacher_idx]
                 traj_indices = teacher_to_traj_indices[teacher_idx]
                 for traj_idx, teacher_logp in zip(
                     traj_indices,
@@ -635,7 +626,7 @@ class PPOTrainer:
                 ):
                     traj = rollout_batch[traj_idx]
                     traj["teacher_logp"] = teacher_logp
-                    self._set_distillation_fields(traj, teacher_config)
+                    self._set_distillation_fields(traj)
 
     def _assign_teacher_logps(self, rollout_batch: list[dict[str, Any]]) -> None:
         assert self.config.teacher is not None

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from areal.api.cli_args import DistillationConfig
 from areal.trainer.rl_trainer import PPOTrainer
 
 
@@ -18,11 +20,34 @@ class _FakeTeacher:
 
 
 def _teacher_config(domain: str):
-    return SimpleNamespace(
-        domain=domain,
-        distill_loss_type="reverse_kl",
-        mopd_adv_clip=5.0,
+    return SimpleNamespace(domain=domain)
+
+
+def _distillation_teacher():
+    return SimpleNamespace(engine_type="rollout", weight=1.0, domain=None)
+
+
+def test_distillation_config_owns_loss_settings():
+    config = DistillationConfig(
+        teachers=[_distillation_teacher()],
+        distill_loss_type="mopd_pg",
+        mopd_adv_clip=3.0,
     )
+
+    assert config.distill_loss_type == "mopd_pg"
+    assert config.mopd_adv_clip == 3.0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"distill_loss_type": "invalid"}, "teacher.distill_loss_type"),
+        ({"mopd_adv_clip": 0.0}, "teacher.mopd_adv_clip"),
+    ],
+)
+def test_distillation_config_rejects_invalid_loss_settings(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        DistillationConfig(teachers=[_distillation_teacher()], **kwargs)
 
 
 def test_assign_domain_teacher_logps_routes_each_trajectory_to_matching_teacher():
@@ -35,6 +60,8 @@ def test_assign_domain_teacher_logps_routes_each_trajectory_to_matching_teacher(
             domain_key="domain",
             rl_loss_weight=1.0,
             distill_loss_weight=0.25,
+            distill_loss_type="mopd_pg",
+            mopd_adv_clip=3.0,
         )
     )
     trainer.teachers = [_FakeTeacher(1.0), _FakeTeacher(2.0)]
@@ -89,3 +116,6 @@ def test_assign_domain_teacher_logps_routes_each_trajectory_to_matching_teacher(
         atol=0,
     )
     assert rollout_batch[0]["distill_loss_weight"] == 0.25
+    assert rollout_batch[0]["distill_loss_type"] == "mopd_pg"
+    assert rollout_batch[0]["mopd_adv_clip"] == 3.0
+    assert rollout_batch[1]["distill_loss_type"] == "mopd_pg"
