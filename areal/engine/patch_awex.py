@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import importlib
 import os
+import pkgutil
 import time
 
 import torch
@@ -406,8 +408,66 @@ def _patch_colocate_writer():
     )
 
 
+def _patch_meta_resolver_for_vlm():
+    import awex
+
+    _orig_init = awex.meta.meta_resolver.ParamMetaResolver.__init__
+
+    def init_for_vlm(self, hf_config):
+        if hasattr(hf_config, "text_config") and hf_config.text_config:
+            if not hasattr(hf_config, "num_hidden_layers"):
+                setattr(
+                    hf_config,
+                    "num_hidden_layers",
+                    hf_config.text_config.num_hidden_layers,
+                )
+        _orig_init(self, hf_config)
+
+    awex.meta.meta_resolver.ParamMetaResolver.__init__ = init_for_vlm
+
+
+def _import_model_configs():
+    model_arch_name_to_config = {}
+    package_name = "areal.engine.models"
+    package = importlib.import_module(package_name)
+    for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
+        if not ispkg:
+            module = importlib.import_module(name)
+            if hasattr(module, "CONFIG"):
+                entry = module.CONFIG
+                if isinstance(entry, list):
+                    for tmp in entry:
+                        model_name = tmp["model_name"]
+                        assert model_name not in model_arch_name_to_config, (
+                            f"Duplicated model config for {model_name}"
+                        )
+                        model_arch_name_to_config[model_name] = tmp
+                else:
+                    model_name = entry["model_name"]
+                    assert model_name not in model_arch_name_to_config, (
+                        f"Duplicated model config for {model_name}"
+                    )
+                    model_arch_name_to_config[model_name] = entry
+
+    return model_arch_name_to_config
+
+
+def _registry_models():
+    from awex.models.registry import ModelRegistry
+
+    model_dict = _import_model_configs()
+    for model_name, config in model_dict.items():
+        if model_name in ModelRegistry.models:
+            print(f"model {model_name} already registered, skipping.", flush=True)
+            continue
+        ModelRegistry.models[model_name] = config
+        print(f"areal register model {model_name} for awex success.", flush=True)
+
+
 def patch_awex():
+    _registry_models()
     _patch_vllm_adapter()
     _patch_nccl_comm()
     _patch_colocate_reader()
     _patch_colocate_writer()
+    _patch_meta_resolver_for_vlm()

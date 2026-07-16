@@ -62,9 +62,11 @@ def _apply_ascend_patch_once():
 
 
 _apply_ascend_patch_once()
+
+
 def _apply_ascend_patch_awex():
     try:
-        from areal.engine.patch_awex_for_colocate import patch_awex
+        from areal.engine.patch_awex import patch_awex
 
         patch_awex()
         print("patching awex success for vllm worker process.", flush=True)
