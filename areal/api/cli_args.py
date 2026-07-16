@@ -3188,6 +3188,20 @@ class TeacherConfig:
         },
     )
     rollout: InferenceEngineConfig | None = field(default=None)
+    vllm: vLLMConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Optional vLLM runtime override for this teacher. Defaults "
+            "to the top-level vllm config."
+        },
+    )
+    sglang: SGLangConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Optional SGLang runtime override for this teacher. Defaults "
+            "to the top-level sglang config."
+        },
+    )
     train: PPOActorConfig | None = field(
         default=None,
         metadata={
@@ -3222,6 +3236,19 @@ class TeacherConfig:
             raise ValueError(
                 "teacher.rollout must be provided when engine_type='rollout'."
             )
+
+        if self.engine_type == "rollout" and self.rollout is not None:
+            backend = self.rollout.backend.split(":", maxsplit=1)[0]
+            if self.vllm is not None and backend != "vllm":
+                raise ValueError(
+                    "teacher.vllm can only be set when teacher.rollout.backend "
+                    "uses vllm."
+                )
+            if self.sglang is not None and backend != "sglang":
+                raise ValueError(
+                    "teacher.sglang can only be set when teacher.rollout.backend "
+                    "uses sglang."
+                )
 
         if self.engine_type == "train" and self.train is None:
             raise ValueError("teacher.train must be provided when engine_type='train'.")
