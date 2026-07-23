@@ -329,7 +329,16 @@ class McoreToHFWeightConverterQwen3VL(McoreToHFWeightConverter):
         else:
             raise NotImplementedError(f"Unsupported GDN parameter name: {name}")
 
-    def _is_linear_attn_layer(self, layer_number: int) -> bool:
+    def _is_linear_attn_layer(self, layer_number: int, name: str) -> bool:
+        # first time here,self._pp_stage_layer_id_map is {}
+        # when pp > 1,layer_number is local rank。it does not support the num_hidden_layers % (pp * full_attention_interval) != 0
+        if not self._pp_stage_layer_id_map:
+            gdn_keys = ["dt_bias", "A_log", "in_proj", "conv1d", "out_norm", "out_proj"]
+            for key in gdn_keys:
+                if key in name:
+                    return True
+            return False
+
         text_config = self.hf_config
         layer_types = getattr(text_config, "layer_types", [])
         if layer_types:
@@ -352,7 +361,7 @@ class McoreToHFWeightConverterQwen3VL(McoreToHFWeightConverter):
         layer_str = rest.split(".", 1)[0]
         layer_number = int(layer_str)
 
-        if self._is_linear_attn_layer(layer_number):
+        if self._is_linear_attn_layer(layer_number, name):
             # GDN linear attention
             converted = []
             for sub_name, param in self._convert_gdn_param(
