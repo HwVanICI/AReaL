@@ -165,7 +165,6 @@ class McoreToHFWeightConverterQwen3VL(McoreToHFWeightConverter):
     def __init__(self, hf_config, rank_info, infer_conf, tf_config):
         super().__init__(hf_config.text_config, rank_info, infer_conf, tf_config)
         self.vision_config = hf_config.vision_config
-        self.hf_config = hf_config
 
     def _fuse_qkv(self, name: str) -> bool:
         return True
@@ -331,7 +330,7 @@ class McoreToHFWeightConverterQwen3VL(McoreToHFWeightConverter):
             raise NotImplementedError(f"Unsupported GDN parameter name: {name}")
 
     def _is_linear_attn_layer(self, layer_number: int) -> bool:
-        text_config = self.hf_config.text_config
+        text_config = self.hf_config
         layer_types = getattr(text_config, "layer_types", [])
         if layer_types:
             return layer_types[layer_number] == "linear_attention"
