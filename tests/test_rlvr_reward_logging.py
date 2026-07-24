@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import pytest
 
+from areal.experimental.openai.proxy.workflow import (
+    _log_interaction_reward_metrics,
+)
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import stats_tracker
 from areal.workflow.rlvr import log_reward_metrics
 
@@ -13,12 +17,11 @@ def reset_stats_tracker():
     stats_tracker.export_all(reset=True)
 
 
-def test_log_reward_metrics_records_domain_and_dataset_rewards():
+def test_log_reward_metrics_records_domain_reward():
     log_reward_metrics(
         0.75,
         {
             "domain": "math",
-            "dataset_name": "gsm8k",
         },
     )
 
@@ -26,7 +29,6 @@ def test_log_reward_metrics_records_domain_and_dataset_rewards():
 
     assert stats["rollout/reward"] == pytest.approx(0.75)
     assert stats["rollout/reward/math"] == pytest.approx(0.75)
-    assert stats["rollout/reward_dataset/gsm8k"] == pytest.approx(0.75)
 
 
 def test_log_reward_metrics_keeps_aggregate_reward_without_task_metadata():
@@ -36,4 +38,15 @@ def test_log_reward_metrics_keeps_aggregate_reward_without_task_metadata():
 
     assert stats["rollout/reward"] == pytest.approx(0.25)
     assert not any(key.startswith("rollout/reward/") for key in stats)
-    assert not any(key.startswith("rollout/reward_dataset/") for key in stats)
+
+
+def test_agent_reward_metrics_records_domain_reward():
+    interactions = {
+        "response-1": InteractionWithTokenLogpReward(reward=0.5),
+    }
+
+    _log_interaction_reward_metrics(interactions, {"domain": "leetcode"})
+
+    stats = stats_tracker.export_all(reset=True)
+    assert stats["rollout/reward"] == pytest.approx(0.5)
+    assert stats["rollout/reward/leetcode"] == pytest.approx(0.5)

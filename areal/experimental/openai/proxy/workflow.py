@@ -13,8 +13,9 @@ import aiohttp
 
 from areal.api import RolloutWorkflow
 from areal.infra import workflow_context
-from areal.utils import logging, stats_tracker
+from areal.utils import logging
 from areal.utils.perf_tracer import session_context, trace_session
+from areal.workflow.reward_metrics import log_reward_metrics
 
 from .client_session import OpenAIProxyClient
 from .server import DEFAULT_ADMIN_API_KEY, GRANT_CAPACITY_PATHNAME
@@ -31,6 +32,17 @@ logger = logging.getLogger("OpenAIProxyWorkflow")
 _executor: ProcessPoolExecutor | None = None
 _executor_lock = threading.Lock()
 _executor_max_workers: int | None = None
+
+
+def _log_interaction_reward_metrics(
+    interactions: dict[str, InteractionWithTokenLogpReward],
+    task_data: dict[str, Any],
+) -> None:
+    if not interactions:
+        return
+    last_reward = next(reversed(interactions.values())).reward
+    if last_reward is not None:
+        log_reward_metrics(last_reward, task_data)
 
 
 def _get_executor(max_workers: int = 4) -> ProcessPoolExecutor:
@@ -206,10 +218,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 )
                 return None
 
-            # Record stats
-            last_id = next(reversed(interactions))
-            last_reward = interactions[last_id].reward
-            stats_tracker.get(workflow_context.stat_scope()).scalar(reward=last_reward)
+            _log_interaction_reward_metrics(interactions, data)
             return interactions
 
         # ---- Normal mode (inline / subproc) ----
@@ -248,10 +257,6 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             style=self.export_style,
         )
 
-        # Record stats
-        last_id = list(interactions.keys())[-1] if interactions else None
-        if last_id and interactions:
-            last_reward = interactions[last_id].reward
-            stats_tracker.get(workflow_context.stat_scope()).scalar(reward=last_reward)
+        _log_interaction_reward_metrics(interactions, data)
 
         return interactions
