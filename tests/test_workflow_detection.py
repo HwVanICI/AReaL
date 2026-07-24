@@ -32,9 +32,11 @@ class TestWorkflowDetection:
         from areal.trainer import PPOTrainer
 
         class MinimalTrainer:
-            def _requires_proxy_workflow(self, workflow):
+            def _requires_proxy_workflow(self, workflow, workflow_kwargs=None):
                 # Copy the implementation from PPOTrainer
-                return PPOTrainer._requires_proxy_workflow(self, workflow)
+                return PPOTrainer._requires_proxy_workflow(
+                    self, workflow, workflow_kwargs
+                )
 
         return MinimalTrainer()
 
@@ -107,6 +109,41 @@ class TestWorkflowDetection:
         """
         workflow = "tests.experimental.openai.utils.SimpleAgent"
         assert trainer_with_detection._requires_proxy_workflow(workflow)
+
+    def test_domain_router_with_agent_child_requires_proxy(
+        self, trainer_with_detection
+    ):
+        workflow = "areal.workflow.DomainRouterRolloutWorkflow"
+        workflow_kwargs = {
+            "workflows": {
+                "math": {
+                    "workflow": DummyAgentNonInheriting,
+                },
+                "rlvr": {
+                    "workflow": DummyRolloutWorkflow,
+                },
+            }
+        }
+
+        assert trainer_with_detection._requires_proxy_workflow(
+            workflow, workflow_kwargs
+        )
+
+    def test_domain_router_with_rollout_children_does_not_require_proxy(
+        self, trainer_with_detection
+    ):
+        workflow = "areal.workflow.DomainRouterRolloutWorkflow"
+        workflow_kwargs = {
+            "workflows": {
+                "math": {
+                    "workflow": DummyRolloutWorkflow,
+                },
+            }
+        }
+
+        assert not trainer_with_detection._requires_proxy_workflow(
+            workflow, workflow_kwargs
+        )
 
 
 class TestAgentWorkflowDeprecation:

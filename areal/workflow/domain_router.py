@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,7 +14,16 @@ from areal.utils.dynamic_import import import_from_string
 
 def _tag_result_domain(result: Any, domain_key: str, domain: str) -> Any:
     if isinstance(result, dict):
-        result.setdefault(domain_key, domain)
+        from areal.experimental.openai.types import InteractionWithTokenLogpReward
+
+        if result and all(
+            isinstance(value, InteractionWithTokenLogpReward)
+            for value in result.values()
+        ):
+            for interaction in result.values():
+                interaction.trajectory_metadata.setdefault(domain_key, domain)
+        else:
+            result.setdefault(domain_key, domain)
     return result
 
 
@@ -100,14 +109,21 @@ class DomainRouterWorkflow:
 
 
 class DomainRouterRolloutWorkflow(RolloutWorkflow):
-    """Route RolloutWorkflow episodes by a domain key in each sample."""
+    """Route rollout or agent workflow episodes by a sample domain.
+
+    Agent-style children are resolved by the inference engine and wrapped in an
+    OpenAI proxy workflow before this router is constructed.
+    """
 
     def __init__(
         self,
         workflows: Mapping[str, Any],
         domain_key: str = "domain",
+        _workflow_resolver: Callable[[Any, dict[str, Any]], RolloutWorkflow]
+        | None = None,
     ) -> None:
         self.domain_key = domain_key
+        self._workflow_resolver = _workflow_resolver
         self.workflows = {
             domain: self._build_workflow(domain, spec)
             for domain, spec in workflows.items()
@@ -132,7 +148,7 @@ class DomainRouterRolloutWorkflow(RolloutWorkflow):
         return _tag_result_domain(result, self.domain_key, domain)
 
     @staticmethod
-    def _build_workflow(domain: str, spec: Any) -> RolloutWorkflow:
+    def _parse_workflow_spec(domain: str, spec: Any) -> tuple[Any, dict[str, Any]]:
         if isinstance(spec, Mapping):
             workflow = spec.get("workflow")
             if workflow is None:
@@ -144,11 +160,35 @@ class DomainRouterRolloutWorkflow(RolloutWorkflow):
         else:
             workflow = spec
             kwargs = {}
+        return workflow, dict(kwargs)
 
-        workflow_obj = DomainRouterWorkflow._instantiate_workflow(workflow, kwargs)
+    def _build_workflow(self, domain: str, spec: Any) -> RolloutWorkflow:
+        workflow, kwargs = self._parse_workflow_spec(domain, spec)
+        if self._workflow_resolver is not None:
+            workflow_obj = self._workflow_resolver(workflow, kwargs)
+        else:
+            workflow_obj = DomainRouterWorkflow._instantiate_workflow(workflow, kwargs)
         if not isinstance(workflow_obj, RolloutWorkflow):
             raise TypeError(
-                f"Workflow for domain {domain!r} must be a RolloutWorkflow, got "
-                f"{type(workflow_obj).__name__}."
+                f"Workflow for domain {domain!r} must be a RolloutWorkflow when "
+                "DomainRouterRolloutWorkflow is constructed directly. Agent-style "
+                "workflows are supported when the router is passed to an inference "
+                f"engine, got {type(workflow_obj).__name__}."
             )
         return workflow_obj
+
+    @classmethod
+    def _from_workflow_resolver(
+        cls,
+        workflow_resolver: Callable[[Any, dict[str, Any]], RolloutWorkflow],
+        **kwargs: Any,
+    ) -> DomainRouterRolloutWorkflow:
+        return cls(_workflow_resolver=workflow_resolver, **kwargs)
+
+    @classmethod
+    def _iter_workflow_specs(
+        cls, workflow_kwargs: Mapping[str, Any]
+    ) -> Iterable[tuple[Any, dict[str, Any]]]:
+        workflows = workflow_kwargs.get("workflows", {})
+        for domain, spec in workflows.items():
+            yield cls._parse_workflow_spec(domain, spec)

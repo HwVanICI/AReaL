@@ -761,7 +761,9 @@ class PPOTrainer:
                     "agent.mode='online' is configured. "
                     "Pass a RolloutWorkflow, AgentWorkflow, or callable."
                 )
-        elif self._requires_proxy_workflow(workflow):
+        elif self._requires_proxy_workflow(
+            workflow, workflow_kwargs
+        ) or self._requires_proxy_workflow(eval_workflow, eval_workflow_kwargs):
             self._ensure_proxy_started()
 
         for global_step in range(start_step, max_steps):
@@ -1520,7 +1522,11 @@ class PPOTrainer:
                 f"('{rollout_version}') must match. Both must be 'v1' or both 'v2'."
             )
 
-    def _requires_proxy_workflow(self, workflow: WorkflowLike | None) -> bool:
+    def _requires_proxy_workflow(
+        self,
+        workflow: WorkflowLike | None,
+        workflow_kwargs: dict[str, Any] | None = None,
+    ) -> bool:
         """Check if workflow requires proxy workers (i.e., not a RolloutWorkflow).
 
         Returns True if:
@@ -1535,6 +1541,23 @@ class PPOTrainer:
         if workflow is None:
             return False
 
+        resolved_workflow = workflow
+        if isinstance(workflow, str):
+            from areal.utils.dynamic_import import import_from_string
+
+            try:
+                resolved_workflow = import_from_string(workflow)
+            except (ValueError, ImportError, AttributeError):
+                # If import fails, assume it needs proxy (fail-safe)
+                return True
+
+        workflow_specs = getattr(resolved_workflow, "_iter_workflow_specs", None)
+        if callable(workflow_specs):
+            return any(
+                self._requires_proxy_workflow(child, child_kwargs)
+                for child, child_kwargs in workflow_specs(workflow_kwargs or {})
+            )
+
         # Direct RolloutWorkflow instances
         if isinstance(workflow, RolloutWorkflow):
             return False
@@ -1545,19 +1568,11 @@ class PPOTrainer:
 
         # String import paths
         if isinstance(workflow, str):
-            from areal.utils.dynamic_import import import_from_string
-
-            try:
-                imported_obj = import_from_string(workflow)
-            except (ValueError, ImportError, AttributeError):
-                # If import fails, assume it needs proxy (fail-safe)
-                return True
-
             # Check if imported object is RolloutWorkflow
-            if isinstance(imported_obj, RolloutWorkflow):
+            if isinstance(resolved_workflow, RolloutWorkflow):
                 return False
-            if isinstance(imported_obj, type) and issubclass(
-                imported_obj, RolloutWorkflow
+            if isinstance(resolved_workflow, type) and issubclass(
+                resolved_workflow, RolloutWorkflow
             ):
                 return False
 
