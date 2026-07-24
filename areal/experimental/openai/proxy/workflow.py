@@ -42,7 +42,7 @@ def _log_interaction_reward_metrics(
         return
     last_reward = next(reversed(interactions.values())).reward
     if last_reward is not None:
-        log_reward_metrics(last_reward, task_data)
+        log_reward_metrics(last_reward, task_data, n_seqs=len(interactions))
 
 
 def _get_executor(max_workers: int = 4) -> ProcessPoolExecutor:
