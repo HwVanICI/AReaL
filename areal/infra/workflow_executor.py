@@ -33,11 +33,11 @@ from areal.infra import workflow_context
 from .workflow_context import WorkflowContext
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
-    concat_string_interactions,
+    interactions_to_trajectory,
 )
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
-from areal.utils.data import concat_padded_tensors, cycle_dataloader
+from areal.utils.data import cycle_dataloader
 from areal.utils.perf_tracer import trace_perf, trace_session_event
 from logging import Logger
 
@@ -1167,12 +1167,7 @@ class WorkflowExecutor:
                 if isinstance(traj, dict) and all(
                     isinstance(v, InteractionWithTokenLogpReward) for v in traj.values()
                 ):
-                    if all(v.has_tensor_data for v in traj.values()):
-                        traj = concat_padded_tensors(
-                            [v.to_tensor_dict() for v in traj.values()]
-                        )
-                    else:
-                        traj = concat_string_interactions(traj)
+                    traj = interactions_to_trajectory(traj)
 
                 assert traj is None or isinstance(traj, dict), traj
 

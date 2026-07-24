@@ -631,6 +631,24 @@ class RemoteInfEngine(InferenceEngine):
     ) -> RolloutWorkflow:
         resolved: RolloutWorkflow
 
+        def instantiate_rollout_workflow(
+            workflow_cls: type[RolloutWorkflow],
+            kwargs: dict[str, Any],
+        ) -> RolloutWorkflow:
+            resolver_factory = getattr(workflow_cls, "_from_workflow_resolver", None)
+            if callable(resolver_factory):
+                return resolver_factory(
+                    workflow_resolver=lambda child, child_kwargs: (
+                        self._resolve_workflow(
+                            child,
+                            child_kwargs,
+                            proxy_addr=proxy_addr,
+                        )
+                    ),
+                    **kwargs,
+                )
+            return workflow_cls(**kwargs)
+
         # 0. None workflow = online mode (config-driven)
         if workflow is None:
             agent_cfg = self.config.agent
@@ -661,7 +679,7 @@ class RemoteInfEngine(InferenceEngine):
                     f"workflow_kwargs is required when workflow is a class. "
                     f"Got workflow={workflow}, but workflow_kwargs=None."
                 )
-            resolved = workflow(**workflow_kwargs)
+            resolved = instantiate_rollout_workflow(workflow, workflow_kwargs)
 
         # 3. String import path
         elif isinstance(workflow, str):
@@ -681,7 +699,7 @@ class RemoteInfEngine(InferenceEngine):
                         f"workflow_kwargs is required when workflow is a class or string. "
                         f"Got workflow={workflow}, but workflow_kwargs=None."
                     )
-                resolved = imported_obj(**workflow_kwargs)
+                resolved = instantiate_rollout_workflow(imported_obj, workflow_kwargs)
 
             # Check if it's a RolloutWorkflow instance
             elif isinstance(imported_obj, RolloutWorkflow):
