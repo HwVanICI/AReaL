@@ -7,7 +7,6 @@ from typing import Any
 import torch
 from transformers import PreTrainedTokenizerFast
 
-from areal import workflow_context
 from areal.api import (
     AsyncRewardWrapper,
     InferenceEngine,
@@ -16,7 +15,7 @@ from areal.api import (
     RolloutWorkflow,
 )
 from areal.api.cli_args import GenerationHyperparameters
-from areal.utils import logging, stats_tracker
+from areal.utils import logging
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.hf_utils import apply_chat_template
 from areal.utils.perf_tracer import (
@@ -24,6 +23,7 @@ from areal.utils.perf_tracer import (
     session_context,
     trace_session,
 )
+from areal.workflow.reward_metrics import log_reward_metrics
 
 logger = logging.getLogger("RLVRWorkflow")
 
@@ -44,15 +44,6 @@ def default_get_input_ids_fn(
 
 def default_data_extract_prompt_fn(data: dict[str, Any]) -> Any:
     return data["messages"]
-
-
-def log_reward_metrics(reward: float, task_data: dict[str, Any]) -> None:
-    tracker = stats_tracker.get(workflow_context.stat_scope())
-    tracker.scalar(reward=reward)
-
-    domain = task_data.get("domain")
-    if domain:
-        tracker.scalar(**{f"reward/{domain}": reward})
 
 
 class RLVRWorkflow(RolloutWorkflow):
