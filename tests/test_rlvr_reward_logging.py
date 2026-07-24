@@ -29,6 +29,7 @@ def test_log_reward_metrics_records_domain_reward():
 
     assert stats["rollout/reward"] == pytest.approx(0.75)
     assert stats["rollout/reward/math"] == pytest.approx(0.75)
+    assert stats["rollout/n_seqs/math"] == 1
 
 
 def test_log_reward_metrics_keeps_aggregate_reward_without_task_metadata():
@@ -43,10 +44,12 @@ def test_log_reward_metrics_keeps_aggregate_reward_without_task_metadata():
 def test_agent_reward_metrics_records_domain_reward():
     interactions = {
         "response-1": InteractionWithTokenLogpReward(reward=0.5),
+        "response-2": InteractionWithTokenLogpReward(reward=1.0),
     }
 
     _log_interaction_reward_metrics(interactions, {"domain": "leetcode"})
 
     stats = stats_tracker.export_all(reset=True)
-    assert stats["rollout/reward"] == pytest.approx(0.5)
-    assert stats["rollout/reward/leetcode"] == pytest.approx(0.5)
+    assert stats["rollout/reward"] == pytest.approx(1.0)
+    assert stats["rollout/reward/leetcode"] == pytest.approx(1.0)
+    assert stats["rollout/n_seqs/leetcode"] == 2
