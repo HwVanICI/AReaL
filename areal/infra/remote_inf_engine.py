@@ -10,7 +10,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from logging import Logger
 from threading import Lock
@@ -539,17 +539,18 @@ class RemoteInfEngine(InferenceEngine):
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
         results: list[torch.Tensor] = []
+        score_jobs: list[tuple[int, int, list[int], int, str]] = []
         timeout = self.config.request_timeout
         version = self.get_version()
-        for traj in data:
+        for traj_idx, traj in enumerate(data):
             input_ids = traj["input_ids"]
             loss_mask = traj["loss_mask"]
             if input_ids.dim() != 2 or loss_mask.dim() != 2:
                 raise ValueError("input_ids and loss_mask must be 2D tensors")
             bs = input_ids.shape[0]
             out = torch.zeros_like(loss_mask, dtype=torch.float32)
+            results.append(out)
             for i in range(bs):
-                token_ids = input_ids[i].tolist()
                 target_len = int(loss_mask[i].sum().item())
                 if target_len <= 0:
                     continue
@@ -559,31 +560,55 @@ class RemoteInfEngine(InferenceEngine):
                     token_ids = input_ids[i, active_idx].tolist()
                 else:
                     token_ids = input_ids[i].tolist()
-                server_addr = self.choose_server()
-                http_req = self.backend.build_score_request(
-                    input_ids=token_ids,
-                    target_len=target_len,
-                    with_lora=self.config.use_lora,
-                    version=version,
+                score_jobs.append(
+                    (traj_idx, i, token_ids, target_len, self.choose_server())
                 )
-                response = requests.request(
-                    http_req.method,
-                    f"http://{server_addr}{http_req.endpoint}",
-                    json=http_req.payload,
-                    timeout=timeout,
+
+        def score_sequence(
+            job: tuple[int, int, list[int], int, str],
+        ) -> tuple[int, int, list[float]]:
+            traj_idx, row_idx, token_ids, target_len, server_addr = job
+            http_req = self.backend.build_score_request(
+                input_ids=token_ids,
+                target_len=target_len,
+                with_lora=self.config.use_lora,
+                version=version,
+            )
+            response = requests.request(
+                http_req.method,
+                f"http://{server_addr}{http_req.endpoint}",
+                json=http_req.payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            token_logps = self.backend.parse_score_response(payload, target_len)
+            if len(token_logps) != target_len:
+                raise ValueError(
+                    f"Expected {target_len} token logprobs, got {len(token_logps)}"
                 )
-                response.raise_for_status()
-                payload = response.json()
-                token_logps = self.backend.parse_score_response(payload, target_len)
-                if len(token_logps) != target_len:
-                    raise ValueError(
-                        f"Expected {target_len} token logprobs, got {len(token_logps)}"
-                    )
-                write_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
-                out[i, write_idx] = torch.tensor(
-                    token_logps, device=out.device, dtype=out.dtype
+            return traj_idx, row_idx, token_logps
+
+        if not score_jobs:
+            return results
+
+        max_workers = self.config.max_concurrent_rollouts
+        if max_workers is None:
+            max_workers = self.config.consumer_batch_size
+        max_workers = max(1, min(max_workers, len(score_jobs)))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            scored_sequences = executor.map(score_sequence, score_jobs)
+            for traj_idx, row_idx, token_logps in scored_sequences:
+                loss_mask = data[traj_idx]["loss_mask"]
+                write_idx = torch.nonzero(loss_mask[row_idx], as_tuple=False).squeeze(
+                    -1
                 )
-            results.append(out)
+                results[traj_idx][row_idx, write_idx] = torch.tensor(
+                    token_logps,
+                    device=results[traj_idx].device,
+                    dtype=results[traj_idx].dtype,
+                )
         return results
 
     def set_proxy_gateway_addr(self, addr: str) -> None:
