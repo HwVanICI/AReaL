@@ -242,11 +242,13 @@ def _patch_colocate_reader():
         logger.info(
             f"Barrier passed for reader step {step_id} with rank {self.transfer_rank}"
         )
+        write_finished_key = f"write_finished{key_suffix}"
+        self.meta_server_client.get_object_then_delete(write_finished_key)
         gc.collect()
         if device_util.get_device_type() == "cuda":
             torch.cuda.empty_cache()
-        write_finished_key = f"write_finished{key_suffix}"
-        self.meta_server_client.get_object_then_delete(write_finished_key)
+        if device_util.get_device_type() == "npu":
+            torch.npu.empty_cache()
         logger.info(
             f"Finished updating weights in colocate mode for rank {self.transfer_rank}"
         )
@@ -384,6 +386,8 @@ def _patch_colocate_writer():
         gc.collect()
         if device_util.get_device_type() == "cuda":
             torch.cuda.empty_cache()
+        if device_util.get_device_type() == "npu":
+            torch.npu.empty_cache()
         print_current_gpu_status(
             f"after clear group_shared for rank {self.transfer_rank}"
         )
