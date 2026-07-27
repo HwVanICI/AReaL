@@ -182,7 +182,7 @@ class RemoteInfBackendProtocol(Protocol):
     def parse_score_response(
         self, response: dict[str, Any], target_len: int
     ) -> list[float]:
-        """Parse token log-prob scoring response."""
+        """Parse token-aligned scores for the final ``target_len`` input tokens."""
         ...
 
     def build_disk_weight_update_requests(
@@ -538,8 +538,16 @@ class RemoteInfEngine(InferenceEngine):
             return self._version
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        """Score masked tokens and return prediction-position-aligned log-probs.
+
+        Remote backends return token-aligned prompt scores. This method maps each
+        selected token at position ``t`` to its causal prediction position ``t - 1``
+        to satisfy :meth:`InferenceEngine.compute_logp`.
+        """
         results: list[torch.Tensor] = []
-        score_jobs: list[tuple[int, int, list[int], int, str]] = []
+        score_jobs: list[
+            tuple[int, int, list[int], int, list[int], list[int], str]
+        ] = []
         timeout = self.config.request_timeout
         version = self.get_version()
         for traj_idx, traj in enumerate(data):
@@ -551,26 +559,70 @@ class RemoteInfEngine(InferenceEngine):
             out = torch.zeros_like(loss_mask, dtype=torch.float32)
             results.append(out)
             for i in range(bs):
-                target_len = int(loss_mask[i].sum().item())
-                if target_len <= 0:
+                target_raw_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
+                if target_raw_idx.numel() == 0:
                     continue
                 if "attention_mask" in traj:
                     attn_mask = traj["attention_mask"][i]
                     active_idx = torch.nonzero(attn_mask, as_tuple=False).squeeze(-1)
-                    token_ids = input_ids[i, active_idx].tolist()
                 else:
-                    token_ids = input_ids[i].tolist()
+                    active_idx = torch.arange(
+                        input_ids.shape[1], device=input_ids.device
+                    )
+
+                active_position = torch.full(
+                    (input_ids.shape[1],),
+                    -1,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                active_position[active_idx] = torch.arange(
+                    active_idx.numel(), device=input_ids.device
+                )
+                target_active_idx = active_position[target_raw_idx]
+                if torch.any(target_active_idx < 0):
+                    raise ValueError(
+                        "loss_mask can only select tokens included by attention_mask"
+                    )
+                if torch.any(target_active_idx == 0):
+                    raise ValueError(
+                        "loss_mask cannot select the first active token when computing "
+                        "causal teacher log-probabilities"
+                    )
+
+                first_target = int(target_active_idx.min().item())
+                last_target = int(target_active_idx.max().item())
+                score_len = last_target - first_target + 1
+                token_ids = input_ids[i, active_idx[: last_target + 1]].tolist()
+                target_offsets = (target_active_idx - first_target).tolist()
+                prediction_idx = (target_raw_idx - 1).tolist()
                 score_jobs.append(
-                    (traj_idx, i, token_ids, target_len, self.choose_server())
+                    (
+                        traj_idx,
+                        i,
+                        token_ids,
+                        score_len,
+                        target_offsets,
+                        prediction_idx,
+                        self.choose_server(),
+                    )
                 )
 
         def score_sequence(
-            job: tuple[int, int, list[int], int, str],
-        ) -> tuple[int, int, list[float]]:
-            traj_idx, row_idx, token_ids, target_len, server_addr = job
+            job: tuple[int, int, list[int], int, list[int], list[int], str],
+        ) -> tuple[int, int, list[float], list[int]]:
+            (
+                traj_idx,
+                row_idx,
+                token_ids,
+                score_len,
+                target_offsets,
+                prediction_idx,
+                server_addr,
+            ) = job
             http_req = self.backend.build_score_request(
                 input_ids=token_ids,
-                target_len=target_len,
+                target_len=score_len,
                 with_lora=self.config.use_lora,
                 version=version,
             )
@@ -582,12 +634,13 @@ class RemoteInfEngine(InferenceEngine):
             )
             response.raise_for_status()
             payload = response.json()
-            token_logps = self.backend.parse_score_response(payload, target_len)
-            if len(token_logps) != target_len:
+            span_logps = self.backend.parse_score_response(payload, score_len)
+            if len(span_logps) != score_len:
                 raise ValueError(
-                    f"Expected {target_len} token logprobs, got {len(token_logps)}"
+                    f"Expected {score_len} token logprobs, got {len(span_logps)}"
                 )
-            return traj_idx, row_idx, token_logps
+            token_logps = [span_logps[offset] for offset in target_offsets]
+            return traj_idx, row_idx, token_logps, prediction_idx
 
         if not score_jobs:
             return results
@@ -599,12 +652,17 @@ class RemoteInfEngine(InferenceEngine):
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             scored_sequences = executor.map(score_sequence, score_jobs)
-            for traj_idx, row_idx, token_logps in scored_sequences:
-                loss_mask = data[traj_idx]["loss_mask"]
-                write_idx = torch.nonzero(loss_mask[row_idx], as_tuple=False).squeeze(
-                    -1
-                )
-                results[traj_idx][row_idx, write_idx] = torch.tensor(
+            for (
+                traj_idx,
+                row_idx,
+                token_logps,
+                prediction_idx,
+            ) in scored_sequences:
+                # Remote backends return token-centric log-probabilities: the value
+                # for input_ids[..., i] belongs to the model prediction at i - 1.
+                # Train-engine compute_logp already follows this prediction-position
+                # convention because it gathers against labels rolled by one.
+                results[traj_idx][row_idx, prediction_idx] = torch.tensor(
                     token_logps,
                     device=results[traj_idx].device,
                     dtype=results[traj_idx].dtype,
