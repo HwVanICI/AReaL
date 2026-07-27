@@ -744,7 +744,28 @@ class InferenceEngine(abc.ABC):
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
         """Compute token log-probabilities for teacher distillation.
 
-        Implementations support this as an inference-side scoring API.
+        Returned tensors use prediction-position alignment. For a target token at
+        ``input_ids[..., t]``, its log-probability is stored at position ``t - 1``,
+        where the causal model predicts that token. Equivalently, output position
+        ``j`` represents
+        ``log P(input_ids[..., j + 1] | input_ids[..., : j + 1])``.
+
+        The input ``loss_mask`` is token-aligned, while consumers shift it left by
+        one position before applying the returned log-probabilities. Implementations
+        backed by token-centric scoring APIs must therefore normalize their results
+        to prediction positions before returning them. Values outside the shifted
+        loss mask are not part of the contract.
+
+        Parameters
+        ----------
+        data : list[dict[str, Any]]
+            Trajectories containing two-dimensional ``input_ids`` and ``loss_mask``
+            tensors, with an optional ``attention_mask``.
+
+        Returns
+        -------
+        list[torch.Tensor]
+            Log-probability tensors aligned to model prediction positions.
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} does not implement compute_logp()."

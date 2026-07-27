@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from areal.infra.remote_inf_engine import RemoteInfEngine
@@ -34,20 +35,20 @@ class _ScoreResponse:
         return None
 
     def json(self):
-        token = self._payload["input_ids"][0]
+        target_len = self._payload["target_len"]
         return {
-            "token_logps": [float(token)] * self._payload["target_len"],
+            "token_logps": [
+                float(token) for token in self._payload["input_ids"][-target_len:]
+            ],
         }
 
 
-def test_compute_logp_scores_sequences_concurrently_and_preserves_order(monkeypatch):
-    """Teacher scoring overlaps HTTP requests and restores trajectory order."""
-
+def _make_engine(max_concurrent_rollouts=1):
     engine = object.__new__(RemoteInfEngine)
     engine.config = SimpleNamespace(
         request_timeout=10,
         use_lora=False,
-        max_concurrent_rollouts=2,
+        max_concurrent_rollouts=max_concurrent_rollouts,
         consumer_batch_size=1,
         routing_strategy="round_robin",
     )
@@ -56,6 +57,13 @@ def test_compute_logp_scores_sequences_concurrently_and_preserves_order(monkeypa
     engine.server_idx = 0
     engine.lock = threading.Lock()
     engine._version = 0
+    return engine
+
+
+def test_compute_logp_scores_concurrently_and_aligns_with_student(monkeypatch):
+    """Teacher targets are ordered and shifted to student prediction positions."""
+
+    engine = _make_engine(max_concurrent_rollouts=2)
 
     active_lock = threading.Lock()
     two_requests_started = threading.Event()
@@ -93,13 +101,134 @@ def test_compute_logp_scores_sequences_concurrently_and_preserves_order(monkeypa
 
     torch.testing.assert_close(
         results[0],
-        torch.tensor([[0.0, 1.0, 1.0], [0.0, 2.0, 2.0]]),
+        torch.tensor([[2.0, 3.0, 0.0], [3.0, 4.0, 0.0]]),
         rtol=0,
         atol=0,
     )
     torch.testing.assert_close(
         results[1],
-        torch.tensor([[0.0, 3.0, 3.0], [0.0, 4.0, 4.0]]),
+        torch.tensor([[4.0, 5.0, 0.0], [5.0, 6.0, 0.0]]),
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "input_ids",
+        "loss_mask",
+        "attention_mask",
+        "expected_logps",
+        "expected_request_ids",
+        "expected_score_len",
+    ),
+    [
+        (
+            [10, 11, 12, 13],
+            [0, 1, 0, 1],
+            [1, 1, 1, 1],
+            [11.0, 0.0, 13.0, 0.0],
+            [10, 11, 12, 13],
+            3,
+        ),
+        (
+            [10, 11, 12, 13, 14],
+            [0, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1],
+            [11.0, 12.0, 0.0, 0.0, 0.0],
+            [10, 11, 12],
+            2,
+        ),
+        (
+            [10, 11, 12, 0, 0],
+            [0, 1, 1, 0, 0],
+            [1, 1, 1, 0, 0],
+            [11.0, 12.0, 0.0, 0.0, 0.0],
+            [10, 11, 12],
+            2,
+        ),
+        (
+            [0, 0, 10, 11, 12],
+            [0, 0, 0, 1, 1],
+            [0, 0, 1, 1, 1],
+            [0.0, 0.0, 11.0, 12.0, 0.0],
+            [10, 11, 12],
+            2,
+        ),
+    ],
+)
+def test_compute_logp_maps_masked_tokens_to_prediction_positions(
+    monkeypatch,
+    input_ids,
+    loss_mask,
+    attention_mask,
+    expected_logps,
+    expected_request_ids,
+    expected_score_len,
+):
+    """Remote scoring handles mask gaps, trailing tokens, and sequence padding."""
+
+    engine = _make_engine()
+    seen_payloads = []
+
+    def request(method, url, json, timeout):  # noqa: ARG001
+        seen_payloads.append(json)
+        return _ScoreResponse(json)
+
+    monkeypatch.setattr("areal.infra.remote_inf_engine.requests.request", request)
+
+    result = engine.compute_logp(
+        [
+            {
+                "input_ids": torch.tensor([input_ids]),
+                "loss_mask": torch.tensor([loss_mask]),
+                "attention_mask": torch.tensor([attention_mask], dtype=torch.bool),
+            }
+        ]
+    )
+
+    torch.testing.assert_close(
+        result[0],
+        torch.tensor([expected_logps]),
+        rtol=0,
+        atol=0,
+    )
+    assert seen_payloads == [
+        {
+            "input_ids": expected_request_ids,
+            "target_len": expected_score_len,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("loss_mask", "attention_mask", "message"),
+    [
+        (
+            [0, 0, 1],
+            [1, 1, 0],
+            "loss_mask can only select tokens included by attention_mask",
+        ),
+        (
+            [1, 0, 0],
+            [1, 1, 1],
+            "loss_mask cannot select the first active token",
+        ),
+    ],
+)
+def test_compute_logp_rejects_unscorable_targets(
+    loss_mask,
+    attention_mask,
+    message,
+):
+    """Invalid target coordinates fail instead of wrapping or scoring padding."""
+
+    engine = _make_engine()
+    trajectory = {
+        "input_ids": torch.tensor([[10, 11, 12]]),
+        "loss_mask": torch.tensor([loss_mask]),
+        "attention_mask": torch.tensor([attention_mask], dtype=torch.bool),
+    }
+
+    with pytest.raises(ValueError, match=message):
+        engine.compute_logp([trajectory])
