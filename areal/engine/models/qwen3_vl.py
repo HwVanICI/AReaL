@@ -43,9 +43,32 @@ class Qwen3VLShardingStrategy(ShardingStrategy):
         else:
             return ShardingType.NO_SHARDING, sharding_dim, 1
 
-    def _get_gdn_sharding_strategy(self):
-        # todo
-        return ShardingType.NO_SHARDING, 0, 1
+    def _get_gdn_sharding_strategy(self, parameter_name):
+        """Determine sharding strategy for GDN (Gated DeltaNet) linear-attn params.
+
+        Ported from awex Qwen3_5ShardingMixin.get_attention_sharding_strategy
+        (awex/sharding/param_sharding.py:356). GDN state params (in_proj_qkvz,
+        in_proj_ba, conv1d, A_log, dt_bias) are per-head SSM state and must be
+        TP-sharded along dim 0, not split across the data-parallel axis.
+        out_proj is row-parallel (dim 1, like attention.dense). norm.weight is
+        replicated (NO_SHARDING). input_layernorm.weight does not contain
+        "linear_attn" so it never reaches this method (handled by the base
+        class as NO_SHARDING).
+        """
+        # Norm weights are replicated (not TP-sharded).
+        if "norm" in parameter_name:
+            return ShardingType.NO_SHARDING, 0, 1
+        # out_proj is row-parallel (dim 1).
+        if "out_proj" in parameter_name:
+            sharding_dim = 1
+        else:
+            # Column-parallel GDN params: in_proj_qkvz, in_proj_ba, conv1d,
+            # A_log, dt_bias.
+            sharding_dim = 0
+        tp_size = self.rank_info.tp_size
+        if tp_size > 1:
+            return ShardingType.TP_SHARDING, sharding_dim, tp_size
+        return ShardingType.NO_SHARDING, sharding_dim, 1
 
     def _get_visual_sharding_strategy(self, parameter_name, **kwargs):
         tp_size = self.rank_info.tp_size
@@ -74,13 +97,87 @@ class Qwen3VLShardingStrategy(ShardingStrategy):
         if "visual." in parameter_name:
             return self._get_visual_sharding_strategy(parameter_name, **kwargs)
         if "linear_attn" in parameter_name:
-            return self._get_gdn_sharding_strategy()
+            return self._get_gdn_sharding_strategy(parameter_name)
         if (
             "shared_expert_gate" in parameter_name
             or "shared_experts.gate_weight" in parameter_name
         ):
             return ShardingType.NO_SHARDING, 0, 1
         return super().get_sharding_strategy(parameter_name, **kwargs)
+
+
+def _reshard_merged_column_parallel_for_infer(
+    full_tensor: torch.Tensor,
+    per_rank_component_sizes: list[int],
+    dim: int,
+    infer_atten_tp_size: int,
+    train_tp_rank: int,
+    train_tp_size: int,
+) -> torch.Tensor:
+    """Reshard a MergedColumnParallel tensor from train TP to infer TP.
+
+    Ported from awex Qwen3_5McoreConverterMixin._reshard_merged_column_parallel_for_infer
+    (awex/converter/mcore_converter.py:1062). See GDN_TP4_TP8_reshard_port.md for the
+    verified bug-fix background.
+
+    A MergedColumnParallel weight concatenates several logical components
+    (e.g. ``[Q, K, V]`` for conv1d, ``[Q, K, V, Z]`` for in_proj_qkvz,
+    ``[B, A]`` for in_proj_ba) along ``dim``. Each component is independently
+    sharded across TP ranks by head.
+
+    ``full_tensor`` is the all-gather result, laid out interleaved by train
+    rank: ``[r0_comp0|...|r0_compN, r1_comp0|...|r1_compN, ...]``.
+    ``per_rank_component_sizes`` gives the size of each component within one
+    train-rank block (= global component size / train_tp_size).
+
+    For r = infer_tp / train_tp_size, this train rank serves r infer ranks.
+    Within this rank's block, each component is split into r equal pieces
+    (one per infer rank), and the pieces are re-assembled in infer-rank order
+    so that a downstream naive dim-0 split dispatches each piece to the
+    correct infer rank.
+    """
+    per_rank_total = sum(per_rank_component_sizes)
+    rank_start = train_tp_rank * per_rank_total
+    rank_block = full_tensor.narrow(dim, rank_start, per_rank_total)
+
+    if infer_atten_tp_size == train_tp_size:
+        # r == 1: this rank's block maps 1:1 to one infer rank.
+        return rank_block.contiguous()
+    if infer_atten_tp_size % train_tp_size != 0:
+        raise ValueError(
+            f"infer_atten_tp_size ({infer_atten_tp_size}) must be a multiple "
+            f"of train_tp_size ({train_tp_size}) for merged-column-parallel "
+            f"resharding"
+        )
+    r = infer_atten_tp_size // train_tp_size
+    # Split the rank block into its logical components.
+    components = list(torch.split(rank_block, per_rank_component_sizes, dim=dim))
+    # Shard each component independently into r pieces (one per infer rank).
+    per_component_shards = [torch.chunk(c, r, dim=dim) for c in components]
+    # Re-assemble: for each of the r infer ranks, concatenate its slice of
+    # every component in component order, then stack in infer-rank order.
+    merged_infer_shards = [
+        torch.cat([comp_shards[i] for comp_shards in per_component_shards], dim=dim)
+        for i in range(r)
+    ]
+    return torch.cat(merged_infer_shards, dim=dim).contiguous()
+
+
+def _q_interleave_index(q_heads_per_rank: int) -> list[int]:
+    """Build Q interleave index: [u0..u_{h-1}, c0..c_{h-1}] -> [u0,c0,u1,c1,...].
+
+    Ported from awex Qwen3_5McoreConverterMixin._q_interleave_index
+    (awex/converter/mcore_converter.py:1366).
+
+    Q is duplicated: first half unique, second half copies (c_i = u_i).
+    HF stores them interleaved [unique, copy, unique, copy, ...].
+    """
+    half = q_heads_per_rank // 2
+    idx = []
+    for i in range(half):
+        idx.append(i)  # unique head i
+        idx.append(half + i)  # its copy
+    return idx
 
 
 def _split_mcore_gated_attn_qkv(
@@ -90,7 +187,147 @@ def _split_mcore_gated_attn_qkv(
     train_tp_rank: int,
     train_tp_size: int,
 ) -> list[tuple[str, torch.Tensor]]:
-    return [("qkv", linear_qkv)]
+    """Convert Qwen3.5 full-attention QKV weight: transform + infer TP sharding.
+
+    Ported from awex Qwen3_5McoreConverterMixin._transform_qwen3_5_qkv +
+    _shard_qkv_for_infer + _convert_qwen3_5_qkv_param
+    (awex/converter/mcore_converter.py:1379, 1484, 1559).
+
+    Per-rank train layout: [Q0..Q_{n-1}(sequential), K, V]
+      Q sequential = [u0..u_{h-1}, c0..c_{h-1}] (unique first, copies second)
+    HF order: Q interleaved [u0,c0,u1,c1,...] + K/V concatenated across ranks.
+    K/V are sharded (not replicated): each rank holds 1 unique KV head
+    (when train_tp >= num_kv_heads). Confirmed via verify_against_hf.py:
+    infer pkl has 3584 rows/rank = 12Q+1K+1V for TP4.
+
+    Note: num_attention_heads reports UNIQUE q heads (24), but the actual
+    QKV tensor has duplicated q heads (48 = 24*2) for Qwen3.5 gating. We
+    detect the duplication factor by matching the local tensor size.
+    """
+    from awex.converter.mcore_converter import get_full_tensor
+
+    text_config = getattr(hf_config, "text_config", None) or hf_config
+    total_num_heads = int(getattr(text_config, "num_attention_heads", 0))
+    total_num_kv_heads = int(getattr(text_config, "num_key_value_heads", 0))
+    head_size = int(getattr(text_config, "head_dim", 0))
+    if not head_size:
+        head_size = int(getattr(text_config, "hidden_size", 0)) // total_num_heads
+
+    if train_tp_size <= 1:
+        # No TP: weight is already full. Do Q interleave directly.
+        weight = linear_qkv
+        matched = None
+        for q_dup in (2, 1):
+            effective_q = total_num_heads * q_dup
+            q_per_rank = effective_q
+            kv_per_rank = total_num_kv_heads
+            q_rows = q_per_rank * head_size
+            kv_rows = kv_per_rank * head_size
+            per_rank_total = q_rows + 2 * kv_rows
+            if weight.shape[0] == per_rank_total:
+                matched = (q_dup, effective_q, q_per_rank, kv_per_rank)
+                break
+        if matched is None:
+            raise ValueError(
+                f"QKV weight size mismatch (train_tp_size=1): "
+                f"actual={weight.shape[0]}, no q_dup match. "
+                f"num_heads={total_num_heads}, "
+                f"num_kv_heads={total_num_kv_heads}, "
+                f"head_size={head_size}"
+            )
+        q_dup, effective_q, q_per_rank, kv_per_rank = matched
+        q_rows = q_per_rank * head_size
+        kv_rows = kv_per_rank * head_size
+        interleave_idx = _q_interleave_index(q_per_rank)
+        q, k, v = weight.split([q_rows, kv_rows, kv_rows], dim=0)
+        orig_shape = q.shape
+        q_heads = q.reshape(q_per_rank, head_size, -1)
+        q = q_heads[interleave_idx].reshape(orig_shape)
+        query, key, value = q, k, v
+    else:
+        # Detect Q head duplication factor (Qwen3.5: 24 unique -> 48 duplicated).
+        local_size = linear_qkv.shape[0]
+        matched = None  # (q_dup, effective_q, q_per_rank, kv_per_rank, need_gather)
+        for q_dup in (2, 1):
+            effective_q = total_num_heads * q_dup
+            if effective_q % train_tp_size != 0:
+                continue
+            q_per_rank = effective_q // train_tp_size
+            kv_per_rank = max(1, total_num_kv_heads // train_tp_size)
+            q_rows = q_per_rank * head_size
+            kv_rows = kv_per_rank * head_size
+            per_rank_total = q_rows + 2 * kv_rows
+            full_total = per_rank_total * train_tp_size
+            if local_size == per_rank_total:
+                matched = (q_dup, effective_q, q_per_rank, kv_per_rank, True)
+                break
+            elif local_size == full_total:
+                matched = (q_dup, effective_q, q_per_rank, kv_per_rank, False)
+                break
+        if matched is None:
+            raise ValueError(
+                f"QKV weight size mismatch: actual local_size={local_size}, "
+                f"no q_dup match. num_heads={total_num_heads}, "
+                f"num_kv_heads={total_num_kv_heads}, head_size={head_size}, "
+                f"train_tp_size={train_tp_size}"
+            )
+        q_dup, effective_q, q_per_rank, kv_per_rank, need_gather = matched
+        q_rows_per_rank = q_per_rank * head_size
+        kv_rows_per_rank = kv_per_rank * head_size
+        weight = get_full_tensor(linear_qkv, dim=0) if need_gather else linear_qkv
+        interleave_idx = _q_interleave_index(q_per_rank)
+        q_parts = []
+        k_parts = []
+        v_parts = []
+        for rank_chunk in torch.chunk(weight, train_tp_size, dim=0):
+            q, k, v = rank_chunk.split(
+                [q_rows_per_rank, kv_rows_per_rank, kv_rows_per_rank], dim=0
+            )
+            orig_shape = q.shape
+            q_heads = q.reshape(q_per_rank, head_size, -1)
+            q = q_heads[interleave_idx].reshape(orig_shape)
+            q_parts.append(q)
+            k_parts.append(k)
+            v_parts.append(v)
+        query = torch.cat(q_parts, dim=0)
+        key = torch.cat(k_parts, dim=0)
+        value = torch.cat(v_parts, dim=0)
+
+    # Shard (Q, K, V) for inference TP: [Q0,K0,V0,Q1,K1,V1,...] + train_tp shard.
+    # Qwen3.5: K/V are SHARDED across infer ranks (1 KV head per rank when
+    # infer_tp == total_num_kv_heads), NOT replicated. The NPU replication
+    # branch was removed for Qwen3.5 (was giving 5120 instead of 3584 rows/rank).
+    if infer_atten_tp_size >= total_num_kv_heads:
+        num_kv_head_replicas = infer_atten_tp_size // total_num_kv_heads
+    else:
+        num_kv_head_replicas = 1
+    query_shards = query.chunk(infer_atten_tp_size, dim=0)
+    if infer_atten_tp_size >= total_num_kv_heads:
+        key_chunks = key.chunk(total_num_kv_heads, dim=0)
+        key_shards = [k for k in key_chunks for _ in range(num_kv_head_replicas)]
+        value_chunks = value.chunk(total_num_kv_heads, dim=0)
+        value_shards = [v for v in value_chunks for _ in range(num_kv_head_replicas)]
+    else:
+        key_shards = key.chunk(infer_atten_tp_size, dim=0)
+        value_shards = value.chunk(infer_atten_tp_size, dim=0)
+    qkv_tp_groups = []
+    for q_s, k_s, v_s in zip(query_shards, key_shards, value_shards):
+        qkv_tp_groups.append(q_s)
+        qkv_tp_groups.append(k_s)
+        qkv_tp_groups.append(v_s)
+    merged = torch.cat(qkv_tp_groups, dim=0)
+
+    if train_tp_size and train_tp_size > 1:
+        if train_tp_rank is None:
+            raise ValueError("train_tp_rank is required when train_tp_size > 1")
+        shards = torch.chunk(merged, train_tp_size, dim=0)
+        if train_tp_rank >= len(shards):
+            raise ValueError(
+                f"train_tp_rank {train_tp_rank} out of range for "
+                f"tp_size {train_tp_size}"
+            )
+        merged = shards[train_tp_rank]
+    return [("self_attn.qkv_proj.weight", merged)]
 
 
 def _reshard_mcore_gdn_conv1d(
@@ -100,7 +337,91 @@ def _reshard_mcore_gdn_conv1d(
     train_tp_rank: int,
     train_tp_size: int,
 ) -> list[tuple[str, torch.Tensor]]:
-    return [("qkvz", conv1d)]
+    """Reshard GDN conv1d.weight from train TP to infer TP.
+
+    Ported from awex Qwen3_5McoreConverterMixin._convert_linear_attention_param
+    (conv1d.weight branch, awex/converter/mcore_converter.py:1226).
+
+    conv1d out_channels are [Q, K, V] concatenated (Z does NOT enter conv1d).
+    Each component is independently head-sharded, so use the merged-aware
+    reshard to respect component boundaries when r > 1. Some mcore GDN impls
+    replicate conv1d across TP ranks (small param); detect that case and use
+    a single copy so resharding doesn't produce duplicated shards.
+    """
+    from awex.converter.mcore_converter import get_full_tensor
+
+    text_config = getattr(hf_config, "text_config", None) or hf_config
+    linear_num_key_heads = int(getattr(text_config, "linear_num_key_heads", 0))
+    linear_key_head_dim = int(getattr(text_config, "linear_key_head_dim", 0))
+    linear_num_value_heads = int(getattr(text_config, "linear_num_value_heads", 0))
+    linear_value_head_dim = int(getattr(text_config, "linear_value_head_dim", 0))
+    if not (
+        linear_num_key_heads
+        and linear_key_head_dim
+        and linear_num_value_heads
+        and linear_value_head_dim
+    ):
+        raise ValueError(
+            "linear_num_key_heads / linear_key_head_dim / "
+            "linear_num_value_heads / linear_value_head_dim are "
+            "required in hf_config.text_config to reshard the GDN "
+            "conv1d.weight, but some were missing."
+        )
+    qk_dim = linear_num_key_heads * linear_key_head_dim
+    v_dim = linear_num_value_heads * linear_value_head_dim
+
+    local_shape = tuple(conv1d.shape)
+    full = get_full_tensor(conv1d, dim=0)
+    train_tp_size_eff = train_tp_size if train_tp_size > 0 else 1
+
+    # Detect replicated conv1d (some mcore GDN impls replicate this small param)
+    is_replicated = False
+    if (
+        train_tp_size_eff > 1
+        and full.shape[0] == local_shape[0] * train_tp_size_eff
+        and local_shape[0] > 0
+    ):
+        first = full.narrow(0, 0, local_shape[0])
+        second = full.narrow(0, local_shape[0], local_shape[0])
+        if torch.equal(first[0], second[0]) and torch.equal(first[-1], second[-1]):
+            full = first.contiguous()
+            is_replicated = True
+
+    if is_replicated:
+        # conv1d is replicated: every train rank holds the same full [Q,K,V]
+        # (global, not per-rank). Shard each component by infer_tp and pick
+        # this rank's r slices.
+        infer_tp = infer_atten_tp_size
+        r = infer_tp // train_tp_size_eff if infer_tp > train_tp_size_eff else 1
+        start = train_tp_rank * r
+        end = start + r
+        components = list(torch.split(full, [qk_dim, qk_dim, v_dim], dim=0))
+        per_component_shards = [torch.chunk(c, infer_tp, dim=0) for c in components]
+        merged = [
+            torch.cat([comp_shards[i] for comp_shards in per_component_shards], dim=0)
+            for i in range(start, end)
+        ]
+        out = torch.cat(merged, dim=0).contiguous()
+    else:
+        # Standard column-parallel: full is interleaved by train rank,
+        # each rank block = [Q_local, K_local, V_local].
+        if qk_dim % train_tp_size_eff != 0 or v_dim % train_tp_size_eff != 0:
+            raise ValueError(
+                f"qk_dim ({qk_dim}) and v_dim ({v_dim}) must be "
+                f"divisible by train_tp_size ({train_tp_size_eff}) for "
+                f"GDN conv1d reshard"
+            )
+        per_rank_qk = qk_dim // train_tp_size_eff
+        per_rank_v = v_dim // train_tp_size_eff
+        out = _reshard_merged_column_parallel_for_infer(
+            full,
+            [per_rank_qk, per_rank_qk, per_rank_v],
+            0,
+            infer_atten_tp_size,
+            train_tp_rank,
+            train_tp_size_eff,
+        )
+    return [("linear_attn.conv1d.weight", out)]
 
 
 def _split_mcore_gdn_in_proj(
@@ -110,7 +431,105 @@ def _split_mcore_gdn_in_proj(
     train_tp_rank: int,
     train_tp_size: int,
 ) -> list[tuple[str, torch.Tensor]]:
-    return [("qkvz", in_proj)]
+    """Split GDN in_proj.weight (fused [qkvz; ba]) and reshard train TP -> infer TP.
+
+    Ported from awex Qwen3_5McoreConverterMixin._convert_linear_attention_param
+    (in_proj.weight branch, awex/converter/mcore_converter.py:1137).
+
+    GDN in_proj is column-parallel (fused [qkvz; ba] along dim 0). Each train
+    rank stores [local_qkvz; local_ba], so after get_full_tensor (all_gather)
+    the layout is interleaved by rank: [r0_qkvz, r0_ba, r1_qkvz, r1_ba, ...]
+    NOT [global_qkvz; global_ba]. We must de-interleave rank chunks first,
+    then reshard each part (qkvz / ba) from train TP to infer TP.
+
+    global_ba = 2 * linear_num_value_heads (the ``b`` and ``a`` projections
+    each have one entry per value head); per-rank ba = global_ba / train_tp_size.
+    qkvz components = [Q, K, V, Z] (Q=K=qk_dim, V=Z=v_dim).
+    ba components = [B, A] (each = num_value_heads per rank).
+    """
+    from awex.converter.mcore_converter import get_full_tensor
+
+    text_config = getattr(hf_config, "text_config", None) or hf_config
+    linear_num_value_heads = int(getattr(text_config, "linear_num_value_heads", 0))
+    linear_num_key_heads = int(getattr(text_config, "linear_num_key_heads", 0))
+    linear_key_head_dim = int(getattr(text_config, "linear_key_head_dim", 0))
+    linear_value_head_dim = int(getattr(text_config, "linear_value_head_dim", 0))
+    if not linear_num_value_heads:
+        raise ValueError(
+            "linear_num_value_heads is required in hf_config.text_config "
+            "to split the GDN in_proj.weight, but it was not found."
+        )
+    if not (linear_num_key_heads and linear_key_head_dim and linear_value_head_dim):
+        raise ValueError(
+            "linear_num_key_heads / linear_key_head_dim / "
+            "linear_value_head_dim are required in hf_config.text_config "
+            "to reshard the GDN in_proj.weight, but some were missing."
+        )
+    qk_dim = linear_num_key_heads * linear_key_head_dim
+    v_dim = linear_num_value_heads * linear_value_head_dim
+    global_ba = 2 * linear_num_value_heads
+    train_tp_size_eff = train_tp_size if train_tp_size > 0 else 1
+
+    full = get_full_tensor(in_proj, dim=0)
+
+    if train_tp_size_eff > 1:
+        if global_ba % train_tp_size_eff != 0:
+            raise ValueError(
+                f"Global GDN ba dim ({global_ba}) is not divisible by "
+                f"train_tp_size ({train_tp_size_eff})"
+            )
+        local_ba = global_ba // train_tp_size_eff
+        # De-interleave: [r0_qkvz, r0_ba, r1_qkvz, r1_ba, ...]
+        # -> [global_qkvz; global_ba]
+        rank_chunks = torch.chunk(full, train_tp_size_eff, dim=0)
+        qkvz_parts = []
+        ba_parts = []
+        for chunk in rank_chunks:
+            local_qkvz = chunk.shape[0] - local_ba
+            qkvz_parts.append(chunk.narrow(0, 0, local_qkvz))
+            ba_parts.append(chunk.narrow(0, local_qkvz, local_ba))
+        qkvz_full = torch.cat(qkvz_parts, dim=0)
+        ba_full = torch.cat(ba_parts, dim=0)
+    else:
+        # train_tp_size == 1: local tensor is already the full tensor
+        # with layout [global_qkvz; global_ba].
+        local_ba = global_ba
+        local_qkvz = full.shape[0] - local_ba
+        qkvz_full = full.narrow(0, 0, local_qkvz)
+        ba_full = full.narrow(0, local_qkvz, local_ba)
+
+    # qkvz and ba are MergedColumnParallel: each component ([Q,K,V,Z] and
+    # [B,A]) is independently head-sharded. Use the merged-aware reshard so
+    # component boundaries are respected when r > 1. Per-rank component
+    # sizes = global component size / train_tp_size.
+    if qk_dim % train_tp_size_eff != 0 or v_dim % train_tp_size_eff != 0:
+        raise ValueError(
+            f"qk_dim ({qk_dim}) and v_dim ({v_dim}) must be divisible "
+            f"by train_tp_size ({train_tp_size_eff}) for GDN in_proj reshard"
+        )
+    per_rank_qk = qk_dim // train_tp_size_eff
+    per_rank_v = v_dim // train_tp_size_eff
+    per_rank_v_heads = linear_num_value_heads // train_tp_size_eff
+    qkvz = _reshard_merged_column_parallel_for_infer(
+        qkvz_full,
+        [per_rank_qk, per_rank_qk, per_rank_v, per_rank_v],
+        0,
+        infer_atten_tp_size,
+        train_tp_rank,
+        train_tp_size_eff,
+    )
+    ba = _reshard_merged_column_parallel_for_infer(
+        ba_full,
+        [per_rank_v_heads, per_rank_v_heads],
+        0,
+        infer_atten_tp_size,
+        train_tp_rank,
+        train_tp_size_eff,
+    )
+    return [
+        ("linear_attn.in_proj_qkvz.weight", qkvz),
+        ("linear_attn.in_proj_ba.weight", ba),
+    ]
 
 
 def reshard_visual_attn_qkv(
@@ -297,6 +716,50 @@ class McoreToHFWeightConverterQwen3VL(McoreToHFWeightConverter):
 
         raise NotImplementedError(f"Unsupported vision param: {name}")
 
+    @staticmethod
+    def _resolve_dtype_from_config(dtype_value):
+        """Resolve a dtype value from hf_config into a torch.dtype.
+
+        ``hf_config`` may store dtypes either as strings (e.g. ``"float32"``,
+        ``"bfloat16"``) or already as ``torch.dtype``. This helper normalizes
+        both forms so callers can ``.to(target_dtype)`` directly.
+        """
+        if isinstance(dtype_value, torch.dtype):
+            return dtype_value
+        if isinstance(dtype_value, str):
+            mapping = {
+                "float32": torch.float32,
+                "fp32": torch.float32,
+                "bfloat16": torch.bfloat16,
+                "bf16": torch.bfloat16,
+                "float16": torch.float16,
+                "fp16": torch.float16,
+            }
+            key = dtype_value.strip().lower()
+            if key in mapping:
+                return mapping[key]
+        raise ValueError(f"Unsupported dtype value from config: {dtype_value!r}")
+
+    def _gdn_state_param_dtype(self) -> torch.dtype:
+        """Dtype used by the inference side for GDN/SSM state params (A_log).
+
+        Read from ``hf_config.mamba_ssm_dtype`` so the conversion tracks the
+        actual model config rather than a hardcoded target.
+        """
+        return self._resolve_dtype_from_config(
+            getattr(self.hf_config, "mamba_ssm_dtype", "float32")
+        )
+
+    def _gdn_compute_dtype(self) -> torch.dtype:
+        """Dtype used by the inference side for regular GDN params (dt_bias, norm).
+
+        Read from ``hf_config.dtype`` (the model compute dtype) so the
+        conversion tracks the actual model config rather than a hardcoded target.
+        """
+        return self._resolve_dtype_from_config(
+            getattr(self.hf_config, "dtype", "bfloat16")
+        )
+
     def _convert_gdn_param(
         self, name: str, parameter: torch.Tensor, layer_number: str
     ) -> list[tuple[str, torch.Tensor]]:
@@ -319,11 +782,28 @@ class McoreToHFWeightConverterQwen3VL(McoreToHFWeightConverter):
                 self.rank_info.attn_tp_size,
             )
         elif "dt_bias" in name:
+            # dt_bias is a regular bias param on the inference side and is
+            # stored in the model compute dtype (hf_config.dtype, e.g.
+            # bfloat16), NOT in mamba_ssm_dtype. Convert accordingly so the
+            # meta check passes.
+            target_dtype = self._gdn_compute_dtype()
+            if parameter.dtype != target_dtype:
+                parameter = parameter.to(target_dtype)
             return [("linear_attn.dt_bias", parameter)]
         elif "A_log" in name:
+            # A_log is an SSM state param on the inference side and is stored
+            # in mamba_ssm_dtype (e.g. float32) for numerical stability,
+            # NOT in the model compute dtype. Convert accordingly so the
+            # meta check passes.
+            target_dtype = self._gdn_state_param_dtype()
+            if parameter.dtype != target_dtype:
+                parameter = parameter.to(target_dtype)
             return [("linear_attn.A_log", parameter)]
         elif "out_norm.weight" in name:
-            return [("linear_attn.norm.weight", parameter + 1.0)]
+            # ``parameter + 1.0`` promotes to float32; cast back to the model
+            # compute dtype so the norm weight matches the inference side.
+            target_dtype = self._gdn_compute_dtype()
+            return [("linear_attn.norm.weight", (parameter + 1.0).to(target_dtype))]
         elif "out_proj.weight" in name:
             return [("linear_attn.out_proj.weight", parameter)]
         else:
