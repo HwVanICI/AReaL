@@ -16,7 +16,7 @@ cluster:
     nfs_record_root: /tmp/areal/name_resolve
 
 scheduler:
-  type: local
+  type: ray
 
 rollout:
   backend: "vllm:d2p1t1"
@@ -131,6 +131,7 @@ actor:
         PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
         AREAL_ALLOW_DEFAULT_ADMIN_KEY: "1"
         HCCL_NPU_SOCKET_PORT_RANGE: "62360-62460"
+        VLLM_SERVER_DEV_MODE: "1"
 
 
 ref:
