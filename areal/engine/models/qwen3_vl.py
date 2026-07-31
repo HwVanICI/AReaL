@@ -130,11 +130,19 @@ def _reshard_merged_column_parallel_for_infer(
     ``per_rank_component_sizes`` gives the size of each component within one
     train-rank block (= global component size / train_tp_size).
 
-    For r = infer_tp / train_tp_size, this train rank serves r infer ranks.
-    Within this rank's block, each component is split into r equal pieces
-    (one per infer rank), and the pieces are re-assembled in infer-rank order
-    so that a downstream naive dim-0 split dispatches each piece to the
-    correct infer rank.
+    For r = infer_tp / train_tp_size:
+
+    - r > 1: this train rank serves r infer ranks. Within this rank's block,
+      each component is split into r equal pieces (one per infer rank), and the
+      pieces are re-assembled in infer-rank order so that a downstream naive
+      dim-0 split dispatches each piece to the correct infer rank.
+    - r < 1 (s = train_tp_size / infer_tp train ranks per infer rank): the
+      corresponding components from s consecutive train ranks are merged
+      (concatenated per component, e.g. [Q_r0, Q_r1, K_r0, K_r1, ...]) into
+      one infer rank's weight. This train rank contributes to infer rank
+      ``train_tp_rank // s`` and returns its contiguous chunk of the merged
+      infer-rank weight so that concatenating the s chunks in train-rank order
+      reproduces the full infer-rank weight.
     """
     per_rank_total = sum(per_rank_component_sizes)
     rank_start = train_tp_rank * per_rank_total
@@ -143,24 +151,49 @@ def _reshard_merged_column_parallel_for_infer(
     if infer_atten_tp_size == train_tp_size:
         # r == 1: this rank's block maps 1:1 to one infer rank.
         return rank_block.contiguous()
-    if infer_atten_tp_size % train_tp_size != 0:
+    if infer_atten_tp_size > train_tp_size:
+        if infer_atten_tp_size % train_tp_size != 0:
+            raise ValueError(
+                f"infer_atten_tp_size ({infer_atten_tp_size}) must be a multiple "
+                f"of train_tp_size ({train_tp_size}) for merged-column-parallel "
+                f"resharding"
+            )
+        r = infer_atten_tp_size // train_tp_size
+        components = list(torch.split(rank_block, per_rank_component_sizes, dim=dim))
+        per_component_shards = [torch.chunk(c, r, dim=dim) for c in components]
+        merged_infer_shards = [
+            torch.cat([comp_shards[i] for comp_shards in per_component_shards], dim=dim)
+            for i in range(r)
+        ]
+        return torch.cat(merged_infer_shards, dim=dim).contiguous()
+
+    # infer_atten_tp_size < train_tp_size: each infer rank merges the
+    # corresponding components from s = train_tp_size / infer_atten_tp_size
+    # train ranks (e.g. infer_tp=2, train_tp=4 -> s=2, train ranks 0,1 feed
+    # infer rank 0; train ranks 2,3 feed infer rank 1). For each component,
+    # concatenate the s per-rank pieces so that component boundaries are
+    # respected (NOT a flat concat of two ranks' entire blocks).
+    if train_tp_size % infer_atten_tp_size != 0:
         raise ValueError(
-            f"infer_atten_tp_size ({infer_atten_tp_size}) must be a multiple "
-            f"of train_tp_size ({train_tp_size}) for merged-column-parallel "
-            f"resharding"
+            f"train_tp_size ({train_tp_size}) must be a multiple of "
+            f"infer_atten_tp_size ({infer_atten_tp_size}) for "
+            f"merged-column-parallel resharding when infer_tp < train_tp"
         )
-    r = infer_atten_tp_size // train_tp_size
-    # Split the rank block into its logical components.
-    components = list(torch.split(rank_block, per_rank_component_sizes, dim=dim))
-    # Shard each component independently into r pieces (one per infer rank).
-    per_component_shards = [torch.chunk(c, r, dim=dim) for c in components]
-    # Re-assemble: for each of the r infer ranks, concatenate its slice of
-    # every component in component order, then stack in infer-rank order.
-    merged_infer_shards = [
-        torch.cat([comp_shards[i] for comp_shards in per_component_shards], dim=dim)
-        for i in range(r)
-    ]
-    return torch.cat(merged_infer_shards, dim=dim).contiguous()
+    s = train_tp_size // infer_atten_tp_size
+    infer_rank = train_tp_rank // s
+    pos_in_group = train_tp_rank % s
+    train_start = infer_rank * s
+    merged_components = []
+    for comp_idx, comp_size in enumerate(per_rank_component_sizes):
+        comp_offset = sum(per_rank_component_sizes[:comp_idx])
+        parts = [
+            full_tensor.narrow(dim, tr * per_rank_total + comp_offset, comp_size)
+            for tr in range(train_start, train_start + s)
+        ]
+        merged_components.append(torch.cat(parts, dim=dim))
+    infer_weight = torch.cat(merged_components, dim=dim)
+    chunk_start = pos_in_group * per_rank_total
+    return infer_weight.narrow(dim, chunk_start, per_rank_total).contiguous()
 
 
 def _q_interleave_index(q_heads_per_rank: int) -> list[int]:
