@@ -494,12 +494,17 @@ def grpo_loss_fn(
         )  # detach to prevent gradient backprop to teacher
 
         if distill_loss_type == "mopd_pg":
+            behavior_importance_weight = stat.get("behave_imp_weight")
             mopd_loss, mopd_stat = mopd_pg_loss_fn(
                 logprobs=logprobs,
                 old_logprobs=old_logp,
                 teacher_logprobs=teacher_logp,
                 loss_mask=loss_mask,
                 adv_clip=mopd_adv_clip,
+                proximal_logprobs=(
+                    prox_logp if behavior_importance_weight is not None else None
+                ),
+                behavior_importance_weight=behavior_importance_weight,
             )
             loss = rl_loss_weight * loss + distill_loss_weight * mopd_loss
             stat.update(
@@ -642,24 +647,39 @@ def mopd_pg_loss_fn(
     teacher_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
     adv_clip: float,
+    proximal_logprobs: torch.Tensor | None = None,
+    behavior_importance_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """MOPD policy-gradient loss adapted to off-policy rollouts.
 
     The stopped-gradient advantage measures the teacher's log-probability gap
     from the current student policy. The rollout policy is used only for the
-    per-token importance correction.
+    per-token importance correction. When PPO rejection sampling is active,
+    ``behavior_importance_weight`` is its filtered or clamped
+    ``pi_proximal / pi_behavior`` correction. Multiplying it by the differentiable
+    ``pi_current / pi_proximal`` ratio applies the same rejection decision to MOPD
+    while preserving gradients through the current policy.
     """
     old_logprobs = old_logprobs.detach()
     teacher_logprobs = teacher_logprobs.detach()
+    if (proximal_logprobs is None) != (behavior_importance_weight is None):
+        raise ValueError(
+            "proximal_logprobs and behavior_importance_weight must be provided together"
+        )
 
     raw_advantage = teacher_logprobs - logprobs.detach()
     advantage = raw_advantage.clamp(min=-adv_clip, max=adv_clip)
     log_ratio = logprobs - old_logprobs
-    importance_weight = torch.exp(log_ratio)
+    if behavior_importance_weight is None:
+        importance_weight = torch.exp(log_ratio)
+    else:
+        current_to_proximal = torch.exp(logprobs - proximal_logprobs.detach())
+        importance_weight = current_to_proximal * behavior_importance_weight.detach()
     pg_loss = -importance_weight * advantage
 
     mask = loss_mask.to(pg_loss.dtype)
     loss = (pg_loss * mask).sum() / mask.sum().clamp_min(1)
+    effective_mask = loss_mask.bool().logical_and(importance_weight.detach() > 0)
 
     stat = dict(
         loss=pg_loss.detach(),
@@ -667,7 +687,7 @@ def mopd_pg_loss_fn(
         raw_advantage=raw_advantage.detach(),
         importance_weight=importance_weight.detach(),
         approx_kl=log_ratio.detach(),
-        adv_clip_mask=(raw_advantage.abs() > adv_clip).logical_and(loss_mask.bool()),
+        adv_clip_mask=(raw_advantage.abs() > adv_clip).logical_and(effective_mask),
     )
     return loss, stat
 
