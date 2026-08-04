@@ -20,6 +20,7 @@ VALID_DATASETS = [
     "hh-rlhf",
     "torl_data",
     "aime",
+    "leetcode",
 ]
 
 logger = logging.getLogger("Dataset")
@@ -111,6 +112,16 @@ def _get_custom_dataset(
         from .aime import get_aime_rl_dataset
 
         return get_aime_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "leetcode" in path and type == "rl":
+        from .leetcode import get_leetcode_rl_dataset
+
+        return get_leetcode_rl_dataset(
             path=path,
             split=split,
             tokenizer=tokenizer,
