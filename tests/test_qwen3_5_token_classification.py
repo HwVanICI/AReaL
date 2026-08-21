@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers.models.qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
 
 from areal.api.cli_args import TrainEngineConfig
 from areal.models.transformers.qwen3_5 import (
@@ -36,6 +37,41 @@ def test_qwen3_5_token_classification_forward_returns_per_token_values():
 
     assert output.logits.shape == torch.Size([1, 4, 1])
     assert "score.weight" in model.state_dict()
+
+
+def test_qwen3_5_multimodal_config_uses_text_hidden_size_for_score():
+    """The full Qwen3.5 config gets its critic width from text_config."""
+    text_config = Qwen3_5TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        layer_types=["full_attention"],
+    )
+    vision_config = Qwen3_5VisionConfig(
+        depth=1,
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=4,
+        out_hidden_size=16,
+        patch_size=2,
+        spatial_merge_size=1,
+        temporal_patch_size=1,
+    )
+    config = Qwen3_5Config(
+        text_config=text_config.to_dict(),
+        vision_config=vision_config.to_dict(),
+        num_labels=1,
+    )
+
+    model = Qwen3_5ForTokenClassification(config)
+
+    assert model.score.in_features == config.text_config.hidden_size
+    assert model.score.out_features == 1
+    assert hasattr(model.model, "visual")
 
 
 @pytest.mark.parametrize(
