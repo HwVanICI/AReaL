@@ -63,6 +63,7 @@ The SWE example reads an `econfig` block (see `examples/swe/utils.py`):
 | `opencode_agent_config` | Config used when `agent_type=opencode` (default `train_opencode_time3600`).                                 |
 | `agent_root`            | Path to the AReaL-SWEAgent checkout (see section 2).                                                        |
 | `step_limit`            | Max agent interaction steps per episode.                                                                    |
+| `max_tokens`            | Total context window advertised to OpenCode.                                                                |
 | `max_completion_tokens` | Max completion tokens per agent LLM call.                                                                   |
 | `timeout`               | Max wall-clock time per episode (seconds).                                                                  |
 
