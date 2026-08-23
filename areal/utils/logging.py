@@ -111,6 +111,7 @@ LOGGER_COLORS_EXACT = {
     "ProxyUtils": "light_purple",
     "AReaL-SWEAgent": "light_purple",
     "SWETrain": "light_green",
+    "SWERollout": "light_green",
     "SWEDataset": "light_green",
     # Agent Service - purple
     "AgentGateway": "light_purple",
