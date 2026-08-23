@@ -26,6 +26,7 @@ class SWEEnvConfig:
         opencode_provider: Optional OpenCode provider override.
         codex_provider: Optional Codex provider override.
         step_limit: Maximum number of agent interaction steps per episode.
+        max_tokens: Maximum context window advertised to the agent LLM.
         max_completion_tokens: Maximum completion tokens for the agent LLM.
         timeout: Maximum time allowed for a single episode in seconds.
     """
@@ -130,6 +131,10 @@ class SWEEnvConfig:
     step_limit: int = field(
         default=100,
         metadata={"help": "Maximum number of agent interaction steps per episode."},
+    )
+    max_tokens: int = field(
+        default=32768,
+        metadata={"help": "Maximum context window advertised to the agent LLM."},
     )
     max_completion_tokens: int = field(
         default=16384,

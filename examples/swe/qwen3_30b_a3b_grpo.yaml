@@ -24,7 +24,7 @@ scheduler:
 gconfig:
   n_samples: 4
   min_new_tokens: 0
-  max_new_tokens: 131071
+  max_new_tokens: 98304
   max_tokens: 131071
   greedy: false
   temperature: 1.0
@@ -56,6 +56,10 @@ rollout:
     reasoning_parser: qwen3
     chat_template_type: concat
     engine_max_tokens: ${gconfig.max_tokens}
+    max_completion_tokens: ${gconfig.max_new_tokens}
+    temperature: ${gconfig.temperature}
+    top_p: ${gconfig.top_p}
+    top_k: ${gconfig.top_k}
     export_style: concat
     turn_discount: 1.0
     session_timeout_seconds: 3600
@@ -206,7 +210,8 @@ econfig:
   llm_model: ""
   opencode_provider: ""
   codex_provider: ""
-  max_completion_tokens: 131071
+  max_tokens: ${gconfig.max_tokens}
+  max_completion_tokens: ${gconfig.max_new_tokens}
   timeout: 3600.0
 
 sglang:
