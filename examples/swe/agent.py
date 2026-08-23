@@ -131,8 +131,8 @@ class SWEAgentWorkflow:
             ``swe_agent_root``,
             ``llm_model``, ``opencode_provider``, ``codex_provider``,
             and ``timeout``.
-        gen_args: Generation arguments (unused; token limits come from
-            the AReaL-SWEAgent config YAML).
+        gen_args: Generation arguments used as compatibility fallbacks when the
+            corresponding environment setting is absent.
         timeout: Maximum time allowed for a single episode (default: 1800s).
     """
 
@@ -191,6 +191,15 @@ class SWEAgentWorkflow:
         codex_provider = (
             econfig.get("codex_provider") or os.getenv("CODEX_PROVIDER") or None
         )
+        max_tokens = int(
+            econfig.get("max_tokens", self.gen_args.get("max_tokens", 32768))
+        )
+        max_completion_tokens = int(
+            econfig.get(
+                "max_completion_tokens",
+                self.gen_args.get("max_completion_tokens", 16384),
+            )
+        )
         instance_id = data.get("instance_id", "unknown")
 
         logger.info(
@@ -211,6 +220,8 @@ class SWEAgentWorkflow:
                     opencode_provider=opencode_provider,
                     codex_provider=codex_provider,
                     sandbox_backend=sandbox_backend,
+                    max_tokens=max_tokens,
+                    max_completion_tokens=max_completion_tokens,
                 ),
                 timeout=self.timeout,
             )
@@ -240,6 +251,8 @@ class SWEAgentWorkflow:
         opencode_provider: str | None,
         codex_provider: str | None,
         sandbox_backend: str,
+        max_tokens: int | None = None,
+        max_completion_tokens: int | None = None,
     ) -> float:
         """Execute one episode through AReaL-SWEAgent and return the reward.
 
@@ -266,6 +279,8 @@ class SWEAgentWorkflow:
                 override_llm_model=llm_model,
                 override_opencode_provider=opencode_provider,
                 override_codex_provider=codex_provider,
+                override_max_tokens=max_tokens,
+                override_max_completion_tokens=max_completion_tokens,
                 sandbox_backend=sandbox_backend,
             )
         except Exception as e:
