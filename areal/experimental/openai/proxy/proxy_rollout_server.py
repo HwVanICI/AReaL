@@ -114,6 +114,12 @@ _last_cleanup_time: float = 0
 _session_timeout_seconds: int = 3600  # Default timeout (overridden by config)
 _processor_cache_registry = ProcessorCacheRegistry()
 _group_tensor_store_registry = GroupTensorStoreRegistry()
+_generation_params: dict[str, float | int] = {
+    "max_completion_tokens": 16384,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": int(1e8),
+}
 
 # API key authentication
 # Initialized to a random value so pre-configuration requests cannot bypass auth.
@@ -297,7 +303,7 @@ async def alloc_ports(raw_request: Request):
 
 def _setup_openai_client():
     global _session_timeout_seconds, _admin_api_key
-    global _message_preprocessors, _prefix_matcher
+    global _message_preprocessors, _prefix_matcher, _generation_params
     config = _engine.config
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     agent_cfg = config.agent
@@ -322,6 +328,12 @@ def _setup_openai_client():
     )
     # Set session timeout from config
     _session_timeout_seconds = agent_cfg.session_timeout_seconds
+    _generation_params = {
+        "max_completion_tokens": agent_cfg.max_completion_tokens,
+        "temperature": agent_cfg.temperature,
+        "top_p": agent_cfg.top_p,
+        "top_k": agent_cfg.top_k,
+    }
     # Validate admin API key BEFORE assigning it to the global, so a
     # failed validation cannot leave the default key live on the server.
     # The default admin key is publicly known; refuse to use it when the
@@ -677,6 +689,7 @@ async def _call_client_create(
     session_id: str,
     extra_ignored_args: list[str] | None = None,
     stream: bool = False,
+    max_tokens_arg: str = "max_completion_tokens",
 ) -> ChatCompletion | Response | AsyncGenerator[ChatCompletionChunk, None]:
     """Common logic for chat completions and responses."""
     if _openai_client is None:
@@ -735,12 +748,20 @@ async def _call_client_create(
             f"{dropped_args_str}"
         )
 
-    if "temperature" not in kwargs:
-        kwargs["temperature"] = 1.0
-        _warn_once("temperature not set in request, defaulting to 1.0")
-    if "top_p" not in kwargs:
-        kwargs["top_p"] = 1.0
-        _warn_once("top_p not set in request, defaulting to 1.0")
+    # Agent rollouts must use the experiment's generation policy, regardless of
+    # defaults or explicit values sent by the coding-agent client. Normalize the
+    # mutually-exclusive OpenAI token-limit aliases before injecting the one
+    # accepted by the selected endpoint.
+    for token_arg in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        kwargs.pop(token_arg, None)
+    kwargs.update(
+        {
+            key: value
+            for key, value in _generation_params.items()
+            if key != "max_completion_tokens"
+        }
+    )
+    kwargs[max_tokens_arg] = _generation_params["max_completion_tokens"]
 
     # Strip stream from request body to prevent it from bypassing the explicit
     # `stream` parameter.  Without this, a request with {"stream": true} would
@@ -846,6 +867,7 @@ async def responses(
         create_fn=_openai_client.responses.create,
         request=request,
         session_id=session_id,
+        max_tokens_arg="max_output_tokens",
     )
 
 

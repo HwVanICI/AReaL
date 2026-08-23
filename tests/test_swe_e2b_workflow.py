@@ -132,10 +132,14 @@ async def test_run_episode_forwards_opencode_model_and_provider(monkeypatch, tmp
         opencode_provider="areal",
         codex_provider=None,
         sandbox_backend="e2b",
+        max_tokens=32768,
+        max_completion_tokens=4096,
     )
 
     assert reward == 1.0
     kwargs = run_agent.await_args.kwargs
     assert kwargs["override_llm_model"] == "qwen3-coder"
     assert kwargs["override_opencode_provider"] == "areal"
+    assert kwargs["override_max_tokens"] == 32768
+    assert kwargs["override_max_completion_tokens"] == 4096
     assert kwargs["sandbox_backend"] == "e2b"

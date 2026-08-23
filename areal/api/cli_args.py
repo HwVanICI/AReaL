@@ -2398,6 +2398,22 @@ class AgentConfig:
         default=None,
         metadata={"help": "Maximum total tokens for the engine (prompt + completion)."},
     )
+    max_completion_tokens: int = field(
+        default=16384,
+        metadata={"help": "Maximum number of tokens generated per agent LLM call."},
+    )
+    top_p: float = field(
+        default=1.0,
+        metadata={"help": "Nucleus sampling probability threshold (0.0, 1.0]."},
+    )
+    top_k: int = field(
+        default=int(1e8),
+        metadata={"help": "Number of highest probability tokens to consider."},
+    )
+    temperature: float = field(
+        default=1.0,
+        metadata={"help": "Sampling temperature. Higher values increase diversity."},
+    )
     turn_discount: float = field(
         default=1.0,
         metadata={"help": "Discount factor for multi-turn reward propagation."},

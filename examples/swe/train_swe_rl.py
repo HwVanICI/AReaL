@@ -128,6 +128,7 @@ def main(args):
         econfig=econfig_dict,
         gen_args=dict(
             temperature=config.gconfig.temperature,
+            max_tokens=config.gconfig.max_tokens,
             max_completion_tokens=config.gconfig.max_new_tokens,
         ),
         timeout=econfig.timeout,
@@ -137,6 +138,7 @@ def main(args):
     eval_workflow_kwargs = workflow_kwargs.copy()
     eval_workflow_kwargs["gen_args"] = dict(
         temperature=0.0,
+        max_tokens=config.gconfig.max_tokens,
         max_completion_tokens=config.gconfig.max_new_tokens,
     )
 

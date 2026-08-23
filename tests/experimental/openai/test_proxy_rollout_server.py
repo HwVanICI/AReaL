@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
 
+from areal.api.cli_args import AgentConfig, GenerationHyperparameters
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
 from areal.experimental.openai.proxy.server import SessionData, deserialize_interactions
 from areal.experimental.openai.proxy.tensor_reference import (
@@ -36,6 +40,16 @@ def _reset_server_globals(monkeypatch):
     monkeypatch.setattr(srv, "_last_cleanup_time", 0.0)
     monkeypatch.setattr(srv, "_processor_cache_registry", ProcessorCacheRegistry())
     monkeypatch.setattr(srv, "_group_tensor_store_registry", GroupTensorStoreRegistry())
+    monkeypatch.setattr(
+        srv,
+        "_generation_params",
+        {
+            "max_completion_tokens": 16384,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": int(1e8),
+        },
+    )
 
 
 httpx = pytest.importorskip("httpx")
@@ -45,6 +59,35 @@ _transport = httpx.ASGITransport(app=srv.app)
 
 def _client():
     return httpx.AsyncClient(transport=_transport, base_url="http://testserver")
+
+
+def _create_fn_with_token_aliases() -> AsyncMock:
+    async def create(
+        *,
+        messages=None,
+        input=None,
+        max_tokens=None,
+        max_completion_tokens=None,
+        max_output_tokens=None,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        areal_cache=None,
+    ): ...
+
+    create_fn = AsyncMock(return_value="ok")
+    create_fn.__signature__ = inspect.signature(create)
+    return create_fn
+
+
+def test_agent_sampling_defaults_match_generation_hyperparameters():
+    agent = AgentConfig(agent_cls_path="tests.experimental.openai.utils.SimpleAgent")
+    generation = GenerationHyperparameters()
+
+    assert agent.temperature == generation.temperature
+    assert agent.top_p == generation.top_p
+    assert agent.top_k == generation.top_k
+    assert agent.max_completion_tokens == generation.max_new_tokens
 
 
 def _admin_headers():
@@ -141,6 +184,83 @@ class TestStartSessionApiKey:
                 json={"task_id": "t", "api_key": "busy-key"},
             )
         assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_call_client_create_injects_configured_generation_params(monkeypatch):
+    session_id = "sampling-session"
+    monkeypatch.setattr(srv, "_openai_client", object())
+    srv._session_cache[session_id] = SessionData(session_id=session_id)
+    monkeypatch.setattr(
+        srv,
+        "_generation_params",
+        {
+            "max_completion_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 50,
+        },
+    )
+    create_fn = _create_fn_with_token_aliases()
+
+    result = await srv._call_client_create(
+        create_fn=create_fn,
+        request={
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.1,
+            "top_p": 0.2,
+            "top_k": 3,
+            "max_tokens": 64,
+            "max_completion_tokens": 128,
+            "max_output_tokens": 256,
+        },
+        session_id=session_id,
+    )
+
+    assert result == "ok"
+    assert create_fn.await_args.kwargs["temperature"] == 0.7
+    assert create_fn.await_args.kwargs["top_p"] == 0.8
+    assert create_fn.await_args.kwargs["top_k"] == 50
+    assert create_fn.await_args.kwargs["max_completion_tokens"] == 4096
+    assert "max_tokens" not in create_fn.await_args.kwargs
+    assert "max_output_tokens" not in create_fn.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_responses_injects_max_output_tokens(monkeypatch):
+    session_id = "responses-session"
+    srv._session_cache[session_id] = SessionData(session_id=session_id)
+    create_fn = _create_fn_with_token_aliases()
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(responses=SimpleNamespace(create=create_fn)),
+    )
+    monkeypatch.setattr(
+        srv,
+        "_generation_params",
+        {
+            "max_completion_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 50,
+        },
+    )
+
+    result = await srv.responses(
+        request={
+            "input": "hi",
+            "max_tokens": 64,
+            "max_completion_tokens": 128,
+            "max_output_tokens": 256,
+        },
+        session_id=session_id,
+    )
+
+    assert result == "ok"
+    assert create_fn.await_args.kwargs["max_output_tokens"] == 4096
+    assert "max_tokens" not in create_fn.await_args.kwargs
+    assert "max_completion_tokens" not in create_fn.await_args.kwargs
 
 
 # ---------------------------------------------------------------------------
