@@ -7,8 +7,7 @@ total_train_epochs: 10
 total_train_steps: 100
 tokenizer_path: ${actor.path}
 
-# Clean up external SWE sandbox instances after the run (LOG_DIR is injected).
-post_exit_hook: 'AWE_ROOT=\${AWEAGENT_ROOT:-\${SWE_AGENT_ROOT:-/path/to/AReaL-SWEAgent}}; cd "$AWE_ROOT" && PYTHONPATH=$PWD:$PYTHONPATH pip install -q -r requirements.txt && AENV_SYSTEM_URL=\${AENV_SYSTEM_URL} python -m aweagent.maintenance.clean_instances'
+post_exit_hook: ""
 
 cluster:
   # 4 nodes x 8 GPUs: 2 for rollout (SGLang), 2 for actor (Megatron).
@@ -159,15 +158,18 @@ actor:
         # Workers must import both AReaL and the external AReaL-SWEAgent.
         PYTHONPATH: "/path/to/AReaL-SWEAgent:/path/to/AReaL"
         AENV_SYSTEM_URL: "http://your-aenv-service:8080"
+        SWE_SANDBOX_BACKEND: "${oc.env:SWE_SANDBOX_BACKEND,aenv}"
         SWE_AGENT_ROOT: "/path/to/AReaL-SWEAgent"
         AWEAGENT_ROOT: "/path/to/AReaL-SWEAgent"
         OPENAI_MODEL: "Qwen3-Coder-30B-A3B-Instruct"
-      additional_bash_cmds:
-        # Install AReaL-SWEAgent's aenv/fastmcp into the venv the workers use.
-        - "/opt/.venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true"
-        - "/opt/.venv/bin/python -m pip install --no-deps aenvironment==0.1.8rc2 || echo 'WARN: aenvironment install failed'"
-        - "/opt/.venv/bin/python -m pip install 'fastmcp<3' || echo 'WARN: fastmcp install failed'"
-        - "/opt/.venv/bin/python -c 'import aenv, aweagent' || echo 'WARN: aenv/aweagent import failed'"
+        # E2B-compatible gateway settings. They are unused on the AEnv path.
+        E2B_API_KEY: "${oc.env:E2B_API_KEY,}"
+        AWEAGENT_E2B_IMAGE_METADATA_KEY: "${oc.env:AWEAGENT_E2B_IMAGE_METADATA_KEY,}"
+        AWEAGENT_E2B_SIZE: "${oc.env:AWEAGENT_E2B_SIZE,md}"
+        AWEAGENT_NODE_TARBALL: "${oc.env:AWEAGENT_NODE_TARBALL,}"
+        AWEAGENT_CC_TARBALL: "${oc.env:AWEAGENT_CC_TARBALL,}"
+        AWEAGENT_CODEX_TARBALL: "${oc.env:AWEAGENT_CODEX_TARBALL,}"
+        AWEAGENT_OPENCODE_TARBALL: "${oc.env:AWEAGENT_OPENCODE_TARBALL,}"
 
 ref:
   experiment_name: ${experiment_name}
@@ -188,14 +190,17 @@ ref:
     target: actor
   scheduling_spec: ${actor.scheduling_spec}
 
-# SWE-bench agent environment. Set agent_type=cc to train Claude Code through
-# the same proxy path. agent_root points at the external AReaL-SWEAgent checkout.
+# SWE-bench agent environment. Set agent_type=cc, codex, or opencode to train a
+# delegated CLI through the same proxy path. Codex/OpenCode require E2B.
 econfig:
   dataset_path: ""
-  agent_type: swe
+  agent_type: ${oc.env:SWE_AGENT_TYPE,swe}
+  sandbox_backend: ${oc.env:SWE_SANDBOX_BACKEND,aenv}
   agent_config: ""
   swe_agent_config: 1_0_0/min-swe-agent-train-top1
   cc_agent_config: train_cc_time3600
+  codex_agent_config: train_codex_time3600
+  opencode_agent_config: train_opencode_time3600
   agent_root: /path/to/AReaL-SWEAgent
   swe_agent_root: /path/to/AReaL-SWEAgent
   llm_model: ""
