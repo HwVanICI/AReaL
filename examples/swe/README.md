@@ -86,6 +86,19 @@ With `scheduler.type=slurm`, AReaL launches the rollout / actor / proxy workers;
 rollout calls into AReaL-SWEAgent, which runs the agent in a sandbox and returns the
 reward.
 
+To run the same dataset and workflow without launching the actor or performing any
+training, use the rollout-only entry point with the same YAML and overrides:
+
+```bash
+python -m examples.swe.rollout_swe --config examples/swe/qwen3_30b_a3b_grpo.yaml
+```
+
+This launches only the rollout engine and proxy workers. It traverses the dataset
+exactly once in source order, including the final partial batch, regardless of the
+dataset `shuffle` setting. It ignores the training-only `total_train_epochs`,
+`total_train_steps`, and rollout staleness limits. Trajectories are written when
+`rollout.dump_to_file=true`.
+
 ## 6. Set up the AEnvironment backend
 
 `AENV_SYSTEM_URL` (section 2) must point at a running
