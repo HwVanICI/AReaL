@@ -1,7 +1,7 @@
 # SWE-bench RL training with AReaL-SWEAgent
 
 This example runs SWE-bench coding-agent RL (GRPO) in AReaL. The actual agent loop,
-sandboxing and reward computation live in a **separate repository**,
+sandboxing and reward computation live in the bundled or external
 [AReaL-SWEAgent](https://github.com/areal-project/AReaL-SWEAgent): for each SWE-bench
 instance it edits code inside an isolated sandbox, grades the patch, and returns a
 reward for the RL loop. AReaL serves the policy being trained and drives rollouts
@@ -16,13 +16,12 @@ AReaL (this repo)                         AReaL-SWEAgent (separate checkout)
 
 ## 1. Get AReaL-SWEAgent
 
-Clone it next to AReaL (the default lookup path is `../AReaL-SWEAgent`) and install its
-dependencies into the same environment AReaL workers run in:
+This checkout includes `AReaL-SWEAgent/`. A sibling checkout remains supported. Install
+the extra for the sandbox backend into the environment used by every AReaL worker:
 
 ```bash
-git clone https://github.com/areal-project/AReaL-SWEAgent.git
 cd AReaL-SWEAgent
-pip install -r requirements.txt
+pip install -e ".[aenv]"  # or: pip install -e ".[e2b]"
 ```
 
 AReaL imports it as the Python package `aweagent`; the repository directory name
@@ -34,7 +33,7 @@ AReaL discovers the checkout in this order (first match wins):
 
 1. `econfig.agent_root` in your YAML (legacy alias: `econfig.swe_agent_root`).
 1. `AWEAGENT_ROOT` / `SWE_AGENT_ROOT` environment variable.
-1. `../AReaL-SWEAgent` relative to the AReaL repo root.
+1. `AReaL-SWEAgent` under the AReaL repo root, then a sibling checkout.
 
 In a multi-node / containerized setup the checkout must be importable on every worker,
 so put it on shared storage and set both the env var and `PYTHONPATH`, e.g. in the
@@ -55,10 +54,13 @@ The SWE example reads an `econfig` block (see `examples/swe/utils.py`):
 
 | Field                   | Meaning                                                                                                     |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `agent_type`            | Agent to run: `swe` (built-in tool-use) or `cc` (Claude Code).                                              |
+| `agent_type`            | Agent to run: `swe` (built-in tool-use), `cc` (Claude Code), `codex`, or `opencode`.                        |
+| `sandbox_backend`       | `aenv` or `e2b`; E2B supports `cc`, `codex`, and `opencode`, while AEnv supports `swe` and `cc`.            |
 | `agent_config`          | Generic config name under `AReaL-SWEAgent/aweagent/configs/`. Overrides the per-type fields below when set. |
 | `swe_agent_config`      | Config used when `agent_type=swe` (default `1_0_0/min-swe-agent-train-top1`).                               |
 | `cc_agent_config`       | Config used when `agent_type=cc`.                                                                           |
+| `codex_agent_config`    | Config used when `agent_type=codex` (default `train_codex_time3600`).                                       |
+| `opencode_agent_config` | Config used when `agent_type=opencode` (default `train_opencode_time3600`).                                 |
 | `agent_root`            | Path to the AReaL-SWEAgent checkout (see section 2).                                                        |
 | `step_limit`            | Max agent interaction steps per episode.                                                                    |
 | `max_completion_tokens` | Max completion tokens per agent LLM call.                                                                   |
@@ -72,6 +74,8 @@ SWE-bench instance with at least:
 - `instance_id` — e.g. `django__django-10097`
 - `problem_statement` — the GitHub issue text
 - `eval_script` — shell script used by AReaL-SWEAgent to grade the patch
+- E2B only: `image` (metadata-routed OCI image) and optional `workdir` (default
+  `/testbed`)
 
 ## 5. Run
 
@@ -201,3 +205,70 @@ AReaL itself:
 The concrete agent behaviour — system prompt, `cli_flags`, tool allow-list,
 thinking-token budgets — lives entirely in the AReaL-SWEAgent cc config; see that
 repository for the available `cc_agent_config` values and their fields.
+
+## 8. Use the E2B-compatible Claude Code backend
+
+This path does not import or call AEnvironment. It follows Slime's metadata-routed E2B
+API and starts a remote sandbox for Claude Code plus a fresh sandbox for grading:
+
+```bash
+export SWE_AGENT_TYPE=cc
+export SWE_SANDBOX_BACKEND=e2b
+export E2B_API_KEY=...
+export AWEAGENT_E2B_IMAGE_METADATA_KEY=your.gateway/image
+export AWEAGENT_NODE_TARBALL=/shared/node-v22-linux-x64.tar.xz
+export AWEAGENT_CC_TARBALL=/shared/claude-code.tgz
+
+python -m examples.swe.train_swe_rl \
+  --config examples/swe/qwen3_30b_a3b_grpo.yaml
+```
+
+The E2B sandbox must be able to connect to the `base_url` advertised by AReaL's proxy.
+Claude Code receives that URL and the trajectory-specific API key as
+`ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`; requests to `/v1/messages` are recorded by
+AReaL and become the on-policy trajectory used by GRPO.
+
+## 9. Use the E2B-compatible Codex backend
+
+Codex uses the same E2B task metadata, fresh grading sandbox, AReaL workflow, and
+training YAML as section 8. Select the Codex agent and provide its npm tarball:
+
+```bash
+export SWE_AGENT_TYPE=codex
+export SWE_SANDBOX_BACKEND=e2b
+export E2B_API_KEY=...
+export AWEAGENT_E2B_IMAGE_METADATA_KEY=your.gateway/image
+export AWEAGENT_NODE_TARBALL=/shared/node-v22-linux-x64.tar.xz
+export AWEAGENT_CODEX_TARBALL=/shared/codex.tgz
+
+python -m examples.swe.train_swe_rl \
+  --config examples/swe/qwen3_30b_a3b_grpo.yaml
+```
+
+`E2BCodex` writes a custom provider into `/home/agent/.codex/config.toml`, then runs
+`codex exec --skip-git-repo-check` in the task repository. The provider's base URL is
+the trajectory-specific AReaL proxy URL with `/v1` appended, and the proxy session key
+is passed as `OPENAI_API_KEY`. As with Claude Code, the E2B sandbox must be able to
+reach the proxy URL directly.
+
+## 10. Use the E2B-compatible OpenCode backend
+
+OpenCode uses the same E2B task metadata, clean grading sandbox, workflow, and training
+YAML. Select `opencode` and provide the npm package tarball:
+
+```bash
+export SWE_AGENT_TYPE=opencode
+export SWE_SANDBOX_BACKEND=e2b
+export E2B_API_KEY=...
+export AWEAGENT_E2B_IMAGE_METADATA_KEY=your.gateway/image
+export AWEAGENT_NODE_TARBALL=/shared/node-v22-linux-x64.tar.xz
+export AWEAGENT_OPENCODE_TARBALL=/shared/opencode-ai.tgz
+
+python -m examples.swe.train_swe_rl \
+  --config examples/swe/qwen3_30b_a3b_grpo.yaml
+```
+
+`E2BOpenCode` configures an `@ai-sdk/openai-compatible` provider and runs
+`opencode run --model <provider>/<model>` in the task repository. The provider uses the
+trajectory-specific AReaL proxy URL and `OPENAI_API_KEY`; the E2B sandbox must be able
+to reach that URL directly.
