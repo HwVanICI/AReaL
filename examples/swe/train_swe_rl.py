@@ -1,13 +1,11 @@
 """Training script for SWE-bench agent RL with AReaL proxy mode."""
 
-import json
 import sys
 import warnings
 from pathlib import Path
 from typing import Any
 
-from datasets import Dataset
-
+from examples.swe.dataset import get_swe_dataset, resolve_swe_dataset_path
 from examples.swe.utils import SWEPPOConfig
 
 from areal import PPOTrainer
@@ -15,65 +13,6 @@ from areal.api.cli_args import load_expr_config
 from areal.utils import logging
 
 logger = logging.getLogger("SWETrain")
-
-
-def get_swe_dataset(
-    dataset_path: str,
-    split: str = "train",
-    min_items: int = 64,
-) -> Dataset:
-    """Create a HuggingFace Dataset from a SWE-bench JSONL file.
-
-    Each line in the JSONL file should be a SWE-bench instance with at minimum:
-    - instance_id: The SWE-bench instance ID (e.g., "django__django-10097")
-    - problem_statement: The GitHub issue description
-    - eval_script: Shell script to evaluate the agent's fix
-
-    Args:
-        dataset_path: Path to the SWE-bench JSONL file.
-        split: Informational split label (not used for filtering).
-        min_items: Minimum dataset size; items are duplicated if fewer exist.
-
-    Returns:
-        HuggingFace Dataset of SWE-bench instances.
-    """
-    path = Path(dataset_path)
-    if not path.exists():
-        raise FileNotFoundError(f"SWE-bench dataset not found: {dataset_path}")
-
-    dataset_items = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            item = json.loads(line)
-            if "instance_id" not in item:
-                logger.warning(f"Skipping item missing 'instance_id': {line[:100]}")
-                continue
-            if "problem_statement" not in item:
-                logger.warning(
-                    "Skipping item missing 'problem_statement': "
-                    f"{item.get('instance_id')}"
-                )
-                continue
-            dataset_items.append(item)
-
-    if not dataset_items:
-        raise ValueError(f"No valid items found in dataset: {dataset_path}")
-
-    # Duplicate dataset if fewer than min_items for efficient batching
-    if len(dataset_items) < min_items:
-        original_items = dataset_items.copy()
-        while len(dataset_items) < min_items:
-            dataset_items.extend(original_items)
-
-    dataset = Dataset.from_list(dataset_items)
-    logger.info(
-        f"Created SWE dataset with {len(dataset)} items "
-        f"from {dataset_path} (split={split})"
-    )
-    return dataset
 
 
 def group_filter(x: dict[str, Any]):
@@ -158,26 +97,19 @@ def main(args):
         ray.init(address="auto", ignore_reinit_error=True)
         _install_aweagent_deps_on_ray_nodes(_resolve_aweagent_root(econfig))
 
-    # Resolve dataset paths from config
-    train_path = config.train_dataset.path
-    valid_path = config.valid_dataset.path
-
-    def resolve_path(p: str) -> str:
-        if Path(p).is_absolute() or Path(p).exists():
-            return p
-        if econfig.dataset_path:
-            candidate = Path(econfig.dataset_path) / p
-            if candidate.exists():
-                return str(candidate)
-        return p
-
     train_dataset = get_swe_dataset(
-        dataset_path=resolve_path(train_path),
+        dataset_path=resolve_swe_dataset_path(
+            config.train_dataset.path, econfig.dataset_path
+        ),
         split="train",
+        min_items=64,
     )
     valid_dataset = get_swe_dataset(
-        dataset_path=resolve_path(valid_path),
+        dataset_path=resolve_swe_dataset_path(
+            config.valid_dataset.path, econfig.dataset_path
+        ),
         split="test",
+        min_items=64,
     )
 
     # Build workflow kwargs
