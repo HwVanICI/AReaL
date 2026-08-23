@@ -11,12 +11,16 @@ class SWEEnvConfig:
 
     Attributes:
         dataset_path: Path to the SWE-bench JSONL dataset file.
-        agent_type: AReaL-SWEAgent agent type to train, e.g. ``swe`` or ``cc``.
+        agent_type: AReaL-SWEAgent agent type to train: ``swe``, ``cc``,
+            ``codex``, or ``opencode``.
+        sandbox_backend: Remote sandbox provider, ``aenv`` or ``e2b``.
         agent_config: Generic AReaL-SWEAgent config name. When set, this overrides
             the compatibility fields below.
         swe_agent_config: Compatibility config field for ``agent_type=swe``.
         cc_agent_config: Compatibility config field for ``agent_type=cc``.
-        agent_root: Root directory of the external AReaL-SWEAgent checkout.
+        codex_agent_config: Config field for ``agent_type=codex``.
+        opencode_agent_config: Config field for ``agent_type=opencode``.
+        agent_root: Root directory of the bundled or external AReaL-SWEAgent checkout.
         swe_agent_root: Legacy alias for ``agent_root``.
         llm_model: Optional LLM model override for OH/OpenCode/Codex agents.
         opencode_provider: Optional OpenCode provider override.
@@ -34,8 +38,17 @@ class SWEEnvConfig:
         default="swe",
         metadata={
             "help": (
-                "AReaL-SWEAgent agent type to run. Supported by AReaL-SWEAgent main: "
-                "'swe', 'cc', 'oh', 'opencode', and 'codex'."
+                "AReaL-SWEAgent agent type to run: 'swe', 'cc', 'codex', or "
+                "'opencode'. Codex and OpenCode require sandbox_backend='e2b'."
+            )
+        },
+    )
+    sandbox_backend: str = field(
+        default="aenv",
+        metadata={
+            "help": (
+                "Sandbox backend used by AReaL-SWEAgent. E2B supports Claude Code, "
+                "Codex, and OpenCode; AEnvironment supports SWE and Claude Code."
             )
         },
     )
@@ -44,7 +57,8 @@ class SWEEnvConfig:
         metadata={
             "help": (
                 "Generic AReaL-SWEAgent YAML config name. When non-empty, overrides "
-                "swe_agent_config / cc_agent_config."
+                "swe_agent_config / cc_agent_config / codex_agent_config / "
+                "opencode_agent_config."
             )
         },
     )
@@ -52,8 +66,8 @@ class SWEEnvConfig:
         default="1_0_0/min-swe-agent-train-top1",
         metadata={
             "help": (
-                "Name of the AReaL-SWEAgent YAML config under the external AReaL-SWEAgent "
-                "checkout. Defaults to the Qwen SWE-RL training config."
+                "Name of the AReaL-SWEAgent YAML config under the external "
+                "AReaL-SWEAgent checkout. Defaults to the Qwen SWE-RL training config."
             )
         },
     )
@@ -66,12 +80,29 @@ class SWEEnvConfig:
             )
         },
     )
+    codex_agent_config: str = field(
+        default="train_codex_time3600",
+        metadata={
+            "help": (
+                "Name of the AReaL-SWEAgent YAML config used when agent_type='codex'."
+            )
+        },
+    )
+    opencode_agent_config: str = field(
+        default="train_opencode_time3600",
+        metadata={
+            "help": (
+                "Name of the AReaL-SWEAgent YAML config used when "
+                "agent_type='opencode'."
+            )
+        },
+    )
     agent_root: str = field(
         default="",
         metadata={
             "help": (
-                "Root directory of the external AReaL-SWEAgent checkout. Defaults to "
-                "../AReaL-SWEAgent relative to the AReaL repository when unset."
+                "Root directory of the AReaL-SWEAgent checkout. Defaults to a bundled "
+                "checkout, then ../AReaL-SWEAgent, when unset."
             )
         },
     )

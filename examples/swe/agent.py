@@ -22,16 +22,19 @@ _DEFAULT_AGENT_CONFIGS = {
     "swe": "1_0_0/min-swe-agent-train-top1",
     "cc": "train_cc_time3600",
     "oh": "eval_oh",
-    "opencode": "eval_opencode",
-    "codex": "eval_codex",
+    "opencode": "train_opencode_time3600",
+    "codex": "train_codex_time3600",
 }
 
 
 def _default_aweagent_root() -> str:
-    """Return the default sibling checkout path for AReaL-SWEAgent."""
+    """Return the bundled checkout when present, otherwise the sibling checkout."""
     areal_root = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
+    bundled = os.path.join(areal_root, "AReaL-SWEAgent")
+    if os.path.isdir(bundled):
+        return bundled
     return os.path.join(os.path.dirname(areal_root), "AReaL-SWEAgent")
 
 
@@ -42,7 +45,7 @@ def _ensure_aweagent_importable(aweagent_root: str = "") -> str:
     1. Explicit ``aweagent_root`` argument (``econfig.agent_root`` /
        ``econfig.aweagent_root`` / ``econfig.swe_agent_root``).
     2. ``AWEAGENT_ROOT`` / ``SWE_AGENT_ROOT`` / ``SWEAGENT_ROOT`` env vars.
-    3. ``../AReaL-SWEAgent`` relative to the AReaL repository root.
+    3. Bundled ``AReaL-SWEAgent`` under the AReaL root, then a sibling checkout.
 
     Returns the resolved AReaL-SWEAgent checkout root.
     """
@@ -89,6 +92,15 @@ def _configured_agent_type(econfig: dict[str, Any]) -> str:
     return agent_type
 
 
+def _configured_sandbox_backend(econfig: dict[str, Any]) -> str:
+    backend = str(econfig.get("sandbox_backend") or "aenv").strip().lower()
+    if backend not in {"aenv", "e2b"}:
+        raise ValueError(
+            f"econfig.sandbox_backend must be 'aenv' or 'e2b', got {backend!r}"
+        )
+    return backend
+
+
 def _configured_agent_config(econfig: dict[str, Any], agent_type: str) -> str:
     return (
         econfig.get("agent_config")
@@ -102,10 +114,10 @@ def _configured_agent_config(econfig: dict[str, Any], agent_type: str) -> str:
 class SWEAgentWorkflow:
     """AReaL-SWEAgent workflow for AReaL proxy mode.
 
-    This workflow runs an AReaL-SWEAgent agent type (``swe``, ``cc``, ``oh``,
-    ``opencode``, or ``codex``) on SWE-bench style records in sandboxed
-    environments. The agent's LLM calls are routed through AReaL's proxy
-    server for on-policy RL training.
+    This workflow runs an AReaL-SWEAgent agent type (``swe``, ``cc``,
+    ``codex``, or ``opencode``) on SWE-bench style records in sandboxed
+    environments. The agent's LLM calls are routed through AReaL's proxy server
+    for on-policy RL training.
 
     The workflow delegates to AReaL-SWEAgent's ``run_agent_with_reward``, passing
     the AReaL proxy URL + per-rollout API key as explicit kwargs so that the
@@ -114,7 +126,9 @@ class SWEAgentWorkflow:
     Args:
         econfig: Environment configuration dict. Key fields include
             ``agent_type``, ``agent_config``, ``swe_agent_config``,
-            ``cc_agent_config``, ``agent_root`` / ``swe_agent_root``,
+            ``cc_agent_config``, ``codex_agent_config``,
+            ``opencode_agent_config``, ``sandbox_backend``, ``agent_root`` /
+            ``swe_agent_root``,
             ``llm_model``, ``opencode_provider``, ``codex_provider``,
             and ``timeout``.
         gen_args: Generation arguments (unused; token limits come from
@@ -148,6 +162,8 @@ class SWEAgentWorkflow:
                 - instance_id (str): SWE-bench instance ID
                 - problem_statement (str): The GitHub issue description
                 - eval_script (str): Shell script for reward evaluation
+                - image/image_url (str): E2B image routing metadata value
+                - workdir (str): Repository path in the image (default /testbed)
             **extra_kwargs: Additional kwargs injected by AReaL proxy infra:
                 - base_url (str): Proxy server URL for the agent LLM.
                 - api_key (str): Per-rollout API key for the proxy session.
@@ -166,6 +182,7 @@ class SWEAgentWorkflow:
             econfig.update(data["econfig"])
 
         agent_type = _configured_agent_type(econfig)
+        sandbox_backend = _configured_sandbox_backend(econfig)
         config_name = _configured_agent_config(econfig, agent_type)
         llm_model = econfig.get("llm_model") or os.getenv("LLM_MODEL") or None
         opencode_provider = (
@@ -177,7 +194,7 @@ class SWEAgentWorkflow:
         instance_id = data.get("instance_id", "unknown")
 
         logger.info(
-            f"Starting {agent_type} episode: "
+            f"Starting {agent_type} episode on {sandbox_backend}: "
             f"instance_id={instance_id}, config={config_name}"
         )
         start_time = time.time()
@@ -193,6 +210,7 @@ class SWEAgentWorkflow:
                     llm_model=llm_model,
                     opencode_provider=opencode_provider,
                     codex_provider=codex_provider,
+                    sandbox_backend=sandbox_backend,
                 ),
                 timeout=self.timeout,
             )
@@ -221,6 +239,7 @@ class SWEAgentWorkflow:
         llm_model: str | None,
         opencode_provider: str | None,
         codex_provider: str | None,
+        sandbox_backend: str,
     ) -> float:
         """Execute one episode through AReaL-SWEAgent and return the reward.
 
@@ -247,6 +266,7 @@ class SWEAgentWorkflow:
                 override_llm_model=llm_model,
                 override_opencode_provider=opencode_provider,
                 override_codex_provider=codex_provider,
+                sandbox_backend=sandbox_backend,
             )
         except Exception as e:
             import traceback

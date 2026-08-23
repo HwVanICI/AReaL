@@ -25,15 +25,20 @@ def group_filter(x: dict[str, Any]):
     return x["rewards"].mean() <= 0.95
 
 
-def _install_aweagent_deps_on_ray_nodes(aweagent_root: str):
+def _install_aweagent_deps_on_ray_nodes(
+    aweagent_root: str,
+    sandbox_backend: str,
+):
     """Install AReaL-SWEAgent dependencies on all Ray GPU nodes.
 
-    Each node runs in a separate container with its own venv,
-    so we must ensure packages like ``aenv`` are installed everywhere.
+    Each node runs in a separate container with its own venv, so the selected
+    sandbox client's optional dependencies must be installed everywhere.
     """
     if not aweagent_root:
+        areal_root = Path(__file__).resolve().parents[2]
+        bundled = areal_root / "AReaL-SWEAgent"
         aweagent_root = str(
-            Path(__file__).resolve().parents[2].parent / "AReaL-SWEAgent"
+            bundled if bundled.is_dir() else areal_root.parent / "AReaL-SWEAgent"
         )
     try:
         import ray
@@ -43,14 +48,14 @@ def _install_aweagent_deps_on_ray_nodes(aweagent_root: str):
 
         @ray.remote(num_gpus=0)
         def _install():
-            import os
             import socket
             import subprocess
+            import sys
 
             ip = socket.gethostbyname(socket.gethostname())
-            req_path = os.path.join(aweagent_root, "requirements.txt")
+            install_target = f"{aweagent_root}[{sandbox_backend}]"
             result = subprocess.run(
-                ["uv", "pip", "install", "-r", req_path],
+                [sys.executable, "-m", "pip", "install", "-e", install_target],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -240,7 +245,10 @@ def main(args):
         import ray
 
         ray.init(address="auto", ignore_reinit_error=True)
-        _install_aweagent_deps_on_ray_nodes(_resolve_aweagent_root(econfig))
+        _install_aweagent_deps_on_ray_nodes(
+            _resolve_aweagent_root(econfig),
+            econfig.sandbox_backend,
+        )
 
     train_dataset = get_swe_dataset(
         dataset_path=resolve_swe_dataset_path(
