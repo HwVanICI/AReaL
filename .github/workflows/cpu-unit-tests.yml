@@ -28,7 +28,6 @@ jobs:
       TRANSFORMERS_OFFLINE: "1"
       HF_DATASETS_OFFLINE: "1"
       NO_PROXY: "127.0.0.1,localhost"
-      no_proxy: "127.0.0.1,localhost"
 
     steps:
       - name: Checkout repository
