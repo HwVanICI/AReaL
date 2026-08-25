@@ -1359,6 +1359,7 @@ class FSDPEngine(TrainEngine):
         meta: WeightUpdateMeta,
         named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
         stream: torch.cuda.Stream | None = None,
+        is_last_bucket: bool = False,
     ) -> _PendingWeightUpdateBucket | None:
         # Early exit when chunk size is relatively small
         if not named_tensors:
@@ -1388,6 +1389,12 @@ class FSDPEngine(TrainEngine):
                 "bias": "none",
             }
 
+        bucket_meta = (
+            dataclasses.replace(meta, is_last_bucket=is_last_bucket)
+            if meta.online_quantization == "ascend"
+            else meta
+        )
+
         if len(self.weight_update_groups) > 1:
             # Per-PP-rank groups: broadcast to each group sequentially.
             # Each group's NCCL broadcast must complete before the next
@@ -1396,7 +1403,7 @@ class FSDPEngine(TrainEngine):
             for group_name, group in zip(
                 self.weight_update_group_names, self.weight_update_groups
             ):
-                pp_meta = copy.copy(meta)
+                pp_meta = copy.copy(bucket_meta)
                 pp_meta.nccl_group_name = group_name
                 fut = self.rollout_engine.update_weights_from_distributed(
                     pp_meta, param_specs
@@ -1415,7 +1422,9 @@ class FSDPEngine(TrainEngine):
             )
 
         # Single group: original async path
-        fut = self.rollout_engine.update_weights_from_distributed(meta, param_specs)
+        fut = self.rollout_engine.update_weights_from_distributed(
+            bucket_meta, param_specs
+        )
 
         handles = []
         if stream is not None:
@@ -1458,9 +1467,10 @@ class FSDPEngine(TrainEngine):
         self,
         meta: WeightUpdateMeta,
         named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
+        is_last_bucket: bool = False,
     ):
         pending_bucket = self._update_bucket_weights_from_distributed_async(
-            meta, named_tensors
+            meta, named_tensors, is_last_bucket=is_last_bucket
         )
         self._wait_pending_weight_update_bucket(pending_bucket)
 
@@ -1607,6 +1617,11 @@ class FSDPEngine(TrainEngine):
         )
 
         main_rank = dist.get_rank() == 0
+        ascend_online = meta.online_quantization == "ascend"
+        if ascend_online:
+            meta.pp_rank = 0
+            meta.pp_world_size = 1
+
         if main_rank:
             self.rollout_engine.pause_generation()
 
@@ -1679,7 +1694,9 @@ class FSDPEngine(TrainEngine):
 
             # Process remaining parameters
             if buffer_size > 0:
-                self._update_bucket_weights_from_distributed(meta, named_tensors)
+                self._update_bucket_weights_from_distributed(
+                    meta, named_tensors, is_last_bucket=True
+                )
         finally:
             if main_rank and pending_bucket is not None:
                 self._wait_pending_weight_update_bucket(pending_bucket)
