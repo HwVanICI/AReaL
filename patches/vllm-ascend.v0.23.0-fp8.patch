@@ -1,0 +1,44 @@
+diff --git a/vllm_ascend/quantization/methods/w8a8_mxfp8.py b/vllm_ascend/quantization/methods/w8a8_mxfp8.py
+index 09916f60..39b58426 100644
+--- a/vllm_ascend/quantization/methods/w8a8_mxfp8.py
++++ b/vllm_ascend/quantization/methods/w8a8_mxfp8.py
+@@ -141,6 +141,24 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
+         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+         layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1).contiguous()
+ 
++        inference_scale = getattr(layer, "_mxfp8_rl_inference_scale", None)
++        if inference_scale is not None:
++            if layer.weight.data_ptr() != layer._mxfp8_rl_inference_weight_ptr:
++                raise RuntimeError(
++                    "[vllm-ascend/W8A8_MXFP8] Reloading changed the inference "
++                    "weight storage captured by ACL Graph."
++                )
++            if layer.weight_scale.shape != inference_scale.shape:
++                raise RuntimeError(
++                    "[vllm-ascend/W8A8_MXFP8] Reloaded weight_scale shape does "
++                    "not match the inference buffer captured by ACL Graph."
++                )
++            target_scale = layer.weight_scale.data
++            layer.weight_scale.data = inference_scale
++            layer.weight_scale.data.copy_(target_scale)
++            del layer._mxfp8_rl_inference_weight_ptr
++            del layer._mxfp8_rl_inference_scale
++
+         # Mark as transformed
+         layer._mxfp8_transformed = True
+ 
+@@ -175,6 +193,14 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
+         orig_shapes = layer._mxfp8_original_shapes
+         orig_scale_shape = orig_shapes["weight_scale"]
+ 
++        if hasattr(layer, "_mxfp8_rl_inference_scale"):
++            raise RuntimeError(
++                "[vllm-ascend/W8A8_MXFP8] A previous RL weight reload did not "
++                "finish processing."
++            )
++        layer._mxfp8_rl_inference_weight_ptr = layer.weight.data_ptr()
++        layer._mxfp8_rl_inference_scale = layer.weight_scale.data
++
+         # Restore weight: (input_size, output_size) -> (output_size, input_size)
+         target_weight = layer.weight.data.transpose(0, 1).contiguous()
+         layer.weight.data = layer.weight.data.transpose(0, 1)

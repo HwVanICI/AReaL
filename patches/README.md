@@ -1,17 +1,20 @@
 # Third-party patches
 
-Upstream bugfixes applied to the pinned vLLM / vllm-ascend sources during the NPU image
-build (`Dockerfile.a2`, `Dockerfile.a3`). Each patch is applied with `git apply`
-immediately after its `pip install -e .`, so a patch that no longer applies fails the
-build instead of silently dropping the fix.
+Bugfixes carried against the pinned vLLM / vllm-ascend sources used by NPU images.
+Patches referenced by `Dockerfile.a2` and `Dockerfile.a3` are applied with `git apply`
+immediately after their corresponding `pip install -e .`, so a patch that no longer
+applies fails the build instead of silently dropping the fix. The MXFP8 rollout patch
+is reserved for the A5 FP8 rollout image and is not applied by the current A2/A3
+Dockerfiles.
 
-| Patch                       | Applies to                     | Upstream                                                                      |
-| --------------------------- | ------------------------------ | ----------------------------------------------------------------------------- |
-| `vllm.v0.23.0.patch`        | vLLM `v0.23.0`                 | [vllm#44483](https://github.com/vllm-project/vllm/pull/44483)                 |
-| `vllm-ascend.v0.23.0.patch` | vllm-ascend `releases/v0.23.0` | [vllm-ascend#11548](https://github.com/vllm-project/vllm-ascend/issues/11548) |
+| Patch                                  | Applies to                                        | Upstream                                                                      |
+| -------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `vllm.v0.23.0.patch`                   | vLLM `v0.23.0`                                    | [vllm#44483](https://github.com/vllm-project/vllm/pull/44483)                 |
+| `vllm-ascend.v0.23.0.patch`            | vllm-ascend `releases/v0.23.0`                    | [vllm-ascend#11548](https://github.com/vllm-project/vllm-ascend/issues/11548) |
+| `vllm-ascend.v0.23.0-fp8.patch`        | vllm-ascend `releases/v0.23.0` (`eaefc536`)       | Local AReaL fix                                                               |
 
-Both bugs sit on the sleep/wake path that AReaL drives between rollout and training, so
-both are load-bearing for NPU RL runs.
+The first two bugs sit on the sleep/wake path that AReaL drives between rollout and
+training, so both are load-bearing for the current NPU RL images.
 
 - **vllm#44483** — merged upstream on 2026-06-24, after the `v0.23.0` tag, so it must be
   backported. A partial `wake_up(tags=["weights"])` resumed the scheduler and let DP
@@ -23,6 +26,11 @@ both are load-bearing for NPU RL runs.
   fix. `NPUWorker.wake_up()` had the `hidden_size` dimension index swapped between its
   `w13_weight` and `w2_weight` branches, re-transposing expert weights restored from
   sleep and breaking the next inference with a shape mismatch.
+- **vllm-ascend MXFP8 ACL Graph** — local support for online MXFP8 rollout reloads.
+  Restore and post-load processing temporarily change the weight and scale layouts;
+  the patch preserves the inference weight storage and scale buffer captured by ACL
+  Graph, then copies the reloaded scale back into that stable buffer before inference
+  resumes.
 
 ## Patching dirties the tree, which changes `vllm.__version__`
 
@@ -42,10 +50,10 @@ It relies on the install being editable. Without `-e`, pip would copy the source
 install time and the patch would land on a copy nothing imports, silently dropping the
 fix. Both installs must therefore stay `-e`.
 
-Each `git apply` is followed by an assertion that the recorded version still equals the
-tag, so a regression here fails the build rather than the first rollout of a training
-run. It reads `vllm/_version.py` directly rather than importing vLLM, which at that
-point in the build has neither torch nor an NPU available.
+Each Docker-applied `git apply` is followed by an assertion that the recorded version
+still equals the tag, so a regression here fails the build rather than the first
+rollout of a training run. It reads `vllm/_version.py` directly rather than importing
+vLLM, which at that point in the build has neither torch nor an NPU available.
 
 For an already-built image with the wrong version baked in, `VLLM_VERSION=0.23.0` in the
 run environment is vllm-ascend's own override and fixes it without a rebuild.
