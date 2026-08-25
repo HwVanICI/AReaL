@@ -739,16 +739,18 @@ class FP8EngineConfig:
     mode: str = field(
         default="e4m3",
         metadata={
-            "help": "FP8 precision mode. Options: "
-            "'e4m3' (uniform e4m3), "
-            "'hybrid' (e4m3 for activations/weights, e5m2 for output activation gradients)."
+            "help": "FP8 precision mode. Megatron/Transformer Engine supports "
+            "'e4m3' and 'hybrid'; MindSpeed additionally supports 'hif8'."
         },
     )
 
     recipe: str = field(
         default="delayed",
         metadata={
-            "help": "FP8 scaling recipe. Options: 'tensorwise', 'delayed', 'mxfp8' (Blackwell only), 'blockwise'."
+            "help": "FP8 scaling recipe. Megatron/Transformer Engine supports "
+            "'tensorwise', 'delayed', 'mxfp8', and 'blockwise' subject to "
+            "backend hardware support; MindSpeed additionally supports "
+            "'mxfp8-32x32'."
         },
     )
 

@@ -1985,6 +1985,9 @@ class MegatronEngine(TrainEngine):
         If either training uses FP8, quantization_config must exist
         and quant_method must be "fp8" (weights must be FP8).
         """
+        if is_npu_available:
+            return
+
         train_fp8 = self.enable_fp8
         weights_fp8 = (
             self.quantization_config is not None
@@ -2868,6 +2871,26 @@ class MegatronEngine(TrainEngine):
             # validation sees the same value the engine actually uses.
             "use_distributed_optimizer": megatron_config.ddp.use_distributed_optimizer,
         }
+
+        if self.enable_fp8 and is_npu_available:
+            fp8_config = self.fp8_config
+            config_overrides.update(
+                {
+                    # MindSpeed validates ``fp8`` but its patch selector currently
+                    # reads ``fp8_format``. Keep both aliases synchronized.
+                    "fp8": fp8_config.mode,
+                    "fp8_format": fp8_config.mode,
+                    "fp8_recipe": fp8_config.recipe,
+                    "first_last_layers_bf16": fp8_config.first_last_layers_bf16,
+                    "num_layers_at_start_in_bf16": (
+                        fp8_config.num_layers_at_start_in_bf16
+                    ),
+                    "num_layers_at_end_in_bf16": (
+                        fp8_config.num_layers_at_end_in_bf16
+                    ),
+                    "transformer_impl": "transformer_engine",
+                }
+            )
 
         config.update(config_overrides)
         repatch(config)
