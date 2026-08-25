@@ -460,6 +460,12 @@ class PPOTrainer:
                 f"Invalid weight update mode: {self.config.actor.weight_update_mode}"
             )
 
+        if (
+            current_platform.device_type == "npu"
+            and config.vllm.quantization == "ascend"
+        ):
+            self.weight_update_meta.online_quantization = "ascend"
+
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
 
         # Set up evaluation (skip in online mode)
@@ -493,6 +499,17 @@ class PPOTrainer:
                 sm = self.rollout.workflow_executor.staleness_manager
             if sm is not None:
                 sm.on_version_recovered(recovery_version)
+
+        if (
+            config.vllm.load_format == "dummy"
+            and self.weight_update_meta.online_quantization == "ascend"
+            and self.recover_info is None
+        ):
+            initial_version = self.actor.get_version()
+            self.actor.update_weights(
+                self.weight_update_meta.with_version(initial_version)
+            )
+            self.rollout.set_version(initial_version)
 
         self._config_perf_tracer()
         self._apply_initial_offload_policy()
@@ -1512,6 +1529,47 @@ class PPOTrainer:
                 f"actor._version ('{actor_version}') and rollout._version "
                 f"('{rollout_version}') must match. Both must be 'v1' or both 'v2'."
             )
+
+        if self.config.vllm.quantization == "ascend":
+            if current_platform.device_type != "npu":
+                raise ValueError("vLLM quantization=ascend is only supported on NPU")
+            if rollout_backend != "vllm":
+                raise ValueError("vLLM quantization=ascend requires a vLLM rollout")
+            if actor_backend == "archon":
+                raise ValueError(
+                    "Online Ascend FP8 rollout does not support an Archon actor"
+                )
+            if self.config.actor.weight_update_mode != "xccl":
+                raise ValueError(
+                    "Online Ascend FP8 rollout requires actor.weight_update_mode=xccl"
+                )
+            if self.config.vllm.load_format != "dummy":
+                raise ValueError(
+                    "Online Ascend FP8 rollout requires vllm.load_format=dummy"
+                )
+            if self.config.actor.use_lora:
+                raise ValueError("Online Ascend FP8 rollout does not support LoRA")
+            if self.config.actor.dtype != "bfloat16":
+                raise ValueError("Online Ascend FP8 rollout requires a BF16 actor")
+            if self.config.vllm.dtype != "bfloat16":
+                raise ValueError("Online Ascend FP8 rollout requires vllm.dtype=bfloat16")
+            if (
+                actor_backend == "megatron"
+                and self.config.actor.megatron.fp8_config is not None
+            ):
+                fp8_config = self.config.actor.megatron.fp8_config
+                if fp8_config.param:
+                    raise ValueError(
+                        "The current Online Ascend FP8 integration has only been "
+                        "validated with compute-only Megatron/MindSpeed FP8; set "
+                        "fp8_config.param=false"
+                    )
+                if self.config.actor.megatron.ddp.fp8_param_gather:
+                    raise ValueError(
+                        "The current Online Ascend FP8 integration has not been "
+                        "validated with FP8 parameter gather; set "
+                        "actor.megatron.ddp.fp8_param_gather=false"
+                    )
 
     def _requires_proxy_workflow(
         self,

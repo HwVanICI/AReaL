@@ -95,6 +95,18 @@ class UpdateWeightsFromXcclRequest(OpenAIBaseModel):
     group_name: str
 
 
+class UpdateWeightBucketRequest(OpenAIBaseModel):
+    names: list[str] | None = None
+    dtypes: list[str] | None = None
+    shapes: list[list[int]] | None = None
+    group_name: str | None = None
+    is_last_bucket: bool = False
+    online_quantization: str | None = None
+    version: int | None = None
+    pp_rank: int = 0
+    pp_world_size: int = 1
+
+
 class UpdateWeightsFromXcclRequestLora(OpenAIBaseModel):
     names: list[str]
     dtypes: list[str]
@@ -228,17 +240,134 @@ async def areal_update_weight_lora(
     return build_response(ret_list)
 
 
+async def _handle_ascend_mxfp8_xccl(
+    request: UpdateWeightBucketRequest, raw_request: Request
+):
+    llm = raw_request.app.state.engine_client
+    if _generation_run_event.is_set():
+        return to_json_response(
+            False,
+            "Generation must be paused before an Ascend weight update",
+        )
+
+    if (
+        request.version is None
+        or request.group_name is None
+        or request.names is None
+        or request.dtypes is None
+        or request.shapes is None
+    ):
+        return to_json_response(False, "Incomplete Ascend weight bucket metadata")
+    if request.pp_world_size < 1 or not 0 <= request.pp_rank < request.pp_world_size:
+        return to_json_response(False, "Invalid pipeline-parallel transaction metadata")
+
+    app_state = raw_request.app.state
+    if not hasattr(app_state, "ascend_weight_update_lock"):
+        app_state.ascend_weight_update_lock = asyncio.Lock()
+        app_state.ascend_weight_update_transaction = None
+
+    async with app_state.ascend_weight_update_lock:
+        transaction = app_state.ascend_weight_update_transaction
+        if transaction is None or transaction["version"] != request.version:
+            if transaction is not None and transaction["status"] == "LOADING":
+                return to_json_response(
+                    False,
+                    "Another Ascend weight transaction is still loading: "
+                    f"version {transaction['version']}",
+                )
+            transaction = {
+                "version": request.version,
+                "pp_world_size": request.pp_world_size,
+                "status": "LOADING",
+                "completed_stages": set(),
+                "is_restored": False,
+            }
+            app_state.ascend_weight_update_transaction = transaction
+
+        if transaction["status"] != "LOADING":
+            return to_json_response(
+                False,
+                f"Ascend transaction version {request.version} is "
+                f"{transaction['status'].lower()}",
+            )
+        if transaction["pp_world_size"] != request.pp_world_size:
+            transaction["status"] = "FAILED"
+            return to_json_response(False, "PP world size changed during transaction")
+        if request.pp_rank in transaction["completed_stages"]:
+            transaction["status"] = "FAILED"
+            return to_json_response(
+                False,
+                f"Received a late bucket for completed PP stage {request.pp_rank}",
+            )
+
+        restore = not transaction["is_restored"]
+        try:
+            ret_list = await llm.collective_rpc(
+                "areal_update_weight_xccl",
+                args=(
+                    request.names,
+                    request.dtypes,
+                    request.shapes,
+                    request.group_name,
+                    request.version,
+                    restore,
+                    "ascend",
+                ),
+            )
+        except Exception as exc:
+            transaction["status"] = "FAILED"
+            return to_json_response(
+                False, f"Ascend weight bucket failed: {exc}"
+            )
+        if not all(result[0] for result in ret_list):
+            transaction["status"] = "FAILED"
+            return build_response(ret_list)
+        transaction["is_restored"] = True
+
+        if request.is_last_bucket:
+            transaction["completed_stages"].add(request.pp_rank)
+
+        if (
+            len(transaction["completed_stages"])
+            == transaction["pp_world_size"]
+        ):
+            try:
+                finalize_results = await llm.collective_rpc(
+                    "areal_finalize_mxfp8_update",
+                    args=(request.version,),
+                )
+            except Exception as exc:
+                transaction["status"] = "FAILED"
+                return to_json_response(
+                    False, f"Ascend weight finalization failed: {exc}"
+                )
+            if not all(result[0] for result in finalize_results):
+                transaction["status"] = "FAILED"
+                return build_response(finalize_results)
+            transaction["status"] = "COMMITTED"
+
+        return build_response(ret_list)
+
+
 @router.post("/areal_update_weights_xccl")
-async def areal_update_weight_xccl(raw_request: Request):
+async def areal_update_weight_xccl(
+    request: UpdateWeightBucketRequest, raw_request: Request
+):
     logger.info("API server starts areal_update_weight_xccl")
     llm = raw_request.app.state.engine_client
-    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
-    await llm.reset_mm_cache()
-    try:
-        ret_list = await llm.collective_rpc("areal_update_weight_xccl")
-    finally:
-        await llm.resume_generation()
-    return build_response(ret_list)
+    use_online_quantization = request.online_quantization == "ascend"
+    if not use_online_quantization:
+        await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+        await llm.reset_mm_cache()
+        try:
+            ret_list = await llm.collective_rpc("areal_update_weight_xccl")
+        finally:
+            await llm.resume_generation()
+        return build_response(ret_list)
+
+    return await _handle_ascend_mxfp8_xccl(
+        request=request, raw_request=raw_request
+    )
 
 
 @router.post("/areal_update_weights_lora_xccl")
