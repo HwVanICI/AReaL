@@ -79,8 +79,16 @@ def test_mindspeed_repatch_receives_fp8_compute_config(monkeypatch):
     ("stage_kind", "expected_last_flags"),
     [("dense", [True]), ("moe", [False, True])],
 )
+@pytest.mark.parametrize(
+    ("bridge_cls", "use_bridge_for_update_weights"),
+    [("mbridge", False), ("megatron-bridge", True)],
+)
 def test_megatron_ascend_marks_dense_or_expert_final_bucket(
-    monkeypatch, stage_kind, expected_last_flags
+    monkeypatch,
+    stage_kind,
+    expected_last_flags,
+    bridge_cls,
+    use_bridge_for_update_weights,
 ):
     captured = []
 
@@ -127,8 +135,10 @@ def test_megatron_ascend_marks_dense_or_expert_final_bucket(
     engine.rollout_engine = _Rollout()
     engine.weight_update_group = object()
     engine.config = SimpleNamespace(use_lora=False, use_merged_lora=False)
-    engine.bridge_cls = "mbridge"
-    engine.mcore_config = SimpleNamespace(use_bridge_for_update_weights=False)
+    engine.bridge_cls = bridge_cls
+    engine.mcore_config = SimpleNamespace(
+        use_bridge_for_update_weights=use_bridge_for_update_weights
+    )
     engine.quantization_config = None
     engine.tf_config = SimpleNamespace(
         num_moe_experts=2 if stage_kind == "moe" else None
@@ -165,6 +175,9 @@ def test_megatron_ascend_marks_dense_or_expert_final_bucket(
     engine._impl_update_weight_from_distributed = _impl_update_weight
     engine._impl_update_expert_weight_from_distributed = _impl_update_expert
     engine._update_bucket_expert_weights_from_distributed = _update_expert_bucket
+    engine._update_weights_via_bridge = lambda _meta: pytest.fail(
+        "Ascend online weight updates must use the registry path"
+    )
     monkeypatch.setattr(
         megatron_engine,
         "get_named_parameters",

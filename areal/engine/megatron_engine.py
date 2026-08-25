@@ -2621,6 +2621,7 @@ class MegatronEngine(TrainEngine):
             self.bridge_cls == "megatron-bridge"
             and self.mcore_config.use_bridge_for_update_weights
             and not self.quantization_config
+            and meta.online_quantization != "ascend"
             and not self.config.use_lora
         )
         if use_bridge:
