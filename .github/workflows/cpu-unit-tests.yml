@@ -21,8 +21,14 @@ jobs:
 
     env:
       AREAL_IS_IN_CI: "1"
+      HF_ENDPOINT: "https://hf-mirror.com"
+      HF_HOME: "${{ runner.temp }}/huggingface"
+      HF_HUB_DISABLE_XET: "1"
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      NO_PROXY: "127.0.0.1,localhost"
+      no_proxy: "127.0.0.1,localhost"
 
     steps:
       - name: Checkout repository
@@ -49,6 +55,63 @@ jobs:
           print("CUDA available:", torch.cuda.is_available())
           assert not torch.cuda.is_available()
           PY
+
+      - name: Pre-download slow-test artifacts
+        env:
+          HF_HUB_OFFLINE: "0"
+          TRANSFORMERS_OFFLINE: "0"
+          HF_DATASETS_OFFLINE: "0"
+        run: |
+          set -euo pipefail
+
+          uv run hf --version
+          uv run hf download --help >/dev/null
+
+          download_with_retry() {
+            local attempt
+            local delay
+
+            for attempt in 1 2 3 4 5; do
+              if "$@"; then
+                return 0
+              fi
+
+              if [[ "${attempt}" -lt 5 ]]; then
+                delay=$((attempt * 30))
+                echo "Download attempt ${attempt} failed; retrying in ${delay}s"
+                sleep "${delay}"
+              fi
+            done
+
+            echo "Download failed after 5 attempts"
+            return 1
+          }
+
+          download_with_retry \
+            uv run hf download \
+            openai/gsm8k \
+            --repo-type dataset \
+            --max-workers 4
+
+          download_with_retry \
+            uv run hf download \
+            hiyouga/geometry3k \
+            --repo-type dataset \
+            --max-workers 4
+
+          # These tests construct tokenizers/processors but never load model
+          # weights, so keep only the lightweight repository files.
+          download_with_retry \
+            uv run hf download \
+            Qwen/Qwen3-0.6B \
+            --exclude "*.safetensors" \
+            --max-workers 4
+
+          download_with_retry \
+            uv run hf download \
+            Qwen/Qwen2.5-VL-3B-Instruct \
+            --exclude "*.safetensors" \
+            --max-workers 4
 
       - name: Run CPU unit tests
         run: |
@@ -83,3 +146,9 @@ jobs:
             tests/test_vllm_generation_request.py \
             tests/test_vllm_pp_mismatch.py \
             tests/test_workflow_detection.py
+
+      - name: Run qualified slow CPU tests
+        run: |
+          uv run pytest -q -m slow \
+            tests/infra/data_service/test_epoch_crossing.py \
+            tests/infra/data_service/test_data_service_e2e.py
