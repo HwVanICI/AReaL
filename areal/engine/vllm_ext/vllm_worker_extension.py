@@ -188,19 +188,39 @@ class VLLMWorkerExtension:
         self.areal_lora_base_model_name = base_model_name
         return True, "Success"
 
-    def areal_update_weight_xccl(self):
+    def areal_update_weight_xccl(
+        self,
+        names: list[str] | None = None,
+        dtypes: list[str] | None = None,
+        shapes: list[list[int]] | None = None,
+        group_name: str | None = None,
+        version: int | None = None,
+        restore: bool = False,
+        online_quantization: str | None = None,
+    ):
         logger.info("start update weights by nccl or hccl", flush=True)
-        undo_moe_postprocess_for_reload(self.model_runner.model)
-        names = self.areal_weight_meta_names
-        dtypes = self.areal_weight_meta_dtypes
-        shapes = self.areal_weight_meta_shapes
+        names = names if names is not None else self.areal_weight_meta_names
+        dtypes = dtypes if dtypes is not None else self.areal_weight_meta_dtypes
+        shapes = shapes if shapes is not None else self.areal_weight_meta_shapes
+        group_name = (
+            group_name
+            if group_name is not None
+            else self.areal_weight_meta_group_name
+        )
+        use_ascend_mxfp8 = online_quantization == "ascend"
+        if not use_ascend_mxfp8:
+            undo_moe_postprocess_for_reload(self.model_runner.model)
         try:
-            group = self.weight_update_groups[self.areal_weight_meta_group_name]
+            group = self.weight_update_groups[group_name]
         except KeyError:
             raise KeyError(
-                f"Weight update group named `{self.areal_weight_meta_group_name}` not found"
+                f"Weight update group named `{group_name}` not found"
             )
         try:
+            if use_ascend_mxfp8:
+                from areal.engine.vllm_ext import ascend_mxfp8
+
+            weights = []
             for name, dtype, shape in zip(names, dtypes, shapes):
                 target_dtype = (
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
@@ -214,19 +234,80 @@ class VLLMWorkerExtension:
                     group=group,
                     async_op=False,
                 )
+                if use_ascend_mxfp8:
+                    weights.append((name, tensor))
+                else:
+                    with set_current_vllm_config(self.model_runner.vllm_config):
+                        self.model_runner.model.load_weights(weights=[(name, tensor)])
+
+            if use_ascend_mxfp8:
+                if version is None:
+                    raise RuntimeError("Ascend online weight update requires version")
+                active_version = getattr(
+                    self, "areal_active_mxfp8_version", None
+                )
+                if restore:
+                    if active_version is not None:
+                        raise RuntimeError(
+                            "Cannot restore MXFP8 weights while version "
+                            f"{active_version} is still active"
+                        )
+                elif active_version != version:
+                    raise RuntimeError(
+                        f"Cannot load MXFP8 bucket for inactive version {version}"
+                    )
+                if restore and not ascend_mxfp8.is_ascend_mxfp8(
+                    self.model_runner
+                ):
+                    raise RuntimeError(
+                        "Ascend online quantization was requested for a non-MXFP8 worker"
+                    )
                 with set_current_vllm_config(self.model_runner.vllm_config):
-                    self.model_runner.model.load_weights(weights=[(name, tensor)])
-            if getattr(current_platform, "device_type", None) == "npu":
+                    ascend_mxfp8.load_mxfp8_weights(
+                        weights,
+                        self.model_runner,
+                        restore=restore,
+                    )
+                if restore:
+                    self.areal_active_mxfp8_version = version
+
+            if (
+                not use_ascend_mxfp8
+                and current_platform.device_type == "npu"
+            ):
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     process_weights_after_loading(
                         self.model_runner.model,
                         self.model_runner.model_config,
                         self.model_runner.device,
                     )
-            self.sync()
+            if use_ascend_mxfp8:
+                current_platform.synchronize()
+            else:
+                self.sync()
             return True, "Success"
         except Exception as e:
             error_msg = f"Failed to update parameter! {e}."
+            logger.error(error_msg)
+            return False, error_msg
+
+    def areal_finalize_mxfp8_update(self, version: int):
+        try:
+            if getattr(self, "areal_active_mxfp8_version", None) != version:
+                raise RuntimeError(
+                    f"Cannot finalize unknown MXFP8 version {version}"
+                )
+            from areal.engine.vllm_ext import ascend_mxfp8
+
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                ascend_mxfp8.process_mxfp8_weights_after_loading(
+                    self.model_runner.model
+                )
+            current_platform.synchronize()
+            self.areal_active_mxfp8_version = None
+            return True, "Success"
+        except Exception as e:
+            error_msg = f"Failed to finalize MXFP8 update! {e}."
             logger.error(error_msg)
             return False, error_msg
 

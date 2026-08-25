@@ -174,3 +174,14 @@ Ray 集群已按上述说明启动。
 
 **注意**：在昇腾 NPU 上，推理（rollout）通过 `vllm` 引擎（vLLM-Ascend 插件）支持；SGLang 不可用。`fsdp` 和
 `megatron`（通过 [MindSpeed](https://gitcode.com/Ascend/MindSpeed)）训练引擎均已支持。
+
+## 在线 Ascend MXFP8 Rollout
+
+在 AReaL 中，设置 `vllm.quantization: ascend` 目前仅表示启用在线 MXFP8
+rollout 量化。该路径要求 `vllm.load_format: dummy`、actor 使用 `xccl`
+权重更新，并且 actor 和 rollout 的 dtype 均为 BF16；该路径不支持 LoRA。AReaL
+会使用 dummy 权重初始化 rollout，并在每次 actor 权重更新时执行在线量化；此设置不用于从磁盘加载
+vLLM-Ascend 预量化 checkpoint。
+量化描述可以将归一化权重等非 MoE 权重保留为 `FLOAT`，但所有 `FusedMoE` 模块都必须使用
+`W8A8_MXFP8`。当前在线 rollout 路径尚未处理 `FLOAT` FusedMoE 的权重重载布局生命周期，
+因此不支持混用 `FLOAT` FusedMoE 权重。

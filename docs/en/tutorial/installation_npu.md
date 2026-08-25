@@ -189,3 +189,15 @@ described above before launching the job.
 **Note**: On Ascend NPU, rollout is supported through the `vllm` engine (via the
 vLLM-Ascend plugin); SGLang is not available. Both the `fsdp` and `megatron` (through
 [MindSpeed](https://gitcode.com/Ascend/MindSpeed)) training engines are supported.
+
+## Online Ascend MXFP8 Rollout
+
+In AReaL, setting `vllm.quantization: ascend` currently enables only online MXFP8
+rollout quantization. It requires `vllm.load_format: dummy`, an `xccl` actor weight
+update, and BF16 actor and rollout dtypes. LoRA is not supported on this path. AReaL
+initializes the rollout with dummy weights and quantizes each actor weight update
+online; this setting does not load a pre-quantized vLLM-Ascend checkpoint from disk.
+The quantization description may keep non-MoE weights such as normalization weights
+in `FLOAT`, but every `FusedMoE` module must use `W8A8_MXFP8`. Mixed online rollout
+with `FLOAT` FusedMoE weights is not supported because their reload layout lifecycle
+is not handled by this path.

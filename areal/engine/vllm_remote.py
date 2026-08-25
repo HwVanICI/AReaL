@@ -220,6 +220,25 @@ class VLLMBackend:
             "group_name": meta.nccl_group_name,
         }
 
+        if meta.online_quantization == "ascend":
+            if meta.version is None:
+                raise ValueError("Ascend online weight update requires version")
+            return WeightUpdateRequests(
+                requests=[
+                    HttpRequest(
+                        endpoint="/areal_update_weights_xccl",
+                        payload={
+                            **base_payload,
+                            "is_last_bucket": meta.is_last_bucket,
+                            "online_quantization": meta.online_quantization,
+                            "version": meta.version,
+                            "pp_rank": meta.pp_rank,
+                            "pp_world_size": meta.pp_world_size,
+                        },
+                    )
+                ]
+            )
+
         if meta.use_lora:
             if meta.version is None:
                 raise ValueError("Version is required for LoRA update.")

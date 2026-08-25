@@ -1798,6 +1798,7 @@ class vLLMConfig:
     dtype: str = "bfloat16"
     distributed_executor_backend: str = "mp"
     load_format: str = "auto"
+    quantization: str | None = None
     # original
     max_num_batched_tokens: int = 2048
     max_num_seqs: int = 256
