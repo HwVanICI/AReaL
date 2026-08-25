@@ -216,6 +216,78 @@ def test_vllm_ascend_bucket_uses_atomic_request_metadata():
     }
 
 
+def test_fsdp_ascend_sends_completion_metadata_only_with_final_bucket(
+    monkeypatch,
+):
+    """FSDP exposes completion only on the final Ascend weight bucket."""
+    from areal.engine import fsdp_engine
+
+    updates = []
+
+    class _Future:
+        def result(self):
+            return None
+
+    class _Handle:
+        def wait(self):
+            return None
+
+    class _Rollout:
+        def pause_generation(self):
+            return None
+
+        def continue_generation(self):
+            return None
+
+        def update_weights_from_distributed(self, meta, _param_specs):
+            updates.append(
+                (
+                    meta.is_last_bucket,
+                    meta.version,
+                    meta.pp_rank,
+                    meta.pp_world_size,
+                )
+            )
+            return _Future()
+
+    engine = fsdp_engine.FSDPEngine.__new__(fsdp_engine.FSDPEngine)
+    engine._initialized = True
+    engine.weight_update_master_addr = "127.0.0.1"
+    engine.weight_update_master_port = 12345
+    engine.weight_update_group_name = "fsdp"
+    engine.weight_update_group = object()
+    engine.weight_update_group_names = ["fsdp"]
+    engine.weight_update_groups = [engine.weight_update_group]
+    engine._cpu_group = object()
+    engine.config = SimpleNamespace(use_lora=False, dtype="bfloat16")
+    engine.rollout_engine = _Rollout()
+    tensors = [
+        ("model.first", torch.ones(2, 2, dtype=torch.bfloat16)),
+        ("model.last", torch.ones(2, 2, dtype=torch.bfloat16)),
+    ]
+    engine._get_model_name_parameters = lambda _meta: tensors
+    engine._get_full_tensor = lambda value: value
+    monkeypatch.setattr(fsdp_engine.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(fsdp_engine.dist, "barrier", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        fsdp_engine.dist,
+        "broadcast",
+        lambda *_args, **_kwargs: _Handle(),
+    )
+    monkeypatch.setattr(fsdp_engine.current_platform, "device_type", "npu")
+    monkeypatch.setattr(fsdp_engine.current_platform, "synchronize", lambda: None)
+
+    meta = WeightUpdateMeta(
+        type="xccl",
+        online_quantization="ascend",
+        version=7,
+        weight_chunked_mem_mb=0,
+    )
+    engine._update_weights_from_distributed(meta)
+
+    assert updates == [(False, 7, 0, 1), (True, 7, 0, 1)]
+
+
 def test_load_mxfp8_weights_maps_packed_linear_weight_and_scale(monkeypatch):
     model = _Model()
     linear = model.model.layers[0].self_attn.qkv_proj
