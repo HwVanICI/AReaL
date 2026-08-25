@@ -2473,6 +2473,7 @@ class MegatronEngine(TrainEngine):
             self.bridge_cls == "megatron-bridge"
             and self.mcore_config.use_bridge_for_update_weights
             and not self.quantization_config
+            and meta.online_quantization != "ascend"
         )
 
         # NOTE: Processes launched with torchrun will set the following env var to True,
@@ -2629,6 +2630,7 @@ class MegatronEngine(TrainEngine):
             self.bridge_cls == "megatron-bridge"
             and self.mcore_config.use_bridge_for_update_weights
             and not self.quantization_config
+            and meta.online_quantization != "ascend"
         )
         if self.config.use_lora:
             assert use_bridge
