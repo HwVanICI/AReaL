@@ -2181,6 +2181,7 @@ class MegatronEngine(TrainEngine):
         self,
         meta: WeightUpdateMeta,
         converted_named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
+        is_last_bucket: bool = False,
     ) -> None:
         # Early exit when chunk size is relatively small
         if not converted_named_tensors:
@@ -2207,7 +2208,14 @@ class MegatronEngine(TrainEngine):
                 "bias": "none",
             }
 
-        fut = self.rollout_engine.update_weights_from_distributed(meta, param_specs)
+        bucket_meta = (
+            dataclasses.replace(meta, is_last_bucket=is_last_bucket)
+            if meta.online_quantization == "ascend"
+            else meta
+        )
+        fut = self.rollout_engine.update_weights_from_distributed(
+            bucket_meta, param_specs
+        )
 
         # vLLM's LoRA receiver copies every tensor to CPU immediately after a
         # synchronous receive.  Queueing the entire adapter as asynchronous
@@ -2236,6 +2244,28 @@ class MegatronEngine(TrainEngine):
         converted_named_tensors.clear()
 
         self.engine_lock.release()
+
+    def _finish_empty_ascend_stage(
+        self, meta: WeightUpdateMeta, stage_finished: bool
+    ) -> None:
+        """Commit a PP stage that produced no final payload bucket."""
+        if (
+            meta.online_quantization != "ascend"
+            or not self.is_pipeline_parallel_head()
+            or stage_finished
+        ):
+            return
+        self.engine_lock.acquire()
+        try:
+            stage_meta = dataclasses.replace(
+                meta,
+                is_last_bucket=True,
+            )
+            self.rollout_engine.update_weights_from_distributed(
+                stage_meta, []
+            ).result()
+        finally:
+            self.engine_lock.release()
 
     @property
     def _duplicated_param_names(self) -> set[str]:
@@ -2328,7 +2358,8 @@ class MegatronEngine(TrainEngine):
         self,
         meta: WeightUpdateMeta,
         named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
-    ) -> None:
+        is_last_bucket: bool = False,
+    ) -> bool:
         """Gather a bucket of MoE expert weights and broadcast them.
 
         This function handles the distributed update for a bucket of Mixture-of-Experts
@@ -2344,7 +2375,7 @@ class MegatronEngine(TrainEngine):
 
         # Early exit when chunk size is relatively small
         if not named_tensors:
-            return
+            return False
 
         group = mpu.get_expert_model_parallel_group()
         world_size = mpu.get_expert_model_parallel_world_size()
@@ -2377,7 +2408,7 @@ class MegatronEngine(TrainEngine):
 
         named_tensors.clear()
         if not self.is_pipeline_parallel_head():
-            return
+            return False
 
         gathered_params = sum(gathered_params, [])
 
@@ -2395,7 +2426,11 @@ class MegatronEngine(TrainEngine):
                 )
             )
 
-        self._update_bucket_weights_from_distributed(meta, converted_hf_tensors)
+        sent_payload = bool(converted_hf_tensors)
+        self._update_bucket_weights_from_distributed(
+            meta, converted_hf_tensors, is_last_bucket=is_last_bucket
+        )
+        return sent_payload
 
     def _impl_update_expert_weight_from_distributed(
         self,
@@ -2578,6 +2613,11 @@ class MegatronEngine(TrainEngine):
         meta.nccl_master_port = self.weight_update_master_port
         meta.nccl_group_name = self.weight_update_group_name
 
+        ascend_online = meta.online_quantization == "ascend"
+        if ascend_online:
+            meta.pp_rank = mpu.get_pipeline_model_parallel_rank()
+            meta.pp_world_size = mpu.get_pipeline_model_parallel_world_size()
+
         if dist.get_rank() == 0:
             self.rollout_engine.pause_generation()
 
@@ -2616,6 +2656,7 @@ class MegatronEngine(TrainEngine):
 
         buffer_size = 0
         converted_named_tensors = []
+        stage_finished = False
 
         named_parameters = (
             get_named_parameters_lora_merged(self.model, num_moe_experts)
@@ -2636,7 +2677,13 @@ class MegatronEngine(TrainEngine):
 
         # Only pipeline parallel heads CAN contain named tensors here
         if converted_named_tensors:
-            self._update_bucket_weights_from_distributed(meta, converted_named_tensors)
+            is_last_bucket = not bool(num_moe_experts)
+            self._update_bucket_weights_from_distributed(
+                meta,
+                converted_named_tensors,
+                is_last_bucket=is_last_bucket,
+            )
+            stage_finished = is_last_bucket
         dist.barrier(group=self.cpu_group)
 
         buffer_size = 0
@@ -2661,7 +2708,14 @@ class MegatronEngine(TrainEngine):
 
         if named_tensors:
             # This function will early return if not pipeline parallel head
-            self._update_bucket_expert_weights_from_distributed(meta, named_tensors)
+            sends_expert_payload = self._update_bucket_expert_weights_from_distributed(
+                meta,
+                named_tensors,
+                is_last_bucket=True,
+            )
+            stage_finished = sends_expert_payload
+
+        self._finish_empty_ascend_stage(meta, stage_finished)
 
         dist.barrier(group=self.cpu_group)
 
