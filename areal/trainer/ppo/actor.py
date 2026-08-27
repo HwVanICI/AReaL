@@ -171,7 +171,15 @@ class PPOActor:
             reward_score, max=self.reward_clip, min=-self.reward_clip
         )
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score)
+            # A trajectory does not always occupy a single row: an agent session
+            # split by sub-agents or context compaction exports one row per
+            # branch, all carrying the same reward. Group by trajectory rather
+            # than by row so the baseline is not skewed by how many rows a
+            # trajectory happens to occupy. Absent for single-row workflows,
+            # where grouping by row is already grouping by trajectory.
+            reward_score = self.reward_norm(
+                reward_score, traj_starts=data.get("begin_of_trajectory")
+            )
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -330,7 +338,7 @@ class PPOActor:
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
-        for key in ["rewards", "tot_rewards", "kl_rewards"]:
+        for key in ["rewards", "tot_rewards", "kl_rewards", "begin_of_trajectory"]:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
