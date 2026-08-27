@@ -1467,7 +1467,16 @@ class Normalization:
         loss_mask: torch.Tensor | None = None,
         high_precision: bool = True,
         reduce_group=None,
+        traj_starts: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if traj_starts is not None:
+            return self._normalize_per_trajectory(
+                x,
+                traj_starts,
+                high_precision=high_precision,
+                reduce_group=reduce_group,
+            )
+
         bs = x.size(0)
         eps = self.eps
 
@@ -1561,6 +1570,54 @@ class Normalization:
 
         # Normalize
         return (x_centered / (std + eps)).float()
+
+    @torch.no_grad()
+    def _normalize_per_trajectory(
+        self,
+        x: torch.Tensor,
+        traj_starts: torch.Tensor,
+        high_precision: bool = True,
+        reduce_group=None,
+    ) -> torch.Tensor:
+        """Normalize one value per trajectory, then broadcast back to its rows.
+
+        A trajectory does not always occupy a single row: an agent session
+        whose context is split by sub-agents or compaction exports one row per
+        branch. Every such row carries the same reward, so normalizing over
+        rows would both weight a trajectory by how many rows it happens to
+        occupy and shift the fixed-size grouping windows off the group
+        boundaries. ``traj_starts`` marks the first row of each trajectory
+        (the ``begin_of_trajectory`` column); collapsing to one value per
+        trajectory makes ``group_size`` count trajectories rather than rows,
+        which is what it is configured as (``n_samples``).
+        """
+        if x.ndim != 1:
+            raise ValueError(
+                "traj_starts expects one value per row, i.e. a 1D tensor, "
+                f"got shape {tuple(x.shape)}"
+            )
+        traj_starts = traj_starts.reshape(-1)
+        if traj_starts.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"traj_starts has {traj_starts.shape[0]} entries but x has "
+                f"{x.shape[0]} rows; they must match one-to-one"
+            )
+        if x.numel() == 0:
+            return x.float()
+        if traj_starts[0] == 0:
+            raise ValueError(
+                "the first row must begin a trajectory, but traj_starts[0] is 0"
+            )
+        # cumsum turns the start markers into a trajectory index per row:
+        # starts [1,1,1,0,0,1] -> [0,1,2,2,2,3]
+        row_to_traj = traj_starts.long().cumsum(0) - 1
+        first_rows = traj_starts.nonzero(as_tuple=True)[0]
+        normalized = self(
+            x[first_rows],
+            high_precision=high_precision,
+            reduce_group=reduce_group,
+        )
+        return normalized[row_to_traj]
 
     @staticmethod
     def _compute_mean(
