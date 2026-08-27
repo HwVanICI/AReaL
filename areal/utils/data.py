@@ -1488,8 +1488,8 @@ class Normalization:
             mean = mean.expand_as(x)
         elif self.mean_level == "group":
             mean = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for start in range(0, bs, self.group_size):
+                s = slice(start, min(start + self.group_size, bs))
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
 
@@ -1532,8 +1532,8 @@ class Normalization:
             std = std.expand_as(x)
         elif self.std_level == "group":
             std = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for start in range(0, bs, self.group_size):
+                s = slice(start, min(start + self.group_size, bs))
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
                 group_mean_slice = mean[s]  # already computed and expanded
