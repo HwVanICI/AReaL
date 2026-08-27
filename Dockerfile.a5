@@ -1,0 +1,107 @@
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# This file is a part of the AReaL project.
+#
+
+FROM quay.io/ascend/cann:9.0.1-950-ubuntu22.04-py3.12
+
+ARG MEGATRON_TAG=core_v0.16.1
+ARG MINDSPEED_BRANCH=core_r0.16.0
+ARG MINDSPEED_COMMIT=79626c1380b78f5cea8a971f265a49f96b04d416
+# Must be pinned to this specific commit: megatron-core 0.16.x compatible. The v0.4.x tags pin
+# megatron-core 0.17.1, which MindSpeed core_r0.16.0 does not support.
+ARG MEGATRON_BRIDGE_COMMIT=de93536e
+ARG VLLM_TAG=v0.23.0
+ARG VLLM_ASCEND_BRANCH=releases/v0.23.0
+ARG VLLM_ASCEND_COMMIT=eaefc536d4475808e18b0c12b42c7710bc4bccb9
+ARG ASCEND_INSTALL_PATH=/usr/local/Ascend
+ARG SOC_VERSION=ascend950dt_9582
+
+# System build deps (the clean CANN base ships none) + pip/uv bootstrap.
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        gcc g++ cmake libnuma-dev wget git curl jq vim tmux build-essential gawk clang-15 && \
+    update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 && \
+    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    python3 -m pip install -U pip "setuptools==80.10.2" uv && \
+    python3 -m pip cache purge
+
+# Local fixes for the pinned vLLM, vllm-ascend, and MindSpeed revisions above;
+# see patches/README.md for provenance. Bump alongside the corresponding pins.
+COPY patches/vllm.v0.23.0.patch \
+     patches/vllm-ascend.v0.23.0.patch \
+     patches/vllm-ascend.v0.23.0-fp8.patch \
+     patches/mindspeed.patch \
+     /areal-workspace/patches/
+
+# Install vLLM + vllm-ascend (torch-npu comes from vllm-ascend requirements.txt).
+# The torch-npu 2.10.0.post2 P2P regression is worked around at runtime in
+# areal/utils/torch_npu_compat.py.
+# Patches are applied after each editable install, never before: a dirty tree makes
+# setuptools-scm report 0.23.1.dev0 instead of 0.23.0, which flips vllm-ascend's
+# vllm_version_is("0.23.0") gates onto their 0.24+ paths. The recorded version is
+# asserted so any regression fails the build, not the first rollout of a training run.
+RUN export PIP_EXTRA_INDEX_URL=https://triton-ascend.osinfra.cn/pypi/simple/ && \
+    export PIP_TRUSTED_HOST=triton-ascend.osinfra.cn && \
+    export SOC_VERSION=${SOC_VERSION} && \
+    export LD_LIBRARY_PATH=${ASCEND_INSTALL_PATH}/cann-9.0.1/aarch64-linux/devlib/linux/aarch64:$LD_LIBRARY_PATH && \
+    . ${ASCEND_INSTALL_PATH}/ascend-toolkit/set_env.sh && \
+    . ${ASCEND_INSTALL_PATH}/nnal/atb/set_env.sh && \
+    git clone --depth 1 --branch ${VLLM_TAG} https://github.com/vllm-project/vllm.git /areal-workspace/vllm && \
+    git clone --branch ${VLLM_ASCEND_BRANCH} https://github.com/vllm-project/vllm-ascend.git /areal-workspace/vllm-ascend && \
+    git -C /areal-workspace/vllm-ascend checkout ${VLLM_ASCEND_COMMIT} && \
+    cd /areal-workspace/vllm && \
+    VLLM_TARGET_DEVICE=empty pip install -v -e . && \
+    git apply -v /areal-workspace/patches/vllm.v0.23.0.patch && \
+    python3 -c "import sys, os; sys.path.insert(0, 'vllm'); import _version; want = os.environ['VLLM_TAG'].removeprefix('v'); assert _version.__version__ == want, f'vllm reports {_version.__version__}, expected {want}'" && \
+    pip uninstall -y triton && \
+    cd /areal-workspace/vllm-ascend && \
+    pip install -r requirements.txt && \
+    COMPILE_CUSTOM_KERNELS=1 pip install --no-build-isolation --no-deps -v -e . && \
+    git apply -v /areal-workspace/patches/vllm-ascend.v0.23.0.patch && \
+    git apply -v /areal-workspace/patches/vllm-ascend.v0.23.0-fp8.patch && \
+    python3 -m pip cache purge
+
+# Install Megatron & MindSpeed (megatron-core lives inside the MindSpeed tree).
+RUN git clone --depth 1 --branch ${MEGATRON_TAG} https://github.com/NVIDIA/Megatron-LM.git /areal-workspace/Megatron-LM && \
+    git clone --branch ${MINDSPEED_BRANCH} https://gitcode.com/Ascend/MindSpeed.git /areal-workspace/MindSpeed && \
+    git -C /areal-workspace/MindSpeed checkout ${MINDSPEED_COMMIT} && \
+    git -C /areal-workspace/MindSpeed apply -v /areal-workspace/patches/mindspeed.patch && \
+    cp -r /areal-workspace/Megatron-LM/megatron /areal-workspace/MindSpeed/megatron && \
+    python3 -m pip install -e /areal-workspace/MindSpeed --no-deps && \
+    python3 -m pip cache purge
+
+# Install AReaL deps. No --upgrade: keep vllm-ascend's torch/torch-npu/triton.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.npu.toml,target=pyproject.toml \
+    UV_HTTP_TIMEOUT=300 uv pip install -r pyproject.toml --system --group dev
+
+# Install Megatron-Bridge
+RUN git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /areal-workspace/Megatron-Bridge && \
+    git -C /areal-workspace/Megatron-Bridge checkout ${MEGATRON_BRIDGE_COMMIT} && \
+    python3 -m pip cache purge
+
+# Copy AReaL source code
+COPY . /AReaL
+RUN uv pip install --no-deps -e /AReaL --system
+
+ENV PYTHONPATH=/areal-workspace/MindSpeed:/areal-workspace/Megatron-Bridge/src:$PYTHONPATH
+
+ENV HCCL_IF_BASE_PORT=63000 \
+    HCCL_NPU_SOCKET_PORT_RANGE="62100-62350"
+
+ENV TASK_QUEUE_ENABLE=1 \
+    OMP_NUM_THREADS=1
