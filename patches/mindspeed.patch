@@ -1,0 +1,69 @@
+diff --git a/mindspeed/core/transformer/moe/grouped_matmul_util.py b/mindspeed/core/transformer/moe/grouped_matmul_util.py
+index 52900aff..9664ddb2 100644
+--- a/mindspeed/core/transformer/moe/grouped_matmul_util.py
++++ b/mindspeed/core/transformer/moe/grouped_matmul_util.py
+@@ -166,7 +166,9 @@ class TensorwiseGMMFunction(BaseGMMFunction):
+     @classmethod
+     def op_forward(cls, x, weight, group_list, group_list_type=0, bias=None):
+         qdtype = get_quant_dtype()
+-        x_quant, x_scale, w_quant, w_scale = cls.quantize(x, weight, qdtype.x, qdtype.w)
++        x_quant, x_scale, w_quant, w_scale = cls.quantize(
++            x, weight, qdtype.x, qdtype.w, g_size=len(group_list)
++        )
+         return torch_npu.npu_grouped_matmul([x_quant], [w_quant], scale=[w_scale], per_token_scale=[x_scale],
+                                             group_list=group_list, group_type=0, bias=bias, split_item=3,
+                                             output_dtype=x.dtype, group_list_type=group_list_type, **qdtype.gmm_kwargs)
+@@ -175,7 +177,9 @@ class TensorwiseGMMFunction(BaseGMMFunction):
+     def op_dx(cls, grad, weight, group_list, group_list_type=0, bias=None):
+         qdtype = get_quant_dtype()
+         weight_t = rearrange(weight, 'n h f -> n f h')
+-        grad_quant, grad_scale, w_quant, w_scale = cls.quantize(grad, weight_t, qdtype.grads, qdtype.w)
++        grad_quant, grad_scale, w_quant, w_scale = cls.quantize(
++            grad, weight_t, qdtype.grads, qdtype.w, g_size=len(group_list)
++        )
+         return torch_npu.npu_grouped_matmul([grad_quant], [w_quant], bias=None,
+                                             scale=[w_scale], per_token_scale=[grad_scale],
+                                             group_list=group_list, group_type=0, split_item=3,
+@@ -184,15 +188,22 @@ class TensorwiseGMMFunction(BaseGMMFunction):
+     @classmethod
+     def op_dw(cls, x, grad, group_list, group_list_type=0, bias=None):
+         qdtype = get_quant_dtype()
+-        x_quant, x_scale, grad_quant, grad_scale = cls.quantize(x, grad, qdtype.x, qdtype.grads)
++        x_quant, x_scale, grad_quant, grad_scale = cls.quantize(
++            x, grad, qdtype.x, qdtype.grads, g_size=len(group_list)
++        )
+         return torch_npu.npu_grouped_matmul([x_quant.t()], [grad_quant], scale=[grad_scale], per_token_scale=[x_scale],
+                                             group_list=group_list, group_type=2, bias=bias, split_item=3,
+                                             output_dtype=x.dtype, group_list_type=group_list_type, **qdtype.gmm_kwargs)
+ 
+     @classmethod
+-    def quantize(cls, x: torch.Tensor, weight: torch.Tensor, x_dst_type: torch.dtype, w_dst_type: torch.dtype):
+-        args = get_args()
+-        g_size = args.num_experts // args.expert_model_parallel_size
++    def quantize(
++        cls,
++        x: torch.Tensor,
++        weight: torch.Tensor,
++        x_dst_type: torch.dtype,
++        w_dst_type: torch.dtype,
++        g_size: int,
++    ):
+         # 这里采用 pertoken 量化 一行即为一组
+         x_quant, x_scale = torch_npu.npu_dynamic_quant(x.reshape(g_size, -1), dst_type=x_dst_type)
+         weight_quant, weight_scale = torch_npu.npu_dynamic_quant(weight.reshape(g_size, -1), dst_type=w_dst_type)
+diff --git a/mindspeed/te/pytorch/fp8/constants.py b/mindspeed/te/pytorch/fp8/constants.py
+index 1fa6afc3..43045357 100644
+--- a/mindspeed/te/pytorch/fp8/constants.py
++++ b/mindspeed/te/pytorch/fp8/constants.py
+@@ -57,6 +57,11 @@ class Fp8Recipe(str, Enum):
+     mxfp8 = 'mxfp8'
+     blockwise = 'blockwise'
+     groupwise = 'groupwise'
++    # Megatron-Core 0.16.x unconditionally resolves Fp8Recipe.custom while
++    # validating any enabled FP8 recipe. MindSpeed replaces Megatron's enum
++    # with this one, so keep the replacement API-compatible even though the
++    # custom recipe itself is not implemented by MindSpeed.
++    custom = 'custom'
+ 
+ 
+ def amax_compute_max(amax, amax_history, last_history_index):

@@ -1,17 +1,17 @@
 # Third-party patches
 
-Bugfixes carried against the pinned vLLM / vllm-ascend sources used by NPU images.
-Patches referenced by `Dockerfile.a2` and `Dockerfile.a3` are applied with `git apply`
-immediately after their corresponding `pip install -e .`, so a patch that no longer
-applies fails the build instead of silently dropping the fix. The MXFP8 rollout patch
-is reserved for the A5 FP8 rollout image and is not applied by the current A2/A3
-Dockerfiles.
+Bugfixes carried against the pinned vLLM, vllm-ascend, and MindSpeed sources used by
+NPU images. Patches referenced by `Dockerfile.a2`, `Dockerfile.a3`, and
+`Dockerfile.a5` are applied with `git apply`, so a patch that no longer applies fails
+the build instead of silently dropping the fix. The MXFP8 rollout and MindSpeed FP8
+patches are applied only by the A5 image.
 
 | Patch                                  | Applies to                                        | Upstream                                                                      |
 | -------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------- |
 | `vllm.v0.23.0.patch`                   | vLLM `v0.23.0`                                    | [vllm#44483](https://github.com/vllm-project/vllm/pull/44483)                 |
 | `vllm-ascend.v0.23.0.patch`            | vllm-ascend `releases/v0.23.0`                    | [vllm-ascend#11548](https://github.com/vllm-project/vllm-ascend/issues/11548) |
 | `vllm-ascend.v0.23.0-fp8.patch`        | vllm-ascend `releases/v0.23.0` (`eaefc536`)       | Local AReaL fix                                                               |
+| `mindspeed.patch`                      | MindSpeed `core_r0.16.0` (`79626c13`)             | Local AReaL fix                                                               |
 
 The first two bugs sit on the sleep/wake path that AReaL drives between rollout and
 training, so both are load-bearing for the current NPU RL images.
@@ -31,6 +31,9 @@ training, so both are load-bearing for the current NPU RL images.
   the patch preserves the inference weight storage and scale buffer captured by ACL
   Graph, then copies the reloaded scale back into that stable buffer before inference
   resumes.
+- **MindSpeed FP8 compatibility** — keeps MindSpeed's FP8 recipe enum compatible with
+  Megatron-Core 0.16.x and derives grouped-matmul quantization groups from the local
+  expert list used by each operation.
 
 ## Patching dirties the tree, which changes `vllm.__version__`
 
