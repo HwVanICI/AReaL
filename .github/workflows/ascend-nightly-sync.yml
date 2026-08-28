@@ -2,8 +2,8 @@ name: Sync Ascend and Publish NPU Images
 
 on:
   schedule:
-    # 07:17 Beijing time (UTC+8)
-    - cron: '17 23 * * *'
+    - cron: '0 2 * * *'
+      timezone: America/Vancouver
   workflow_dispatch:
 
 permissions:
@@ -38,7 +38,7 @@ jobs:
             }
 
   sync:
-    name: Fast-forward HwVanICI/ascend
+    name: Mirror areal-project/ascend to HwVanICI/ascend
     needs: guard
     if: github.repository == 'HwVanICI/AReaL'
     runs-on: ubuntu-latest
@@ -55,8 +55,9 @@ jobs:
         with:
           ref: ascend
           fetch-depth: 0
+          token: ${{ secrets.ASCEND_SYNC_TOKEN }}
 
-      - name: Fast-forward from areal-project/ascend
+      - name: Mirror areal-project/ascend
         id: sync
         run: |
           set -euo pipefail
@@ -70,14 +71,12 @@ jobs:
 
           if [[ "${fork_sha}" == "${source_sha}" ]]; then
             echo "HwVanICI/ascend is already at ${source_sha}."
-          elif git merge-base --is-ancestor "${fork_sha}" "${source_sha}"; then
-            git push origin "${source_sha}:refs/heads/ascend"
-            changed=true
           else
-            echo "::error::HwVanICI/ascend cannot fast-forward to areal-project/ascend."
-            echo "Fork revision: ${fork_sha}"
-            echo "Upstream revision: ${source_sha}"
-            exit 1
+            git push \
+              --force-with-lease="refs/heads/ascend:${fork_sha}" \
+              origin \
+              "${source_sha}:refs/heads/ascend"
+            changed=true
           fi
 
           remote_sha=$(git ls-remote origin refs/heads/ascend | cut -f1)

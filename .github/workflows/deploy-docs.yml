@@ -18,6 +18,7 @@ permissions:
 jobs:
   # Build job
   build:
+    if: github.repository == 'areal-project/AReaL'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -60,6 +61,7 @@ jobs:
 
   # Deployment job
   deploy:
+    if: github.repository == 'areal-project/AReaL' && needs.build.result == 'success'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
