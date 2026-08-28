@@ -1,0 +1,116 @@
+name: Ascend NPU Nightly Images
+
+on:
+  push:
+    branches:
+      - ascend
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref to build
+        required: false
+        default: ascend
+        type: string
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Git ref to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ascend-image-build-${{ github.repository }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-and-publish:
+    name: build-and-publish-${{ matrix.accelerator }}-nightly
+    if: github.repository == 'HwVanICI/AReaL'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    strategy:
+      fail-fast: false
+      matrix:
+        accelerator:
+          - a2
+          - a3
+
+    env:
+      ACCELERATOR: ${{ matrix.accelerator }}
+      DOCKERFILE: Dockerfile.${{ matrix.accelerator }}
+      IMAGE_CACHE: ghcr.io/hwvanici/areal_npu_buildcache:${{ matrix.accelerator }}
+      IMAGE: ghcr.io/hwvanici/areal_npu:${{ matrix.accelerator }}-nightly
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+
+      - name: Record source revision
+        id: source
+        run: |
+          source_sha=$(git rev-parse HEAD)
+          echo "sha=${source_sha}" >> "$GITHUB_OUTPUT"
+          echo "Building source revision ${source_sha}"
+
+      - name: Inspect runner and Docker access
+        run: |
+          set -euo pipefail
+
+          echo "Runner: ${RUNNER_NAME:-unknown}"
+          echo "Architecture: $(uname -m)"
+          echo "Available CPUs: $(nproc)"
+          free -h
+          df -h /
+
+          docker version
+          docker buildx version
+          docker system df
+
+      - name: Log in to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Build and publish Dockerfile.${{ matrix.accelerator }}
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          docker buildx create \
+            --driver docker-container \
+            --name "areal-${ACCELERATOR}-builder" \
+            --use
+          docker buildx inspect --bootstrap
+
+          SECONDS=0
+          docker buildx build \
+            --cache-from "type=registry,ref=${IMAGE_CACHE}" \
+            --cache-to "type=registry,ref=${IMAGE_CACHE},mode=min" \
+            --file "${DOCKERFILE}" \
+            --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --progress=plain \
+            --push \
+            --tag "${IMAGE}" \
+            .
+          echo "Build duration: ${SECONDS}s"
+
+          docker buildx imagetools inspect "${IMAGE}"
+
+      - name: Report final storage usage
+        if: always()
+        run: |
+          docker system df || true
+          df -h / /var/lib/docker || true

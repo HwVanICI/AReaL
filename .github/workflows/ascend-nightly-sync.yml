@@ -1,0 +1,107 @@
+name: Sync Ascend and Publish NPU Images
+
+on:
+  schedule:
+    # 07:17 Beijing time (UTC+8)
+    - cron: '17 23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ascend-nightly-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guard:
+    name: Check trigger permissions
+    if: github.repository == 'HwVanICI/AReaL'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Block non-admin manual triggers
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data: { permission } } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+            if (permission !== 'admin') {
+              core.setFailed(`User ${context.actor} has '${permission}' permission; admin required for manual dispatch.`);
+            }
+
+  sync:
+    name: Fast-forward HwVanICI/ascend
+    needs: guard
+    if: github.repository == 'HwVanICI/AReaL'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      source_sha: ${{ steps.sync.outputs.source_sha }}
+
+    steps:
+      - name: Checkout HwVanICI/ascend
+        uses: actions/checkout@v6
+        with:
+          ref: ascend
+          fetch-depth: 0
+
+      - name: Fast-forward from areal-project/ascend
+        id: sync
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/areal-project/AReaL.git
+          git fetch --no-tags upstream ascend
+
+          fork_sha=$(git rev-parse HEAD)
+          source_sha=$(git rev-parse refs/remotes/upstream/ascend)
+          changed=false
+
+          if [[ "${fork_sha}" == "${source_sha}" ]]; then
+            echo "HwVanICI/ascend is already at ${source_sha}."
+          elif git merge-base --is-ancestor "${fork_sha}" "${source_sha}"; then
+            git push origin "${source_sha}:refs/heads/ascend"
+            changed=true
+          else
+            echo "::error::HwVanICI/ascend cannot fast-forward to areal-project/ascend."
+            echo "Fork revision: ${fork_sha}"
+            echo "Upstream revision: ${source_sha}"
+            exit 1
+          fi
+
+          remote_sha=$(git ls-remote origin refs/heads/ascend | cut -f1)
+          if [[ "${remote_sha}" != "${source_sha}" ]]; then
+            echo "::error::HwVanICI/ascend is ${remote_sha}, expected ${source_sha}."
+            exit 1
+          fi
+
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Ascend mirror"
+            echo
+            echo "- Source: \`areal-project/AReaL@${source_sha}\`"
+            echo "- Updated: \`${changed}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-images:
+    name: Build and publish nightly images
+    needs: sync
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ascend-image-build.yml
+    with:
+      source_ref: ${{ needs.sync.outputs.source_sha }}
