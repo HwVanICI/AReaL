@@ -209,6 +209,21 @@ econfig:
   swe_agent_root: /path/to/AReaL-SWEAgent
   llm_model: ""
   opencode_provider: ""
+  opencode_config:
+    tools:
+      task: false
+    permission:
+      "*": allow
+      task:
+        "*": deny
+    agent:
+      build:
+        steps: 100
+        permission:
+          task:
+            "*": deny
+      title:
+        disable: true
   codex_provider: ""
   max_tokens: ${gconfig.max_tokens}
   max_completion_tokens: ${gconfig.max_new_tokens}

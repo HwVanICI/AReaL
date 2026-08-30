@@ -1,6 +1,7 @@
 """Utilities for SWE-bench agent training with AReaL."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from areal.api.cli_args import PPOConfig
 
@@ -24,6 +25,7 @@ class SWEEnvConfig:
         swe_agent_root: Legacy alias for ``agent_root``.
         llm_model: Optional LLM model override for OH/OpenCode/Codex agents.
         opencode_provider: Optional OpenCode provider override.
+        opencode_config: Additional OpenCode configuration merged into opencode.json.
         codex_provider: Optional Codex provider override.
         step_limit: Maximum number of agent interaction steps per episode.
         max_tokens: Maximum context window advertised to the agent LLM.
@@ -123,6 +125,12 @@ class SWEEnvConfig:
     opencode_provider: str = field(
         default="",
         metadata={"help": "Optional provider override for OpenCode agents."},
+    )
+    opencode_config: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Additional OpenCode configuration merged into opencode.json."
+        },
     )
     codex_provider: str = field(
         default="",
