@@ -19,6 +19,7 @@ def test_swe_env_config_supports_omegaconf_structured_config():
     config = OmegaConf.structured(SWEEnvConfig)
 
     assert config.sandbox_backend == "aenv"
+    assert config.opencode_config == {}
     config.sandbox_backend = "e2b"
     assert config.sandbox_backend == "e2b"
 
@@ -132,6 +133,7 @@ async def test_run_episode_forwards_opencode_model_and_provider(monkeypatch, tmp
         opencode_provider="areal",
         codex_provider=None,
         sandbox_backend="e2b",
+        opencode_config={"tools": {"task": False}},
         max_tokens=32768,
         max_completion_tokens=4096,
     )
@@ -140,6 +142,7 @@ async def test_run_episode_forwards_opencode_model_and_provider(monkeypatch, tmp
     kwargs = run_agent.await_args.kwargs
     assert kwargs["override_llm_model"] == "qwen3-coder"
     assert kwargs["override_opencode_provider"] == "areal"
+    assert kwargs["override_opencode_config"] == {"tools": {"task": False}}
     assert kwargs["override_max_tokens"] == 32768
     assert kwargs["override_max_completion_tokens"] == 4096
     assert kwargs["sandbox_backend"] == "e2b"

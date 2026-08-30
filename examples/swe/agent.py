@@ -129,7 +129,8 @@ class SWEAgentWorkflow:
             ``cc_agent_config``, ``codex_agent_config``,
             ``opencode_agent_config``, ``sandbox_backend``, ``agent_root`` /
             ``swe_agent_root``,
-            ``llm_model``, ``opencode_provider``, ``codex_provider``,
+            ``llm_model``, ``opencode_provider``, ``opencode_config``,
+            ``codex_provider``,
             and ``timeout``.
         gen_args: Generation arguments used as compatibility fallbacks when the
             corresponding environment setting is absent.
@@ -188,6 +189,7 @@ class SWEAgentWorkflow:
         opencode_provider = (
             econfig.get("opencode_provider") or os.getenv("OPENCODE_PROVIDER") or None
         )
+        opencode_config = dict(econfig.get("opencode_config") or {})
         codex_provider = (
             econfig.get("codex_provider") or os.getenv("CODEX_PROVIDER") or None
         )
@@ -218,6 +220,7 @@ class SWEAgentWorkflow:
                     api_key=api_key,
                     llm_model=llm_model,
                     opencode_provider=opencode_provider,
+                    opencode_config=opencode_config,
                     codex_provider=codex_provider,
                     sandbox_backend=sandbox_backend,
                     max_tokens=max_tokens,
@@ -251,6 +254,7 @@ class SWEAgentWorkflow:
         opencode_provider: str | None,
         codex_provider: str | None,
         sandbox_backend: str,
+        opencode_config: dict[str, Any] | None = None,
         max_tokens: int | None = None,
         max_completion_tokens: int | None = None,
     ) -> float:
@@ -278,6 +282,7 @@ class SWEAgentWorkflow:
                 override_base_url=base_url,
                 override_llm_model=llm_model,
                 override_opencode_provider=opencode_provider,
+                override_opencode_config=opencode_config,
                 override_codex_provider=codex_provider,
                 override_max_tokens=max_tokens,
                 override_max_completion_tokens=max_completion_tokens,
