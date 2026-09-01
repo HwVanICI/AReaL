@@ -2,8 +2,8 @@ name: Sync Ascend and Publish NPU Images
 
 on:
   schedule:
-    - cron: '0 2 * * *'
-      timezone: America/Vancouver
+    # 02:17 America/Vancouver while PDT
+    - cron: '17 9 * * *'
   workflow_dispatch:
 
 permissions:
