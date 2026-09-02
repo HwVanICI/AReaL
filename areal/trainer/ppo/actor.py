@@ -339,6 +339,12 @@ class PPOActor:
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
+        if self.config.loss_aggregation == "traj-mean":
+            # Built before the marker is dropped and before the microbatch
+            # split, so every token carries its whole trajectory's count.
+            data["unit_weights"] = trajectory_token_weights(
+                data["loss_mask"], data.get("begin_of_trajectory")
+            )
         for key in ["rewards", "tot_rewards", "kl_rewards", "begin_of_trajectory"]:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
@@ -466,6 +472,47 @@ class PPOActorControllerV2(GatewayTrainController):
         self._gateway_post("/ppo/actor/update", payload)
 
 
+def trajectory_token_weights(
+    loss_mask: torch.Tensor,
+    begin_of_trajectory: torch.Tensor | None,
+) -> torch.Tensor:
+    """Per-token reciprocal of the token count of the trajectory it belongs to.
+
+    Summing this column over a batch yields the number of trajectories in it,
+    so ``traj-mean`` can use it as both the loss weight and the engine weight
+    without requiring a trajectory to stay inside one microbatch.
+
+    ``begin_of_trajectory`` marks the first row of every agent rollout. When it
+    is absent the workflow emits one row per rollout, so each row counts as its
+    own trajectory and the result matches ``seq-mean``.
+    """
+    mask = loss_mask.bool()
+    n_rows = mask.shape[0]
+    if begin_of_trajectory is None:
+        row_to_traj = torch.arange(n_rows, device=mask.device)
+    else:
+        starts = begin_of_trajectory.reshape(-1).to(device=mask.device).long()
+        if starts.shape[0] != n_rows:
+            raise ValueError(
+                f"begin_of_trajectory has {starts.shape[0]} entries but "
+                f"loss_mask has {n_rows} rows"
+            )
+        row_to_traj = starts.cumsum(0) - 1
+        if int(row_to_traj[0].item()) != 0:
+            raise ValueError(
+                "the first row must begin a trajectory, but begin_of_trajectory[0] is 0"
+            )
+    n_trajs = int(row_to_traj[-1].item()) + 1
+    tokens_per_row = mask.sum(dim=-1, dtype=torch.float32)
+    tokens_per_traj = torch.zeros(
+        n_trajs, dtype=torch.float32, device=mask.device
+    ).scatter_add_(0, row_to_traj, tokens_per_row)
+    # Empty trajectories contribute no unmasked token, so the clamp only keeps
+    # the division defined; their weights stay zero.
+    row_weights = 1.0 / tokens_per_traj.clamp_min(1.0)
+    return mask.to(torch.float32) * row_weights[row_to_traj].unsqueeze(-1)
+
+
 def grpo_loss_fn(
     logprobs: torch.Tensor,
     entropy: torch.Tensor,
@@ -530,6 +577,7 @@ def grpo_loss_fn(
             cu_seqlens=input_data.get("cu_seqlens"),
             pg_reduction=pg_reduction,
             denominator_mask=denominator_mask,
+            unit_weights=input_data.get("unit_weights"),
         )
     else:
         loss, stat = ppo_actor_loss_fn(
@@ -546,6 +594,7 @@ def grpo_loss_fn(
             cu_seqlens=input_data.get("cu_seqlens"),
             pg_reduction=pg_reduction,
             denominator_mask=denominator_mask,
+            unit_weights=input_data.get("unit_weights"),
         )
 
     # Joint Distillation KL Loss

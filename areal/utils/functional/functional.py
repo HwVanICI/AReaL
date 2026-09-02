@@ -464,6 +464,7 @@ def ppo_actor_loss_fn(
     cu_seqlens: torch.Tensor | None = None,
     pg_reduction: PolicyGradientReduction | None = None,
     denominator_mask: torch.Tensor | None = None,
+    unit_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """PPO actor loss function with optional rejection sampling.
 
@@ -505,6 +506,8 @@ def ppo_actor_loss_fn(
             None uses the default token-mean reduction.
         denominator_mask: Original loss mask kept as the aggregation denominator
             when rejection sampling narrows loss_mask.
+        unit_weights: Per-token reciprocal of its trajectory's token count.
+            Required for loss_aggregation='traj-mean'.
     """
     # Rejection masking narrows the numerator but keeps the original
     # denominator, so it stays consistent with loss_weight_fn in actor.py.
@@ -573,6 +576,7 @@ def ppo_actor_loss_fn(
         loss_mask,
         denominator_mask=orig_loss_mask,
         cu_seqlens=cu_seqlens,
+        unit_weights=unit_weights,
     )
     clip_mask.logical_and_(loss_mask)
     dual_clip_mask.logical_and_(loss_mask)
@@ -605,6 +609,7 @@ def sapo_loss_fn(
     cu_seqlens: torch.Tensor | None = None,
     pg_reduction: PolicyGradientReduction | None = None,
     denominator_mask: torch.Tensor | None = None,
+    unit_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """SAPO (Soft Adaptive Policy Optimization) loss with asymmetric sigmoid gates.
 
@@ -622,6 +627,7 @@ def sapo_loss_fn(
         cu_seqlens: Cumulative sequence lengths for sequence-level IS
         pg_reduction: PolicyGradientReduction selecting the loss aggregation mode
         denominator_mask: Original loss mask kept as the aggregation denominator
+        unit_weights: Per-token trajectory weights, required for traj-mean
 
     Returns:
         Tuple of (loss, statistics dict compatible with PPO)
@@ -664,6 +670,7 @@ def sapo_loss_fn(
         loss_mask,
         denominator_mask=denominator_mask,
         cu_seqlens=cu_seqlens,
+        unit_weights=unit_weights,
     )
 
     # Return stat dict compatible with PPO (fake clip_mask for logging compatibility)
