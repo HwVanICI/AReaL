@@ -1691,11 +1691,18 @@ class PPOActorConfig(TrainEngineConfig):
             "help": "Policy-gradient loss reduction. "
             "'token-mean': average over valid tokens. "
             "'seq-mean': average per-response token means. "
+            "'traj-mean': average per-trajectory token means, so an agent "
+            "rollout exported as several rows still counts once. "
             "'constant': average each response's masked token sum divided by "
             "loss_aggregation_divisor. Non-token modes require sequence "
             "boundaries; tree-packed actor training currently supports only "
             "'token-mean'.",
-            "choices": ["token-mean", "seq-mean", "constant"],
+            "choices": [
+                "token-mean",
+                "seq-mean",
+                "traj-mean",
+                "constant",
+            ],
         },
     )
     loss_aggregation_divisor: float | None = field(
@@ -1739,11 +1746,12 @@ class PPOActorConfig(TrainEngineConfig):
         if self.loss_aggregation not in (
             "token-mean",
             "seq-mean",
+            "traj-mean",
             "constant",
         ):
             raise ValueError(
                 "loss_aggregation must be 'token-mean', 'seq-mean', "
-                f"or 'constant', got {self.loss_aggregation!r}."
+                f"'traj-mean', or 'constant', got {self.loss_aggregation!r}."
             )
         if self.loss_aggregation == "constant":
             if (

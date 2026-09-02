@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from areal.trainer.ppo.actor import trajectory_token_weights
 from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 
 # Three packed sequences of length 2, 3 and 5. Per-token losses are constant
@@ -137,3 +138,131 @@ class TestNarrowedNumerator:
             LOSS, narrowed, denominator_mask=MASK, cu_seqlens=CU_SEQLENS
         )
         assert result.item() == pytest.approx((LOSS.sum().item() - 1.0) / 10)
+
+
+# Four padded rows forming two trajectories: the first spans three rows
+# (2 + 3 + 5 = 10 masked tokens), the second is a single 4-token row.
+TRAJ_BEGIN = torch.tensor([1, 0, 0, 1], dtype=torch.int32)
+TRAJ_MASK = torch.tensor(
+    [
+        [1, 1, 0, 0, 0],
+        [1, 1, 1, 0, 0],
+        [1, 1, 1, 1, 1],
+        [1, 1, 1, 1, 0],
+    ],
+    dtype=torch.bool,
+)
+TRAJ_LOSS = torch.tensor(
+    [
+        [1.0, 1.0, 0.0, 0.0, 0.0],
+        [2.0, 2.0, 2.0, 0.0, 0.0],
+        [4.0, 4.0, 4.0, 4.0, 4.0],
+        [8.0, 8.0, 8.0, 8.0, 0.0],
+    ]
+)
+
+
+class TestTrajectoryTokenWeights:
+    def test_weights_sum_to_the_trajectory_count(self):
+        weights = trajectory_token_weights(TRAJ_MASK, TRAJ_BEGIN)
+        assert weights.sum().item() == pytest.approx(2.0)
+
+    def test_rows_of_one_trajectory_share_a_weight(self):
+        weights = trajectory_token_weights(TRAJ_MASK, TRAJ_BEGIN)
+        # First trajectory holds 10 masked tokens, second holds 4.
+        assert weights[0][0].item() == pytest.approx(0.1)
+        assert weights[2][0].item() == pytest.approx(0.1)
+        assert weights[3][0].item() == pytest.approx(0.25)
+
+    def test_masked_tokens_get_no_weight(self):
+        weights = trajectory_token_weights(TRAJ_MASK, TRAJ_BEGIN)
+        assert weights[0][2].item() == 0.0
+
+    def test_missing_marker_falls_back_to_one_trajectory_per_row(self):
+        weights = trajectory_token_weights(TRAJ_MASK, None)
+        assert weights.sum().item() == pytest.approx(4.0)
+
+    def test_marker_length_must_match(self):
+        with pytest.raises(ValueError, match="begin_of_trajectory has"):
+            trajectory_token_weights(TRAJ_MASK, torch.tensor([1, 0, 1]))
+
+    def test_first_row_must_start_a_trajectory(self):
+        with pytest.raises(ValueError, match="first row must begin"):
+            trajectory_token_weights(
+                TRAJ_MASK, torch.tensor([0, 0, 1, 1], dtype=torch.int32)
+            )
+
+
+class TestTrajMean:
+    def _weights(self):
+        return trajectory_token_weights(TRAJ_MASK, TRAJ_BEGIN)
+
+    def test_hand_computed_value(self):
+        # Trajectory means are (2*1 + 3*2 + 5*4) / 10 = 2.8 and 8.0.
+        reduction = PolicyGradientReduction("traj-mean")
+        result = reduction.aggregate(TRAJ_LOSS, TRAJ_MASK, unit_weights=self._weights())
+        assert result.item() == pytest.approx(5.4)
+
+    @pytest.mark.parametrize(
+        "partition",
+        [
+            [[0], [1], [2], [3]],
+            [[0, 3], [1, 2]],
+            [[2], [0], [3], [1]],
+            [[0, 1, 2, 3]],
+        ],
+    )
+    def test_partitioning_does_not_change_the_result(self, partition):
+        """A trajectory may be split across microbatches."""
+        reduction = PolicyGradientReduction("traj-mean")
+        weights = self._weights()
+        numerator = 0.0
+        denominator = 0.0
+        for rows in partition:
+            index = torch.tensor(rows)
+            mask, loss, unit = TRAJ_MASK[index], TRAJ_LOSS[index], weights[index]
+            local_mean = reduction.aggregate(loss, mask, unit_weights=unit)
+            local_weight = reduction.normalizer_fn(
+                {"loss_mask": mask, "unit_weights": unit}
+            )
+            numerator += local_mean.item() * local_weight.item()
+            denominator += local_weight.item()
+        assert numerator / denominator == pytest.approx(5.4, rel=1e-5)
+
+    def test_matches_seq_mean_when_every_row_is_a_trajectory(self):
+        weights = trajectory_token_weights(TRAJ_MASK, None)
+        packed_loss = TRAJ_LOSS[TRAJ_MASK]
+        packed_mask = TRAJ_MASK[TRAJ_MASK]
+        packed_weights = weights[TRAJ_MASK]
+        cu_seqlens = torch.tensor([0, 2, 5, 10, 14], dtype=torch.int32)
+        traj = PolicyGradientReduction("traj-mean").aggregate(
+            packed_loss, packed_mask, unit_weights=packed_weights
+        )
+        seq = PolicyGradientReduction("seq-mean").aggregate(
+            packed_loss, packed_mask, cu_seqlens=cu_seqlens
+        )
+        assert traj.item() == pytest.approx(seq.item(), rel=1e-6)
+
+    def test_requires_unit_weights(self):
+        reduction = PolicyGradientReduction("traj-mean")
+        with pytest.raises(ValueError, match="unit_weights are required"):
+            reduction.aggregate(TRAJ_LOSS, TRAJ_MASK)
+
+    def test_unit_weights_must_match_the_loss_shape(self):
+        reduction = PolicyGradientReduction("traj-mean")
+        with pytest.raises(ValueError, match="unit_weights shape"):
+            reduction.aggregate(TRAJ_LOSS, TRAJ_MASK, unit_weights=torch.ones(3, 3))
+
+    def test_normalizer_requires_unit_weights(self):
+        reduction = PolicyGradientReduction("traj-mean")
+        with pytest.raises(ValueError, match="unit_weights are required"):
+            reduction.normalizer_fn({"loss_mask": TRAJ_MASK})
+
+    def test_needs_no_sequence_boundaries(self):
+        reduction = PolicyGradientReduction("traj-mean")
+        packed_loss = TRAJ_LOSS[TRAJ_MASK]
+        packed_mask = TRAJ_MASK[TRAJ_MASK]
+        packed_weights = self._weights()[TRAJ_MASK]
+        assert reduction.aggregate(
+            packed_loss, packed_mask, unit_weights=packed_weights
+        ).item() == pytest.approx(5.4)
