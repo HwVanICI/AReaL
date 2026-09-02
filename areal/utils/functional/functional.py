@@ -10,6 +10,7 @@ import torch.distributed as dist
 
 from areal.api.cli_args import RejectionSamplingConfig
 from areal.utils.data import KLEstimator
+from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 
 
 @torch.no_grad()
@@ -461,6 +462,8 @@ def ppo_actor_loss_fn(
     rejection_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
+    pg_reduction: PolicyGradientReduction | None = None,
+    denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """PPO actor loss function with optional rejection sampling.
 
@@ -498,12 +501,14 @@ def ppo_actor_loss_fn(
             Required when inputs are 1D and importance_sampling_level='sequence'.
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
+        pg_reduction: PolicyGradientReduction selecting the loss aggregation mode.
+            None uses the default token-mean reduction.
+        denominator_mask: Original loss mask kept as the aggregation denominator
+            when rejection sampling narrows loss_mask.
     """
-    # Save original count BEFORE rejection sampling may modify loss_mask.
-    # This keeps the denominator consistent with loss_weight_fn in actor.py,
-    # which always uses the original loss_mask from input_data. Without this,
-    # mask mode would inflate per-token gradients by N_original / N_kept.
-    loss_mask_count = loss_mask.count_nonzero() or 1
+    # Rejection masking narrows the numerator but keeps the original
+    # denominator, so it stays consistent with loss_weight_fn in actor.py.
+    orig_loss_mask = loss_mask if denominator_mask is None else denominator_mask
 
     # === Apply rejection sampling (replaces old compute_behave_imp_weight) ===
     if rejection_sampling is not None:
@@ -562,7 +567,13 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+    reduction = pg_reduction or PolicyGradientReduction()
+    pg_loss = reduction.aggregate(
+        pg_loss,
+        loss_mask,
+        denominator_mask=orig_loss_mask,
+        cu_seqlens=cu_seqlens,
+    )
     clip_mask.logical_and_(loss_mask)
     dual_clip_mask.logical_and_(loss_mask)
     stat = dict(
@@ -592,6 +603,8 @@ def sapo_loss_fn(
     loss_mask: torch.Tensor,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
+    pg_reduction: PolicyGradientReduction | None = None,
+    denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """SAPO (Soft Adaptive Policy Optimization) loss with asymmetric sigmoid gates.
 
@@ -607,13 +620,14 @@ def sapo_loss_fn(
         loss_mask: Mask for valid tokens
         importance_sampling_level: "token" or "sequence" level importance sampling
         cu_seqlens: Cumulative sequence lengths for sequence-level IS
+        pg_reduction: PolicyGradientReduction selecting the loss aggregation mode
+        denominator_mask: Original loss mask kept as the aggregation denominator
 
     Returns:
         Tuple of (loss, statistics dict compatible with PPO)
     """
     if tau_pos <= 0 or tau_neg <= 0:
         raise ValueError("SAPO temperatures (tau_pos, tau_neg) must be positive.")
-    loss_mask_count = loss_mask.count_nonzero() or 1
     advantages = advantages.detach()
     log_ratio = logprobs - old_logprobs
 
@@ -644,7 +658,13 @@ def sapo_loss_fn(
     # Compute loss
     pg_loss = -soft_gate * advantages
     logging_loss = pg_loss.detach()
-    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+    reduction = pg_reduction or PolicyGradientReduction()
+    pg_loss = reduction.aggregate(
+        pg_loss,
+        loss_mask,
+        denominator_mask=denominator_mask,
+        cu_seqlens=cu_seqlens,
+    )
 
     # Return stat dict compatible with PPO (fake clip_mask for logging compatibility)
     stat = dict(
