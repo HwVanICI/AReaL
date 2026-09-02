@@ -10,8 +10,13 @@ from typing import Any, Literal
 
 import torch
 
-LossAggregationMode = Literal["token-mean", "seq-mean", "constant"]
-_LOSS_AGGREGATIONS = ("token-mean", "seq-mean", "constant")
+LossAggregationMode = Literal["token-mean", "seq-mean", "traj-mean", "constant"]
+_LOSS_AGGREGATIONS = (
+    "token-mean",
+    "seq-mean",
+    "traj-mean",
+    "constant",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +25,13 @@ class PolicyGradientReduction:
 
     The training engine combines microbatches as
     ``sum(local_mean * local_weight) / sum(local_weight)``.
+
+    ``traj-mean`` instead takes a precomputed per-token ``unit_weights`` column
+    holding ``1 / (tokens in this token's trajectory)``. Both the numerator and
+    the weight are then plain sums, so a trajectory may be split across
+    microbatches and data-parallel ranks: summing the weights over the whole
+    batch recovers the trajectory count, which is exactly the denominator the
+    engine divides by.
     """
 
     mode: LossAggregationMode = "token-mean"
@@ -49,6 +61,8 @@ class PolicyGradientReduction:
         loss_mask = data["loss_mask"].bool()
         if self.mode == "token-mean":
             return loss_mask.count_nonzero()
+        if self.mode == "traj-mean":
+            return self._unit_weight_sum(data.get("unit_weights"))
 
         self._require_sequence_boundaries(loss_mask, data.get("cu_seqlens"))
         sequence_denominators = self._sequence_sums(
@@ -68,6 +82,7 @@ class PolicyGradientReduction:
         *,
         denominator_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
+        unit_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Aggregate a token-shaped policy-gradient loss."""
         numerator_mask, denominator_mask = self._resolve_masks(
@@ -77,6 +92,13 @@ class PolicyGradientReduction:
             # Preserve the pre-feature token-mean dtype and reduction path.
             numerator = torch.where(numerator_mask, loss, 0).sum()
             return numerator / denominator_mask.count_nonzero().clamp_min(1)
+
+        if self.mode == "traj-mean":
+            weights = self._require_unit_weights(loss, unit_weights)
+            numerator = (self._masked_loss(loss, numerator_mask) * weights).sum()
+            return numerator / self._unit_weight_sum(weights).clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
 
         self._require_sequence_boundaries(loss_mask, cu_seqlens)
         if self.mode == "constant":
@@ -90,6 +112,29 @@ class PolicyGradientReduction:
         return self._aggregate_units(
             loss, numerator_mask, denominator_mask, cu_seqlens=cu_seqlens
         )
+
+    @staticmethod
+    def _unit_weight_sum(unit_weights: torch.Tensor | None) -> torch.Tensor:
+        if unit_weights is None:
+            raise ValueError(
+                "unit_weights are required for loss_aggregation='traj-mean'."
+            )
+        return unit_weights.to(torch.float32).sum()
+
+    @staticmethod
+    def _require_unit_weights(
+        loss: torch.Tensor, unit_weights: torch.Tensor | None
+    ) -> torch.Tensor:
+        if unit_weights is None:
+            raise ValueError(
+                "unit_weights are required for loss_aggregation='traj-mean'."
+            )
+        if unit_weights.shape != loss.shape:
+            raise ValueError(
+                f"unit_weights shape {tuple(unit_weights.shape)} must match "
+                f"loss shape {tuple(loss.shape)}."
+            )
+        return unit_weights.to(torch.float32)
 
     def _require_divisor(self) -> float:
         if self.divisor is None:
