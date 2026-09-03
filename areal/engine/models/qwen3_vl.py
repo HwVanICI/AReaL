@@ -220,22 +220,50 @@ def _split_mcore_gated_attn_qkv(
     train_tp_rank: int,
     train_tp_size: int,
 ) -> list[tuple[str, torch.Tensor]]:
-    """Convert Qwen3.5 full-attention QKV weight: transform + infer TP sharding.
+    """Convert Qwen3.5 full-attention QKV: mcore GQA-interleaved -> infer layout.
 
-    Ported from awex Qwen3_5McoreConverterMixin._transform_qwen3_5_qkv +
-    _shard_qkv_for_infer + _convert_qwen3_5_qkv_param
-    (awex/converter/mcore_converter.py:1379, 1484, 1559).
+    u->q_heads=24,using 8 as example.
+    g->gate_heads=24,using 8 as example just like q.
+    k,v->kv_heads=4
 
-    Per-rank train layout: [Q0..Q_{n-1}(sequential), K, V]
-      Q sequential = [u0..u_{h-1}, c0..c_{h-1}] (unique first, copies second)
-    HF order: Q interleaved [u0,c0,u1,c1,...] + K/V concatenated across ranks.
-    K/V are sharded (not replicated): each rank holds 1 unique KV head
-    (when train_tp >= num_kv_heads). Confirmed via verify_against_hf.py:
-    infer pkl has 3584 rows/rank = 12Q+1K+1V for TP4.
+    mcore 4 group,q_heads // kv_heads
 
-    Note: num_attention_heads reports UNIQUE q heads (24), but the actual
-    QKV tensor has duplicated q heads (48 = 24*2) for Qwen3.5 gating. We
-    detect the duplication factor by matching the local tensor size.
+    g0:[u0 u1 g0 g1 k0 v0]
+    g1:[u2 u3 g2 g3 k1 v1]
+    g2:[u4 u5 g4 g5 k2 v2]
+    g3:[u6 u7 g6 g7 k3 v3]
+    when tp=2, rank_0 has g0、g1 and rank_1 has g2、g3。every rank has full group
+    when tp=4, rank_x has gx,x in [0,1,2,3]。every rank has full group
+    when tp=8，rank_0 has [u0 u1 g0] and rank_1 has [g1 k0 v0].they split up g0 in half.
+
+    vllm
+
+    [u0 g0 u1 g1 u2 g2 u3 g3 u4 g4 u5 g5 u6 g6 u7 g7]
+    [k0 k1 k2 k3]
+    [v0 v1 v2 v3]
+    when tp=2,rank_0 has [u0 g0 u1 g1 u2 g2 u3 g3 k0 k1 v0 v1]
+    when tp=4,rank_0 has [u0 g0 u1 g1 k0 v0]
+    when tp=8,repeat kv:
+    [u0 g0 u1 g1 u2 g2 u3 g3 u4 g4 u5 g5 u6 g6 u7 g7]
+    [k0 k0 k1 k1 k2 k2 k3 k3]
+    [v0 v0 v1 v1 v2 v2 v3 v3]
+    rank_0 has [u0 g0 k0 v0]
+    rank_1 has [u1 g1 k0 v0]
+
+    No mater what the train tp is,just allgather to get all groups.
+    then traverse each group to get all q,z,k,v.like:
+    g0 [u0 u1 g0 g1 k0 v0] → q_u=[u0,u1], z=[g0,g1], k=[k0], v=[v0]
+    g1 [u2 u3 g2 g3 k1 v1] → q_u=[u2,u3], z=[g2,g3], k=[k1], v=[v1]
+    g2 [u4 u5 g4 g5 k2 v2] → q_u=[u4,u5], z=[g4,g5], k=[k2], v=[v2]
+    g3 [u6 u7 g6 g7 k3 v3] → q_u=[u6,u7], z=[g6,g7], k=[k3], v=[v3]
+    q_unique = [u0 u1 u2 u3 u4 u5 u6 u7]
+    z_full   = [g0 g1 g2 g3 g4 g5 g6 g7]
+    key      = [k0 k1 k2 k3]
+    value    = [v0 v1 v2 v3]
+    interleave_idx = _q_interleave_index(16)--> [0,8,1,9,2,10,3,11,4,12,5,13,6,14,7,15]
+    query = [u0 g0 u1 g1 u2 g2 u3 g3 u4 g4 u5 g5 u6 g6 u7 g7]
+    key   =  [k0 k1 k2 k3]
+    value =  [v0 v1 v2 v3]
     """
     from awex.converter.mcore_converter import get_full_tensor
 
@@ -245,119 +273,114 @@ def _split_mcore_gated_attn_qkv(
     head_size = int(getattr(text_config, "head_dim", 0))
     if not head_size:
         head_size = int(getattr(text_config, "hidden_size", 0)) // total_num_heads
+    if not (total_num_heads and total_num_kv_heads and head_size):
+        raise ValueError(
+            f"num_attention_heads/num_key_value_heads/head_dim are required in "
+            f"hf_config.text_config to convert the gated-attn QKV, but some "
+            f"were missing: heads={total_num_heads}, kv={total_num_kv_heads}, "
+            f"head_size={head_size}"
+        )
+    heads_per_group = total_num_heads // total_num_kv_heads
 
-    if train_tp_size <= 1:
-        # No TP: weight is already full. Do Q interleave directly.
-        weight = linear_qkv
-        matched = None
-        for q_dup in (2, 1):
-            effective_q = total_num_heads * q_dup
-            q_per_rank = effective_q
-            kv_per_rank = total_num_kv_heads
-            q_rows = q_per_rank * head_size
-            kv_rows = kv_per_rank * head_size
-            per_rank_total = q_rows + 2 * kv_rows
-            if weight.shape[0] == per_rank_total:
-                matched = (q_dup, effective_q, q_per_rank, kv_per_rank)
-                break
-        if matched is None:
+    per_group_slots = 2 * heads_per_group + 2
+    full_rows = per_group_slots * total_num_kv_heads * head_size
+    # Row sizes of each component within one kv-group.
+    q_u_rows = heads_per_group * head_size
+    z_rows = heads_per_group * head_size
+    kv_rows = head_size
+
+    train_tp_size_eff = train_tp_size if (train_tp_size and train_tp_size > 0) else 1
+    local_size = linear_qkv.shape[0]
+
+    if train_tp_size_eff > 1:
+        if local_size == full_rows:
+            need_gather = False
+        elif local_size * train_tp_size_eff == full_rows:
+            need_gather = True
+        else:
             raise ValueError(
-                f"QKV weight size mismatch (train_tp_size=1): "
-                f"actual={weight.shape[0]}, no q_dup match. "
-                f"num_heads={total_num_heads}, "
-                f"num_kv_heads={total_num_kv_heads}, "
+                f"QKV weight size mismatch: local_size={local_size}, "
+                f"train_tp_size={train_tp_size_eff}. Expected a per-rank shard "
+                f"({full_rows // train_tp_size_eff}) or full ({full_rows}) for "
+                f"the gated GQA layout. num_heads={total_num_heads}, "
+                f"num_kv_heads={total_num_kv_heads}, head_size={head_size}"
+            )
+    else:
+        need_gather = False
+        if local_size != full_rows:
+            raise ValueError(
+                f"QKV weight size mismatch: local_size={local_size}, expected "
+                f"full={full_rows} for the gated GQA layout. num_heads="
+                f"{total_num_heads}, num_kv_heads={total_num_kv_heads}, "
                 f"head_size={head_size}"
             )
-        q_dup, effective_q, q_per_rank, kv_per_rank = matched
-        q_rows = q_per_rank * head_size
-        kv_rows = kv_per_rank * head_size
-        interleave_idx = _q_interleave_index(q_per_rank)
-        q, k, v = weight.split([q_rows, kv_rows, kv_rows], dim=0)
-        orig_shape = q.shape
-        q_heads = q.reshape(q_per_rank, head_size, -1)
-        q = q_heads[interleave_idx].reshape(orig_shape)
-        query, key, value = q, k, v
-    else:
-        # Detect Q head duplication factor (Qwen3.5: 24 unique -> 48 duplicated).
-        local_size = linear_qkv.shape[0]
-        matched = None  # (q_dup, effective_q, q_per_rank, kv_per_rank, need_gather)
-        for q_dup in (2, 1):
-            effective_q = total_num_heads * q_dup
-            if effective_q % train_tp_size != 0:
-                continue
-            q_per_rank = effective_q // train_tp_size
-            kv_per_rank = max(1, total_num_kv_heads // train_tp_size)
-            q_rows = q_per_rank * head_size
-            kv_rows = kv_per_rank * head_size
-            per_rank_total = q_rows + 2 * kv_rows
-            full_total = per_rank_total * train_tp_size
-            if local_size == per_rank_total:
-                matched = (q_dup, effective_q, q_per_rank, kv_per_rank, True)
-                break
-            elif local_size == full_total:
-                matched = (q_dup, effective_q, q_per_rank, kv_per_rank, False)
-                break
-        if matched is None:
-            raise ValueError(
-                f"QKV weight size mismatch: actual local_size={local_size}, "
-                f"no q_dup match. num_heads={total_num_heads}, "
-                f"num_kv_heads={total_num_kv_heads}, head_size={head_size}, "
-                f"train_tp_size={train_tp_size}"
-            )
-        q_dup, effective_q, q_per_rank, kv_per_rank, need_gather = matched
-        q_rows_per_rank = q_per_rank * head_size
-        kv_rows_per_rank = kv_per_rank * head_size
-        weight = get_full_tensor(linear_qkv, dim=0) if need_gather else linear_qkv
-        interleave_idx = _q_interleave_index(q_per_rank)
-        q_parts = []
-        k_parts = []
-        v_parts = []
-        for rank_chunk in torch.chunk(weight, train_tp_size, dim=0):
-            q, k, v = rank_chunk.split(
-                [q_rows_per_rank, kv_rows_per_rank, kv_rows_per_rank], dim=0
-            )
-            orig_shape = q.shape
-            q_heads = q.reshape(q_per_rank, head_size, -1)
-            q = q_heads[interleave_idx].reshape(orig_shape)
-            q_parts.append(q)
-            k_parts.append(k)
-            v_parts.append(v)
-        query = torch.cat(q_parts, dim=0)
-        key = torch.cat(k_parts, dim=0)
-        value = torch.cat(v_parts, dim=0)
 
-    # Shard (Q, K, V) for inference TP: [Q0,K0,V0,Q1,K1,V1,...] + train_tp shard.
-    # Qwen3.5: K/V are SHARDED across infer ranks (1 KV head per rank when
-    # infer_tp == total_num_kv_heads), NOT replicated. The NPU replication
-    # branch was removed for Qwen3.5 (was giving 5120 instead of 3584 rows/rank).
+    weight = get_full_tensor(linear_qkv, dim=0) if need_gather else linear_qkv
+    if weight.shape[0] != full_rows or weight.ndim != 2:
+        raise ValueError(
+            f"QKV full weight mismatch after gather: shape="
+            f"{tuple(weight.shape)}, ndim={weight.ndim}, expected "
+            f"[{full_rows}, *]. Qwen3.5 uses attention_bias=false so a 2D "
+            f"weight is expected on this path."
+        )
+    feature_dim = weight.shape[-1]
+    q_u_parts, z_parts, key_parts, value_parts = [], [], [], []
+    for group in torch.chunk(weight, total_num_kv_heads, dim=0):
+        q_u, z, k, v = group.split([q_u_rows, z_rows, kv_rows, kv_rows], dim=0)
+        q_u_parts.append(q_u)
+        z_parts.append(z)
+        key_parts.append(k)
+        value_parts.append(v)
+    q_unique = torch.cat(q_u_parts, dim=0)  # [num_heads * head_size, feature]
+    z_full = torch.cat(z_parts, dim=0)  # [num_heads * head_size, feature]
+    key = torch.cat(key_parts, dim=0)  # [num_kv * head_size, feature]
+    value = torch.cat(value_parts, dim=0)  # [num_kv * head_size, feature]
+
+    # Q is duplicated (unique + gate). mcore stores them per group as
+    # [Q_u, Z]; HF wants them interleaved per head [u0, c0, u1, c1, ...].
+    # Gather into [all-unique, all-gate] then interleave per head to HF order.
+    effective_q = 2 * total_num_heads
+    combined = torch.cat([q_unique, z_full], dim=0)
+    interleave_idx = _q_interleave_index(effective_q)
+    query = combined.view(effective_q, head_size, feature_dim)[interleave_idx].reshape(
+        -1, feature_dim
+    )
+    # Free the gate intermediates (only `query` is needed downstream).
+    del q_unique, z_full, combined
     if infer_atten_tp_size >= total_num_kv_heads:
         num_kv_head_replicas = infer_atten_tp_size // total_num_kv_heads
-    else:
-        num_kv_head_replicas = 1
-    query_shards = query.chunk(infer_atten_tp_size, dim=0)
-    if infer_atten_tp_size >= total_num_kv_heads:
-        key_chunks = key.chunk(total_num_kv_heads, dim=0)
-        key_shards = [k for k in key_chunks for _ in range(num_kv_head_replicas)]
-        value_chunks = value.chunk(total_num_kv_heads, dim=0)
-        value_shards = [v for v in value_chunks for _ in range(num_kv_head_replicas)]
+        key_shards = [
+            k
+            for k in key.chunk(total_num_kv_heads, dim=0)
+            for _ in range(num_kv_head_replicas)
+        ]
+        value_shards = [
+            v
+            for v in value.chunk(total_num_kv_heads, dim=0)
+            for _ in range(num_kv_head_replicas)
+        ]
     else:
         key_shards = key.chunk(infer_atten_tp_size, dim=0)
         value_shards = value.chunk(infer_atten_tp_size, dim=0)
+    query_shards = query.chunk(infer_atten_tp_size, dim=0)
+
     qkv_tp_groups = []
-    for q_s, k_s, v_s in zip(query_shards, key_shards, value_shards):
-        qkv_tp_groups.append(q_s)
-        qkv_tp_groups.append(k_s)
-        qkv_tp_groups.append(v_s)
+    for query_shard, key_shard, value_shard in zip(
+        query_shards, key_shards, value_shards
+    ):
+        qkv_tp_groups.append(query_shard)
+        qkv_tp_groups.append(key_shard)
+        qkv_tp_groups.append(value_shard)
     merged = torch.cat(qkv_tp_groups, dim=0)
 
-    if train_tp_size and train_tp_size > 1:
+    if train_tp_size_eff > 1:
         if train_tp_rank is None:
             raise ValueError("train_tp_rank is required when train_tp_size > 1")
-        shards = torch.chunk(merged, train_tp_size, dim=0)
+        shards = torch.chunk(merged, train_tp_size_eff, dim=0)
         if train_tp_rank >= len(shards):
             raise ValueError(
                 f"train_tp_rank {train_tp_rank} out of range for "
-                f"tp_size {train_tp_size}"
+                f"tp_size {train_tp_size_eff}"
             )
         merged = shards[train_tp_rank]
     return [("self_attn.qkv_proj.weight", merged)]
