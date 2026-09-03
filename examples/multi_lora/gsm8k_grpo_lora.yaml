@@ -206,11 +206,6 @@ stats_logger:
   fileroot: ${cluster.fileroot}
   wandb:
     mode: disabled
-  swanlab:
-    project: t00926703
-    name: one-lora_1.0.5_try_without_updatelora
-    mode: cloud
-    api_key: MHr2kFFcp5QZLSCPytEeE
 
 perf_tracer:
   experiment_name: ${experiment_name}
