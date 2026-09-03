@@ -8,7 +8,7 @@ import random
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Protocol
 from collections.abc import Generator
 from collections import deque
@@ -226,7 +226,6 @@ def check_trajectory_format(
 
     return True
 
-
 @dataclass
 class _RolloutTaskInput:
     """Internal wrapper for rollout-specific task input."""
@@ -234,9 +233,10 @@ class _RolloutTaskInput:
     task_id: int
     data: dict[str, Any]
     workflow: RolloutWorkflow
+    workflow_kwargs: dict[str, Any] = field(default_factory=dict)
     should_accept_fn: Callable[[dict[str, Any]], bool] | None = None
     is_eval: bool = False
-
+    multilora_name: str = ""
 
 @dataclass
 class _RolloutResult:
@@ -291,7 +291,12 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
         # Unbounded deques for producer/consumer pattern
         self._pending_inputs: deque[TInput] = deque()
+        ## NOTE: We change to adding the lora name into _pending_inputs
+        # self._pending_inputs: deque[tuple[TInput, str]] = deque()
+        
+        ## NOTE: patching to change to hard-coded from "default" lora_name
         self._pending_results: dict[int, TimedResult[TResult]] = {}
+
         self._active_task_ids: set[int] = set()
 
         # Condition variables for coordination
@@ -364,13 +369,28 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 # Check for errors from other threads (fail-fast)
                 self._check_thread_exception()
 
+
                 task_input = self._get_next_task_for_submission()
                 if task_input is None:
                     continue
-
+                
+                lora_name = task_input.workflow_kwargs.get("multilora_name")
+                if lora_name:
+                    self._pending_results.setdefault(lora_name, {})
                 task_fn = self.task_factory(task_input)
                 try:
-                    self.runner.submit(task_fn, task_id=task_input.task_id)
+                    if lora_name:
+                        self.runner.submit(
+                            task_fn,
+                            task_id=task_input.task_id,
+                            multilora_name=lora_name,
+                        )
+                    else:
+                        self.runner.submit(
+                            task_fn,
+                            task_id=task_input.task_id,
+                        )
+                        
                     self.staleness_manager.on_rollout_submitted()
                     if self.enable_tracing:
                         self.logger.info(f"Submit rollout. {self._rollout_stats()}")
@@ -409,12 +429,17 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     results = self.runner.wait(
                         count=count, timeout=0.05, with_timing=True
                     )
+                
                 except TimeoutError:
                     continue
 
                 with self._result_cv:
                     for result in results:
-                        self._pending_results[result.task_id] = result
+                        
+                        ## NOTE: patching to change to hard-coded from "default" lora_name
+                        # self._pending_results[result.task_id] = result
+                        self._pending_results[result.multilora_name][result.task_id] = result
+
                         # Trigger callback if registered
                         cb_addr = self._task_callbacks.pop(result.task_id, None)
                         if cb_addr:
@@ -441,7 +466,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 # There is capacity and pending inputs
                 if (
                     not self.runner.paused.is_set()
-                    and self.staleness_manager.get_capacity() > 0
+                    # and self.staleness_manager.get_capacity() > 0
                     and self._pending_inputs
                 ):
                     return self._pending_inputs.popleft()
@@ -534,6 +559,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         task_input : TInput
             Task input to be processed.
         """
+        
         self._check_thread_exception()
         with self._input_cv:
             self._pending_inputs.append(task_input)
@@ -543,6 +569,89 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             self._input_cv.notify()
         with self._result_cv:
             self._active_task_ids.add(task_input.task_id)
+
+
+    def submit_task_input_lora(self, lora_name: str, task_input: TInput) -> None:
+        """Submit a task input for processing.
+
+        Parameters
+        ----------
+        task_input : TInput
+            Task input to be processed.
+        """       
+        self._check_thread_exception()
+        with self._input_cv:
+            self._pending_inputs.append(task_input)
+            self.staleness_manager.on_rollout_enqueued()
+            if self.enable_tracing:
+                self.logger.info(f"Enqueue rollout. {self._rollout_stats()}")
+            self._input_cv.notify()
+        with self._result_cv:
+            self._active_task_ids.add(task_input.task_id)
+
+
+    def wait_results_lora(
+        self, multilora_name: str, count: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> list[TResult | None]:
+        """Wait for the completion of `count` tasks.
+
+        Parameters
+        ----------
+        count : int
+            Number of results to wait for.
+        timeout : float | None
+            Maximum time to wait in seconds.
+        raise_timeout : bool
+            Whether to raise TimeoutError on timeout.
+
+        Returns
+        -------
+        list[TResult | None]
+            List of task results, None for rejected tasks.
+        """
+        if count <= 0:
+            raise ValueError(f"count must be positive, got {count}")
+
+        start_time = time.perf_counter()
+        if timeout is None:
+            timeout = _DEFAULT_WAIT_TIMEOUT_SECONDS
+
+        with self._result_cv:
+            ## NOTE: patching to change to hard-coded from "default" lora_name
+            
+            while len(self._pending_results[multilora_name]) < count:
+                self._check_thread_exception()
+
+                elapsed = time.perf_counter() - start_time
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    if raise_timeout:
+                        raise TimeoutError(
+                            f"Timed out waiting for {count} results, "
+                            ## NOTE: patching to change to hard-coded from "default" lora_name 
+                            f"only received {len(self._pending_results[multilora_name])}"
+                        )
+                    return []
+
+                self._result_cv.wait(timeout=remaining)
+            ## NOTE: patching to change to hard-coded from "default" lora_name 
+            drained: list[TimedResult[TResult]] = list(self._pending_results[multilora_name].values())
+            self._pending_results[multilora_name].clear()
+
+        drained.sort(key=lambda x: x.create_time)
+        selected, pending = drained[:count], drained[count:]
+        with self._result_cv:
+            if pending:
+                for result in pending:
+                    ## NOTE: patching to change to hard-coded from "default" lora_name
+                    self._pending_results[multilora_name][result.task_id] = result
+                self._result_cv.notify_all()
+            for r in selected:
+                self._active_task_ids.discard(r.task_id)
+
+        random.shuffle(selected)
+
+        return [r.data for r in selected]
 
     def wait_results(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
@@ -571,6 +680,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             timeout = _DEFAULT_WAIT_TIMEOUT_SECONDS
 
         with self._result_cv:
+            ## NOTE: patching to change to hard-coded from "default" lora_name to 
             while len(self._pending_results) < count:
                 self._check_thread_exception()
 
@@ -585,7 +695,6 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     return []
 
                 self._result_cv.wait(timeout=remaining)
-
             drained: list[TimedResult[TResult]] = list(self._pending_results.values())
             self._pending_results.clear()
 
@@ -604,7 +713,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         return [r.data for r in selected]
 
     def wait_for_task(
-        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+        self, multilora_name: str, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> TResult | None:
         """Wait for a specific task result by task_id."""
         start_time = time.perf_counter()
@@ -615,7 +724,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             if task_id not in self._active_task_ids:
                 raise ValueError(f"Task {task_id} is never submitted.")
 
-            while task_id not in self._pending_results:
+            ## NOTE: patching to change to hard-coded from "default" lora_name to 
+            # while task_id not in self._pending_results:
+            while task_id not in self._pending_results[multilora_name]:
                 self._check_thread_exception()
 
                 elapsed = time.perf_counter() - start_time
@@ -627,7 +738,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
                 self._result_cv.wait(timeout=remaining)
 
-            found_result = self._pending_results.pop(task_id)
+            ## NOTE: patching to change to hard-coded from "default" lora_name to 
+            found_result = self._pending_results[multilora_name].pop(task_id)
             self._active_task_ids.remove(task_id)
             self._result_cv.notify_all()
             return found_result.data
@@ -1124,6 +1236,9 @@ class WorkflowExecutor:
         async def _execute_workflow() -> _RolloutResult | None:
             """Execute workflow.arun_episode and apply AReaL-specific logic."""
             task_id = pending_task.task_id
+            
+            multilora_name = pending_task.workflow_kwargs["multilora_name"]
+            
 
             # Set task_id in ContextVar before entering arun_episode
             perf_tracer.set_task_id(task_id)
@@ -1141,7 +1256,7 @@ class WorkflowExecutor:
 
             try:
                 traj = await pending_task.workflow.arun_episode(
-                    self.inference_engine, pending_task.data
+                    self.inference_engine, pending_task.data, multilora_name
                 )
 
                 # Trajectory format checking
@@ -1242,6 +1357,7 @@ class WorkflowExecutor:
     def submit(
         self,
         data: dict[str, Any],
+        multilora_name: str,
         workflow: RolloutWorkflow,
         should_accept_fn: Callable[[dict[str, Any]], bool] = None,
         task_id: int | None = None,
@@ -1257,6 +1373,7 @@ class WorkflowExecutor:
         if task_id is None:
             task_id = self._task_id_generator.next()
         perf_tracer.register_task(task_id)
+
         task_input = _RolloutTaskInput(
             data=data,
             workflow=workflow,
@@ -1264,6 +1381,9 @@ class WorkflowExecutor:
             task_id=task_id,
             is_eval=is_eval,
         )
+        
+        if multilora_name:
+            task_input.workflow_kwargs["multilora_name"] = multilora_name
 
         # Delegate to dispatcher
         self.dispatcher.submit_task_input(task_input)
@@ -1287,7 +1407,7 @@ class WorkflowExecutor:
         return [r.trajectory if r is not None else None for r in results]
 
     def wait_for_task(
-        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+        self, multilora_name: str, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
         """
         Wait for a specific workflow task to complete.
@@ -1313,7 +1433,7 @@ class WorkflowExecutor:
         --------
         :meth:`~areal.api.engine_api.InferenceEngine.wait_for_task`
         """
-        result = self.dispatcher.wait_for_task(task_id, timeout, raise_timeout)
+        result = self.dispatcher.wait_for_task(multilora_name, task_id, timeout, raise_timeout)
 
         if result is not None and self.config.enable_rollout_tracing:
             self.logger.info(f"Task {task_id} completed successfully")
@@ -1349,7 +1469,7 @@ class WorkflowExecutor:
             self.submit(
                 data=item,
                 workflow=workflow,
-            )
+            )       
         results = self.wait(count=len(data))
         # Return list of trajectory dicts (filter out None)
         return [r for r in results if r is not None]

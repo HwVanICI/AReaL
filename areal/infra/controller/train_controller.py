@@ -713,6 +713,10 @@ class TrainController:
         self._check_rollout_engine_connected()
         self._custom_function_call("update_weights", meta=meta)
 
+    def update_lora(self, meta: WeightUpdateMeta, global_step: int, lora_name: str):
+        self._check_rollout_engine_connected()
+        self._custom_function_call("update_lora", meta=meta, global_step=global_step, lora_name=lora_name)
+        
     def offload(self) -> None:
         """Offload model parameters to CPU across all train workers."""
         self._custom_function_call("offload")
@@ -768,6 +772,32 @@ class TrainController:
             dynamic_bs=dynamic_bs,
         )
 
+
+    # in trainer.py
+    async def rollout_batch_async(
+        self,
+        data_batch,
+        workflow: WorkflowLike,
+        workflow_kwargs: dict[str, Any],
+        should_accept_fn: str | None = None,
+        group_size: int = 1,
+        multilora_name: str = "",
+    ) -> dict[str, Any]:
+        """
+        Async wrapper around rollout engine.
+        Now multiple trainer.rollout_batch calls can be awaited simultaneously.
+        """
+        return await self.rollout.rollout_batch_async(
+            data_batch=data_batch,
+            workflow=workflow,
+            workflow_kwargs=workflow_kwargs,
+            should_accept_fn=should_accept_fn,
+            group_size=group_size,
+            multilora_name=multilora_name,
+            dynamic_bs=False,
+        )
+        
+        
     def rollout_batch(
         self,
         data: list[dict[str, Any]],

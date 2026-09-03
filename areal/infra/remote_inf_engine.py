@@ -80,12 +80,12 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         self.logger = logger
 
     async def arun_episode(
-        self, engine: InferenceEngine, data: dict[str, Any]
+        self, engine: InferenceEngine, data: dict[str, Any], multilora: str
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
 
         results = await asyncio.gather(
-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
+            *[self.workflow.arun_episode(engine, data, multilora) for _ in range(self.group_size)]
         )
 
         valid_results = [r for r in results if r is not None]
@@ -901,7 +901,7 @@ class RemoteInfEngine(InferenceEngine):
             return server
         raise NotImplementedError("Only round-robin scheduling is implemented.")
 
-    async def agenerate(self, req: ModelRequest) -> ModelResponse:
+    async def agenerate(self, req: ModelRequest, multilora_name="") -> ModelResponse:
         """Asynchronously generate a response for the given request.
 
         Parameters
@@ -984,12 +984,21 @@ class RemoteInfEngine(InferenceEngine):
             # version is current once the response arrives.
             request_version = self.get_version()
 
-            # Build request using backend
-            http_req = self.backend.build_generation_request(
-                req,
-                with_lora=self.config.use_lora,
-                version=request_version,
-            )
+            if multilora_name:
+                # Build request using backend
+                http_req = self.backend.build_generation_request_multilora(
+                    req,
+                    with_lora=self.config.use_lora,
+                    version=request_version,
+                    lora_name=multilora_name,
+                )
+            else:
+                # Build request using backend
+                http_req = self.backend.build_generation_request(
+                    req,
+                    with_lora=self.config.use_lora,
+                    version=request_version,
+                )
 
             # Loop until the generation is complete
             result = await arequest_with_retry(
@@ -1001,6 +1010,9 @@ class RemoteInfEngine(InferenceEngine):
                 max_retries=self.config.request_retries,
                 timeout=self.config.request_timeout,
             )
+            
+
+            
 
             # Assert response is JSON dict (not text/binary from error pages)
             if not isinstance(result, dict):
@@ -1011,7 +1023,7 @@ class RemoteInfEngine(InferenceEngine):
             # Parse response using backend
             gen_result = self.backend.parse_generation_response(result)
             stop_reason = gen_result.stop_reason
-
+            
             if (
                 req.metadata.get("return_routed_experts", False)
                 and gen_result.routed_experts is None
@@ -1041,7 +1053,7 @@ class RemoteInfEngine(InferenceEngine):
                 len(gen_result.output_tokens),
                 len(req.input_ids),
             )
-
+        
         # Final abort handling
         if stop_reason == "abort":
             # If stop_reason is "abort", the only reason we exit the loop is
@@ -1176,6 +1188,10 @@ class RemoteInfEngine(InferenceEngine):
         Future[None]
             A future object representing the asynchronous weight update operation
         """
+        print(f"!!! line 1191 {meta=}", flush=True)
+        
+        # meta.path = os.path.join(meta.path, f"{meta.lora_name}_v{meta.version}")
+        
         assert meta.type == "disk"
 
         tik = time.perf_counter()
@@ -1185,18 +1201,21 @@ class RemoteInfEngine(InferenceEngine):
             raise RuntimeError(
                 "Experiment and trial names must be set for disk-based weight updates."
             )
+            
+        print(f"{self.config.experiment_name=} {self.config.trial_name=} {self.get_version()=}", flush=True)
 
         fut = get_executor().submit(
             _update_weights_from_disk,
             self.backend,
             self.config.experiment_name,
             self.config.trial_name,
-            self.get_version(),
+            f"{meta.lora_name}_v{meta.version}",
             self.addresses,
             meta,
             self.config.request_retries,
             self.config.request_timeout,
         )
+        
 
         def callback(fut):
             respond_time = fut.result()
@@ -1205,12 +1224,53 @@ class RemoteInfEngine(InferenceEngine):
                 f"in {(time.perf_counter() - tik):.2f}s. "
                 f"Respond time: {respond_time:.2f}s."
             )
-            if meta.clear_checkpoint_after_load:
-                shutil.rmtree(meta.path, ignore_errors=True)
+            
+            # # if meta.clear_checkpoint_after_load:
+            # #     print(f"!!! CALLBACK DELETING {meta.path}", flush=True)
+            # #     shutil.rmtree(meta.path, ignore_errors=True)
+            # # else:
+            # #     print(f"!!! CALLBACK NOT DELETING", flush=True)
 
         fut.add_done_callback(callback)
         return fut
+        
 
+    def load_lora_adapter(self, req) -> Future[None]:
+        """load lora adater in the inference engine
+        """
+        
+        tik = time.perf_counter()
+
+        # Use ProcessPool to bypass python GIL for running async coroutines
+        if self.config.experiment_name is None or self.config.trial_name is None:
+            raise RuntimeError(
+                "Experiment and trial names must be set for disk-based weight updates."
+            )
+
+    
+        fut = get_executor().submit(
+            _load_lora_adapter,
+            self.backend,
+            req,
+            self.addresses,
+            self.config.request_timeout,
+        )
+
+        def callback(fut):
+            respond_time = fut.result()
+            elapsed = time.perf_counter() - tik
+            if respond_time is None:
+                self.logger.info(
+                    f"Adding lora adapter done in {elapsed:.2f}s."
+                )
+            else:
+                self.logger.info(
+                    f"Adding lora adapter done in {elapsed:.2f}s. Respond time: {respond_time:.2f}s."
+                )
+
+        fut.add_done_callback(callback)
+        return fut
+    
     def update_weights_from_awex(
         self,
         meta: WeightUpdateMeta,
@@ -1285,6 +1345,13 @@ class RemoteInfEngine(InferenceEngine):
             HTTP address of the proxy server for AgentWorkflow. If provided,
             AgentWorkflow will use this proxy instead of a local one.
         """
+        
+        if workflow_kwargs is None:
+            workflow_kwargs = {}
+
+        # Extract LoRA name from workflow kwargs
+        multilora_name = workflow_kwargs.pop("multilora_name", "")
+        
         if workflow is None and (
             self.config.agent is None or self.config.agent.mode != "online"
         ):
@@ -1302,6 +1369,7 @@ class RemoteInfEngine(InferenceEngine):
 
         return self.workflow_executor.submit(
             data,
+            multilora_name,
             workflow=resolved_workflow,
             should_accept_fn=resolved_should_accept_fn,
             task_id=task_id,
@@ -1333,10 +1401,10 @@ class RemoteInfEngine(InferenceEngine):
         )
 
     def wait_for_task(
-        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+        self, multilora_name:str, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
         """Wait for a specific submitted task to complete."""
-        return self.workflow_executor.wait_for_task(task_id, timeout, raise_timeout)
+        return self.workflow_executor.wait_for_task(multilora_name, task_id, timeout, raise_timeout)
 
     def rollout_batch(
         self,
@@ -1691,6 +1759,46 @@ def _update_weights_from_distributed(
 
     return uvloop.run(_fn())
 
+
+def _load_lora_adapter(
+    backend,
+    req,
+    addresses,
+    request_timeout,
+):
+    """Helper to add lora."""
+
+    async def _fn():
+        # Get requests from backend
+        weight_reqs = backend.build_distributed_load_lora_adapter(req)
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=request_timeout),
+            read_bufsize=1024 * 1024 * 10,
+            connector=get_default_connector(),
+        ) as session:
+            for http_req in weight_reqs.requests:
+                for addr in addresses:
+                    url = f"http://{addr}{http_req.endpoint}"
+
+                    print("==== LoRA LOAD REQUEST ====")
+                    print("URL      :", url)
+                    print("PAYLOAD  :", http_req.payload)
+                    print("===========================")
+
+                    async with session.post(
+                        url,
+                        json=http_req.payload,
+                        headers={"Content-Type": "application/json"},
+                    ) as resp:
+                        body = await resp.text()
+
+                        if resp.status >= 400:
+                            raise RuntimeError(
+                                f"POST {url} failed with {resp.status}\n{body}"
+                            )
+
+    return uvloop.run(_fn())
 
 def _init_awex_remote(
     backend: RemoteInfBackendProtocol,

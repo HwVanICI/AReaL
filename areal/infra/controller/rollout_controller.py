@@ -60,6 +60,7 @@ class _RemoteRolloutTaskInput:
     workflow_kwargs: dict[str, Any]
     should_accept_fn: str | None
     is_eval: bool = False
+    multilora_name: str = ""
     group_size: int = 1
     proxy_addr: str | None = None
 
@@ -845,6 +846,7 @@ class RolloutController:
                     worker.id,
                     "wait_for_task",
                     engine_name=engine_name,
+                    multilora_name=pending_task.workflow_kwargs["multilora_name"],
                     task_id=engine_task_id,
                     timeout=0.1,  # A short time to prevent blocking other requests
                     raise_timeout=False,
@@ -885,6 +887,48 @@ class RolloutController:
     def get_capacity(self):
         return self.staleness_manager.get_capacity()
 
+
+    def submit_with_lora(
+        self,
+        data: dict[str, Any],
+        workflow: WorkflowLike,
+        workflow_kwargs: dict[str, Any] | None = None,
+        should_accept_fn: str | None = None,
+        task_id: int | None = None,
+        is_eval: bool = False,
+        group_size: int = 1,
+        proxy_addr: str | None = None,
+        multilora_name: str = "",
+    ) -> int:
+        workflow_str = self._resolve_workflow_str(workflow)
+        should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+        if workflow_kwargs is None:
+            workflow_kwargs = {}
+
+        # NOTE: RolloutController does not support `should_accept_fn`
+        # If the workflow's result should be aborted,
+        # `arun_episode` should return None instead.
+        if task_id is None:
+            task_id = self._task_id_generator.next()
+        
+        workflow_kwargs["multilora_name"] = multilora_name
+                
+        task_input = _RemoteRolloutTaskInput(
+            data=data,
+            workflow=workflow_str,
+            workflow_kwargs=workflow_kwargs,
+            should_accept_fn=should_accept_fn,
+            task_id=task_id,
+            is_eval=is_eval,
+            group_size=group_size,
+            proxy_addr=proxy_addr,
+        )
+        
+        # Delegate to dispatcher
+        self.dispatcher.submit_task_input(task_input)
+
+        return task_id
+    
     def submit(
         self,
         data: dict[str, Any],
@@ -921,6 +965,20 @@ class RolloutController:
         self.dispatcher.submit_task_input(task_input)
         return task_id
 
+
+    def wait_lora(
+        self, multilora_name: str, count: int, timeout: float | None = None, raise_timeout: bool = True
+        # self, lora_name: str, count: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> list[dict[str, Any] | None]:
+        # Delegate to dispatcher and extract trajectories
+        results = self.dispatcher.wait_results_lora(multilora_name, count, timeout, raise_timeout)
+        # Log and trace
+        if self.config.enable_rollout_tracing:
+            logger.info("Rollout results are ready!")
+            
+        return [r.trajectory if r is not None else None for r in results]
+    
+    
     def wait(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> list[dict[str, Any] | None]:
@@ -932,6 +990,55 @@ class RolloutController:
 
         return [r.trajectory if r is not None else None for r in results]
 
+
+    @trace_perf("rollout_controller.rollout_batch", category="scheduler")
+    async def rollout_batch_async(
+        self,
+        data_batch,
+        workflow: WorkflowLike,
+        workflow_kwargs: dict[str, Any] | None = None,
+        should_accept_fn: str | None = None,
+        group_size: int = 1,
+        multilora_name="",
+        dynamic_bs=False,
+    ) -> list[dict[str, Any]]:
+        
+        # Submit all requests first
+        for curr_instance in data_batch:
+            if multilora_name:
+                self.submit_with_lora(
+                    data=curr_instance,
+                    workflow=workflow,
+                    workflow_kwargs=workflow_kwargs,
+                    should_accept_fn=should_accept_fn,
+                    group_size=group_size,
+                    multilora_name=multilora_name,
+                )
+            else:
+                self.submit(
+                    data=curr_instance,
+                    workflow=workflow,
+                    workflow_kwargs=workflow_kwargs,
+                    should_accept_fn=should_accept_fn,
+                    group_size=group_size,
+                )
+
+        print(
+            f"[ASYNC] submitted {len(data_batch)} requests "
+            f"for {multilora_name=}",
+            flush=True,
+        )
+        
+        # results = self.wait(count=len(data_batch))
+        results = await asyncio.to_thread(
+            self.wait_lora,
+            multilora_name=multilora_name,
+            count=len(data_batch),
+        )
+        
+        # Return list of trajectories
+        return [r for r in results if r is not None]
+
     @trace_perf("rollout_controller.rollout_batch", category="scheduler")
     def rollout_batch(
         self,
@@ -941,6 +1048,7 @@ class RolloutController:
         should_accept_fn: str | None = None,
         group_size: int = 1,
     ) -> list[dict[str, Any]]:
+        
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
             category="scheduler",
@@ -957,6 +1065,7 @@ class RolloutController:
         results = self.wait(count=len(data))
         # Return list of trajectories
         return [r for r in results if r is not None]
+
 
     @trace_perf("rollout_controller.prepare_batch", category="scheduler")
     def prepare_batch(
@@ -1092,10 +1201,13 @@ class RolloutController:
             "update_weights_from_distributed", meta=meta, param_specs=param_specs
         )
 
+    async def load_lora_adapter(self, req):
+        await self._collective_rpc_async(
+            "load_lora_adapter", req=req
+        )
+        
     async def update_weights_from_disk(self, meta: WeightUpdateMeta):
-        meta.clear_checkpoint_after_load = False
         await self._collective_rpc_async("update_weights_from_disk", meta=meta)
-        shutil.rmtree(meta.path, ignore_errors=True)
 
     async def update_weights_from_awex(
         self,

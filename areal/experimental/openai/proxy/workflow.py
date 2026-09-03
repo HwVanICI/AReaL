@@ -131,7 +131,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         self.subproc_max_workers = subproc_max_workers
 
     @trace_session("run_agent")
-    async def _run_agent(self, session_api_key: str, data: dict):
+    async def _run_agent(self, session_api_key: str, data: dict, multilora: str):
         if self.mode == "inline":
             http_client = await workflow_context.get_httpx_client()
             extra_kwargs = {
@@ -139,7 +139,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 "http_client": http_client,
                 "api_key": session_api_key,
             }
-            return await self.agent.run(data, **extra_kwargs)
+            return await self.agent.run(data, multilora, **extra_kwargs)
         if self.mode == "subproc":
             extra_envs = {
                 "OPENAI_BASE_URL": self.proxy_addr,
@@ -174,7 +174,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
 
     @session_context()
     async def arun_episode(
-        self, engine: TRolloutEngine, data: dict[str, Any]
+        self, engine: TRolloutEngine, data: dict[str, Any], multilora: str
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
         task_id = workflow_context.get().task_id
 
@@ -193,7 +193,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             # Online mode: _OnlineAgent waits for external user session.
             # Returns CompletedSessionInfo with session credentials.
             session_info: CompletedSessionInfo = await self._run_agent(
-                self._admin_api_key, data
+                self._admin_api_key, data, multilora
             )
 
             # Create proxy client for export only (no start/end session).
@@ -232,7 +232,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         async with proxy_client:
             # Run the user code.
             try:
-                rewards = await self._run_agent(proxy_client.session_api_key, data)
+                rewards = await self._run_agent(proxy_client.session_api_key, data, multilora)
             except Exception as exc:
                 logger.warning(
                     "Agent task failed (%s: %s). This trajectory will be rejected.",

@@ -580,7 +580,10 @@ async def _call_client_create(
     session_data.update_last_access()
 
     sig = inspect.signature(create_fn)
-    areal_client_ignored_args = ["model"] + (extra_ignored_args or [])
+    # areal_client_ignored_args = ["model"] + (extra_ignored_args or [])
+    areal_client_ignored_args = [(extra_ignored_args or [])]
+    
+
     areal_client_disallowed_args = ["areal_cache"]
     areal_client_allowed_args = list(
         k
@@ -838,6 +841,7 @@ async def anthropic_messages(
                 session_id=session_id,
                 stream=True,
             )
+            
 
             # Use LiteLLM's adapter to convert to Anthropic SSE format
             anthropic_sse_stream = (

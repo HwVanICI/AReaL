@@ -15,14 +15,16 @@ from .infra import (
 
 
 def __getattr__(name: str):
-    if name in ("DPOTrainer", "PPOTrainer", "RWTrainer", "SFTTrainer"):
-        from .trainer import DPOTrainer, PPOTrainer, RWTrainer, SFTTrainer
+    if name in ("DPOTrainer", "PPOTrainer", "RWTrainer", "SFTTrainer", "MultiLoRATrainer", "MultiLoRATrainerAsync"):
+        from .trainer import DPOTrainer, PPOTrainer, RWTrainer, SFTTrainer, MultiLoRATrainer, MultiLoRATrainerAsync
 
         _map = {
             "DPOTrainer": DPOTrainer,
             "PPOTrainer": PPOTrainer,
             "RWTrainer": RWTrainer,
             "SFTTrainer": SFTTrainer,
+            "MultiLoRATrainer": MultiLoRATrainer,
+            "MultiLoRATrainerAsync": MultiLoRATrainerAsync,
         }
         globals().update(_map)
         return _map[name]
@@ -35,6 +37,8 @@ __all__ = [
     "RolloutController",
     "RWTrainer",
     "SFTTrainer",
+    "MultiLoRATrainer",
+    "MultiLoRATrainerAsync",
     "StalenessManager",
     "TrainController",
     "WorkflowExecutor",

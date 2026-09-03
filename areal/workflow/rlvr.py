@@ -105,7 +105,6 @@ class RLVRWorkflow(RolloutWorkflow):
             resp.output_tokens,
             **task_data,
         )
-
         return reward
 
     @session_context()
@@ -115,6 +114,7 @@ class RLVRWorkflow(RolloutWorkflow):
         req: ModelRequest,
         prompt_str: str,
         task_data: dict[str, Any],
+        multilora_name: str,
     ) -> tuple[ModelResponse, float]:
         """Generate one sample and compute its reward.
 
@@ -128,7 +128,7 @@ class RLVRWorkflow(RolloutWorkflow):
             Model response and reward value.
         """
         async with atrace_session_phase("generate"):
-            resp = await engine.agenerate(req)
+            resp = await engine.agenerate(req, multilora_name)
 
         reward = await self._compute_rewards(resp, prompt_str, task_data)
 
@@ -137,7 +137,7 @@ class RLVRWorkflow(RolloutWorkflow):
         return resp, reward
 
     async def arun_episode(
-        self, engine: InferenceEngine, data: dict[str, Any]
+        self, engine: InferenceEngine, data: dict[str, Any], multilora_name: str
     ) -> dict[str, torch.Tensor]:
         # NOTE: load reward function dynamically if given as string
         if isinstance(self.reward_fn, str):
@@ -159,7 +159,7 @@ class RLVRWorkflow(RolloutWorkflow):
         prompt_str = self.tokenizer.decode(input_ids)
 
         # Generate single response and compute reward
-        resp, reward = await self._collect_samples(engine, req, prompt_str, data)
+        resp, reward = await self._collect_samples(engine, req, prompt_str, data, multilora_name)
 
         # Build result tensor dict with batch dim 1
         seq = resp.input_tokens + resp.output_tokens

@@ -331,6 +331,7 @@ class NfsNameRecordRepository(NameRecordRepository):
         path = self.__file_path(name)
         if not os.path.isfile(path):
             raise NameEntryNotFoundError(path)
+        
         os.remove(path)
         while True:
             path = os.path.dirname(path)

@@ -636,6 +636,79 @@ class FSDPEngine(TrainEngine):
             else:
                 raise ValueError(f"Unknown weight update type {meta.type}")
 
+    def update_lora(self, meta: WeightUpdateMeta, global_step: int, lora_name: str):
+        self._check_rollout_engine_connected()
+        if meta.type == "xccl":
+            raise Exception("xccl for lora not supported yet")
+        elif meta.type == "disk":
+            self._update_lora(meta, global_step, lora_name)
+        else:
+            raise ValueError(f"Unknown weight update type {meta.type}")
+        
+    def _update_lora(self, meta: WeightUpdateMeta, global_step: int, lora_name: str):
+        """
+        Safe LoRA update for large FSDP models.
+
+        Rank 0 loads LoRA weights from disk. All other ranks wait.
+        Uses FSDP set_model_state_dict to properly handle DTensor sharding.
+        """
+        import time
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+        update_start_t = time.time()
+        task_path = os.path.join(meta.path, f"{lora_name}_v{global_step}")
+
+        # Only rank 0 loads LoRA weights
+        full_state = {}
+        if dist.get_rank() == 0:
+            # Load checkpoint
+            full_state = get_state_dict_from_repo_id_or_path(task_path)
+
+            # Keep only LoRA weights
+            full_state = {k: v for k, v in full_state.items() if "lora" in k}
+
+            # Rename keys to match FSDP wrapped model
+            renamed_state = {}
+            for k, v in full_state.items():
+                new_k = k.replace("lora_A.weight", "lora_A.default.weight")
+                new_k = new_k.replace("lora_B.weight", "lora_B.default.weight")
+                renamed_state[new_k] = v
+
+            full_state = renamed_state
+
+        # Ensure all ranks wait until rank 0 finishes loading
+        dist.barrier(group=self.cpu_group)
+
+        # Move model to current device
+        device = "npu"
+        self.model = self.model.to(device=device, non_blocking=True)
+
+        # Determine if CPU offload is requested
+        cpu_offload = self.cpu_offload is not None
+
+        # Wrap in StateDictOptions to properly broadcast & convert tensors to DTensor
+        options = StateDictOptions(
+            full_state_dict=True,          # Required to use set_model_state_dict
+            cpu_offload=cpu_offload,
+            broadcast_from_rank0=True,
+            strict=False                   # Allow partial LoRA load
+        )
+
+        # Load LoRA weights into FSDP shards
+        set_model_state_dict(self.model, full_state, options=options)
+
+        # Tie word embeddings if configured
+        if self.model_config.tie_word_embeddings:
+            self.model.tie_weights()
+
+        # Broadcast buffers (rotary embeddings etc.)
+        for name, buf in self.model.named_buffers():
+            dist.broadcast(buf, src=0)
+
+        self._load_optimizer_state(task_path)
+
+        dist.barrier(group=self.cpu_group)
+        
     def set_version(self, version: int):
         self._version = version
 
@@ -1709,8 +1782,9 @@ class FSDPEngine(TrainEngine):
                 update_name = names.update_weights_from_disk(
                     self.config.experiment_name,
                     self.config.trial_name,
-                    self.get_version(),
+                    f"{meta.lora_name}_v{self.get_version()}",
                 )
+                
                 name_resolve.add(
                     update_name, str(datetime.now().timestamp()), keepalive_ttl=120
                 )
@@ -1725,30 +1799,37 @@ class FSDPEngine(TrainEngine):
     @trace_perf("fsdp_engine.update_weights_from_disk", category="io")
     def _update_weights_from_disk(self, meta: WeightUpdateMeta):
         fut = Future()
-
+        
+        assert meta.path is not None
+        task_path = os.path.join(meta.path, f"{meta.lora_name}_v{meta.version}")
+        meta.path = task_path
+        
+        ## All ranks must save the model and optimizer state
+        self._save_model_to_hf(task_path, self.tokenizer, self.processor)
+        self._save_optimizer_state(task_path)
+        
         if dist.get_rank() == 0:
+
             self.rollout_engine.pause_generation()
             fut = self.rollout_engine.update_weights_from_disk(meta)
 
-        assert meta.path is not None
-        self._save_model_to_hf(meta.path, self.tokenizer, self.processor)
-        # dist.barrier() are called when _save_model_to_hf finished
-
-        if dist.get_rank() == 0:
             update_name = names.update_weights_from_disk(
                 self.config.experiment_name,
                 self.config.trial_name,
-                self.get_version(),
+                f"{meta.lora_name}_v{meta.version}",
             )
+            
             name_resolve.add(
                 update_name, str(datetime.now().timestamp()), keepalive_ttl=120
             )
 
             fut.result()
+            
             self.rollout_engine.continue_generation()
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
+
 
     def _save_model_to_hf(
         self,

@@ -164,6 +164,7 @@ class RolloutCallback:
         Future[None]
             Future that completes when controller finishes loading weights
         """
+        print("!!! line 167 /home/tim/AReaL/areal/infra/controller/rollout_callback.py")
         payload = {"meta": serialize_value(meta)}
         return self._post_nowait_void("/callback/update_weights_disk", payload)
 

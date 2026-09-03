@@ -238,6 +238,20 @@ class WeightUpdateMeta:
             new_meta.path = os.path.join(base_dir, f"weight_update_v{version}")
         return new_meta
 
+    def with_version_multilora(self, version: int, multilora_name) -> "WeightUpdateMeta":
+        """Return a copy of this meta with versioned path.
+
+        Changes path from 'weight_update' to 'weight_update_{multilora_name}_v{version}'.
+        """
+        if version < 0:
+            raise ValueError(f"version must be non-negative, got {version}")
+        new_meta = copy.copy(self)
+        new_meta.version = version
+        if self.path is not None:
+            base_dir = os.path.dirname(self.path)
+            new_meta.path = os.path.join(base_dir, f"weight_update_{multilora_name}_v{version}")
+        return new_meta
+    
     def with_colocate_stage(self, stage: int) -> "WeightUpdateMeta":
         """for update colocation,
         stage 0 for actor save weights
@@ -271,6 +285,7 @@ class WeightUpdateMeta:
             Saver.get_model_save_root(experiment_name, trial_name, file_root, name),
             "weight_update",
         )
+
         return cls(
             type="disk",
             path=path,

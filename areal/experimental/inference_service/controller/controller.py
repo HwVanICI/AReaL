@@ -1093,11 +1093,13 @@ class RolloutControllerV2:
 
     def wait_for_task(
         self,
+        multilora_name: str,
         task_id: int,
         timeout: float | None = None,
         raise_timeout: bool = True,
     ) -> dict[str, Any] | None:
         return self.workflow_executor.wait_for_task(
+            multilora_name,
             task_id,
             timeout=timeout,
             raise_timeout=raise_timeout,
