@@ -117,7 +117,7 @@ def main(args):
             config.valid_dataset.path, econfig.dataset_path
         ),
         split="test",
-        min_items=64,
+        min_items=1,
     )
 
     # Build workflow kwargs
@@ -134,13 +134,7 @@ def main(args):
         timeout=econfig.timeout,
     )
 
-    # Eval workflow with lower temperature for deterministic evaluation
     eval_workflow_kwargs = workflow_kwargs.copy()
-    eval_workflow_kwargs["gen_args"] = dict(
-        temperature=0.0,
-        max_tokens=config.gconfig.max_tokens,
-        max_completion_tokens=config.gconfig.max_new_tokens,
-    )
 
     with PPOTrainer(
         config,
@@ -150,7 +144,7 @@ def main(args):
         trainer.train(
             workflow="examples.swe.agent.SWEAgentWorkflow",
             workflow_kwargs=workflow_kwargs,
-            eval_workflow=None,
+            eval_workflow="examples.swe.agent.SWEAgentWorkflow",
             eval_workflow_kwargs=eval_workflow_kwargs,
             dynamic_filter_fn=getattr(config, "should_accept_fn", None),
         )

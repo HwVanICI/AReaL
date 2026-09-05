@@ -31,6 +31,9 @@ gconfig:
   top_p: 1.0
   top_k: 1000000
 
+eval_gconfig:
+  n_samples: 1
+
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -265,11 +268,12 @@ train_dataset:
 
 valid_dataset:
   batch_size: 4
-  shuffle: true
+  shuffle: false
   pin_memory: true
   num_workers: 4
   path: /path/to/swe_bench_rl.jsonl
   type: rl
+  drop_last: false
 
 # Utilities
 saver:
