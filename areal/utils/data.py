@@ -760,10 +760,43 @@ class MicroBatchList:
 DEFAULT_MAX_TOKENS_PER_MB = int(1e12)
 
 
+def _resolve_microbatch_sequence_groups(
+    bs: int,
+    granularity: int,
+    group_sizes: Sequence[int] | torch.Tensor | None,
+) -> list[list[int]]:
+    if group_sizes is None:
+        if bs % granularity != 0:
+            raise RuntimeError(
+                f"Batch size {bs} cannot divide granularity {granularity}."
+            )
+        return [
+            list(range(i * granularity, (i + 1) * granularity))
+            for i in range(bs // granularity)
+        ]
+
+    if torch.is_tensor(group_sizes):
+        group_sizes = group_sizes.detach().cpu().tolist()
+    sizes = [int(size) for size in group_sizes]
+    if any(size <= 0 for size in sizes):
+        raise ValueError(f"group_sizes must be positive, got {sizes}.")
+    total = sum(sizes)
+    if total != bs:
+        raise ValueError(f"group_sizes sum to {total} but batch size is {bs}.")
+
+    groups = []
+    offset = 0
+    for size in sizes:
+        groups.append(list(range(offset, offset + size)))
+        offset += size
+    return groups
+
+
 def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    atomic_group_sizes: Sequence[int] | torch.Tensor | None = None,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -771,6 +804,10 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        atomic_group_sizes: Optional contiguous sequence-group sizes used only for
+            allocation. Rows in one group stay in the same returned batch; the
+            grouping itself is never propagated into the returned batches, so the
+            engine's inner forward microbatch splitting stays independent.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -784,18 +821,12 @@ def split_padded_tensor_dict_into_mb_list(
         )
     granularity = mb_spec.granularity
     bs = data["attention_mask"].shape[0]
-    if bs % granularity != 0:
-        raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
+    seq_groups = _resolve_microbatch_sequence_groups(
+        bs, granularity, atomic_group_sizes
+    )
     max_seqlen = data["attention_mask"].shape[1]
     seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-    input_lens = (
-        data["attention_mask"]
-        .view(bs // granularity, granularity, -1)
-        .sum(dim=(1, 2))
-        .long()
-        .cpu()
-        .numpy()
-    )
+    input_lens = [sum(seq_lens[i] for i in group) for group in seq_groups]
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}
@@ -817,9 +848,7 @@ def split_padded_tensor_dict_into_mb_list(
     # split
     group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
     group_indices = [
-        seqpack.flat2d(
-            [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
-        )
+        seqpack.flat2d([seq_groups[i] for i in group_index])
         for group_index in group_indices
     ]
     splitted_lens = [
