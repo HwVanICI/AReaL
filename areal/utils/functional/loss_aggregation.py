@@ -11,12 +11,7 @@ from typing import Any, Literal
 import torch
 
 LossAggregationMode = Literal["token-mean", "seq-mean", "traj-mean", "constant"]
-_LOSS_AGGREGATIONS = (
-    "token-mean",
-    "seq-mean",
-    "traj-mean",
-    "constant",
-)
+_LOSS_AGGREGATIONS = ("token-mean", "seq-mean", "traj-mean", "constant")
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,11 +22,11 @@ class PolicyGradientReduction:
     ``sum(local_mean * local_weight) / sum(local_weight)``.
 
     ``traj-mean`` instead takes a precomputed per-token ``unit_weights`` column
-    holding ``1 / (tokens in this token's trajectory)``. Both the numerator and
-    the weight are then plain sums, so a trajectory may be split across
-    microbatches and data-parallel ranks: summing the weights over the whole
-    batch recovers the trajectory count, which is exactly the denominator the
-    engine divides by.
+    holding ``1 / (tokens in this token's trajectory)``. PPO optimizer
+    minibatches keep trajectory rows atomic. Within one optimizer step, the
+    trajectory may still be split across forward microbatches and data-parallel
+    ranks: summing the weights recovers the trajectory count, which is exactly
+    the denominator the engine divides by.
     """
 
     mode: LossAggregationMode = "token-mean"

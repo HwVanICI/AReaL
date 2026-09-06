@@ -339,11 +339,16 @@ class PPOActor:
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
+        trajectory_group_sizes = None
         if self.config.loss_aggregation == "traj-mean":
-            # Built before the marker is dropped and before the microbatch
-            # split, so every token carries its whole trajectory's count.
+            begin_of_trajectory = data.get("begin_of_trajectory")
             data["unit_weights"] = trajectory_token_weights(
-                data["loss_mask"], data.get("begin_of_trajectory")
+                data["loss_mask"], begin_of_trajectory
+            )
+            # Keep trajectory rows atomic only across optimizer minibatches.
+            # Engine-internal forward microbatches may still split them.
+            trajectory_group_sizes = _trajectory_row_group_sizes(
+                begin_of_trajectory, data["loss_mask"].shape[0]
             )
         for key in ["rewards", "tot_rewards", "kl_rewards", "begin_of_trajectory"]:
             data.pop(key, None)
@@ -352,6 +357,7 @@ class PPOActor:
         mb_inputs = split_padded_tensor_dict_into_mb_list(
             data,
             mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
+            atomic_group_sizes=trajectory_group_sizes,
         )
 
         with stats_tracker.scope("update"):
@@ -470,6 +476,23 @@ class PPOActorControllerV2(GatewayTrainController):
             "kwargs": serialize_value(kwargs),
         }
         self._gateway_post("/ppo/actor/update", payload)
+
+
+def _trajectory_row_group_sizes(
+    begin_of_trajectory: torch.Tensor | None,
+    n_rows: int,
+) -> list[int]:
+    """Return contiguous row counts for trajectory-atomic minibatch allocation."""
+    if begin_of_trajectory is None:
+        return [1] * n_rows
+
+    boundaries = torch.nonzero(begin_of_trajectory.reshape(-1), as_tuple=False).reshape(
+        -1
+    )
+    boundary_rows = boundaries.cpu().tolist()
+    return [
+        end - start for start, end in zip(boundary_rows, [*boundary_rows[1:], n_rows])
+    ]
 
 
 def trajectory_token_weights(
