@@ -162,7 +162,7 @@ class SessionData:
         with self._lock:
             now = time.monotonic()
             self._last_access_time = now
-            if finish_reason == "stop" and not has_tool_calls:
+            if finish_reason in ("stop", "length") and not has_tool_calls:
                 self._terminal_response_time = now
             elif finish_reason is not None:
                 self._terminal_response_time = None
