@@ -28,6 +28,7 @@ from .server import (
     INTERNAL_WAIT_FOR_SESSION_PATHNAME,
     RESPONSES_PATHNAME,
     RL_END_SESSION_PATHNAME,
+    RL_SESSION_STATUS_PATHNAME,
     RL_SET_REWARD_PATHNAME,
     RL_START_SESSION_PATHNAME,
     WaitForSessionRequest,
@@ -630,6 +631,10 @@ def create_proxy_gateway_app(
                 route.worker_addr,
             )
         return await _session_forward(request, RL_SET_REWARD_PATHNAME)
+
+    @app.post(f"/{RL_SESSION_STATUS_PATHNAME}")
+    async def session_status(request: Request):
+        return await _session_forward(request, RL_SESSION_STATUS_PATHNAME)
 
     # -- end_session (session auth, resolve online-mode future) --------
 
