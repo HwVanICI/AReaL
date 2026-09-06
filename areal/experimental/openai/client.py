@@ -79,6 +79,11 @@ class _AsyncGenerateEngine(Protocol):
 
 TRolloutEngine = TypeVar("TRolloutEngine", bound=_AsyncGenerateEngine)
 
+
+class PromptContextOverflowError(ValueError):
+    """The tokenized prompt leaves no room within the model context limit."""
+
+
 # reset OpenAI keys when using the wrapped client.
 os.environ["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY", "none")
 os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "none")
@@ -1183,8 +1188,9 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 ):
                     # Remove the interaction from cache on failure
                     del cache[completion_id]
-                raise ValueError(
-                    f"len of prompt tokens {len(prompt_token_ids)} exceeds max_total_tokens {max_total_tokens_final}"
+                raise PromptContextOverflowError(
+                    f"len of prompt tokens {len(prompt_token_ids)} exceeds "
+                    f"max_total_tokens {max_total_tokens_final}"
                 )
         if not is_omitted(max_completion_tokens):
             if max_new_tokens is None:

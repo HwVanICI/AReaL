@@ -19,6 +19,7 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
 from openai.types.chat.chat_completion_chunk import ChoiceDelta
 
+from areal.experimental.openai.client import PromptContextOverflowError
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,13 @@ async def _fake_create(
     )
 
 
+async def _fake_context_overflow_create(
+    *, messages=None, stream=None, areal_cache=None, **kwargs
+):
+    """Use the marker type without relying on its current error wording."""
+    raise PromptContextOverflowError("prompt context overflow")
+
+
 @pytest.fixture()
 def _mock_openai_client(monkeypatch):
     """Inject a fake OpenAI client so no real inference engine is needed."""
@@ -221,6 +229,51 @@ class TestChatCompletionsEndpoint:
             data = resp.json()
             assert data["object"] == "chat.completion"
             assert data["choices"][0]["message"]["content"] == "hello"
+            status = await client.post(
+                "/rl/session_status",
+                headers=_session_headers(api_key),
+                json={},
+            )
+            assert status.json()["terminal_seconds"] is not None
+
+    @pytest.mark.asyncio
+    async def test_streaming_context_overflow_returns_length_finish(self, monkeypatch):
+        """Prompt overflow returns a terminal SSE response instead of HTTP 500."""
+        monkeypatch.setattr(srv, "_capacity", 1)
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = _fake_context_overflow_create
+        monkeypatch.setattr(srv, "_openai_client", mock_client)
+
+        async with _client() as client:
+            started = await client.post(
+                "/rl/start_session",
+                headers=_admin_headers(),
+                json={"task_id": "overflow"},
+            )
+            api_key = started.json()["api_key"]
+
+            response = await client.post(
+                "/chat/completions",
+                headers=_session_headers(api_key),
+                json={
+                    "messages": [{"role": "user", "content": "too long"}],
+                    "model": "test",
+                    "stream": True,
+                },
+            )
+
+            assert response.status_code == 200
+            events = [
+                line
+                for line in response.text.strip().split("\n\n")
+                if line.startswith("data: ")
+            ]
+            assert events[-1] == "data: [DONE]"
+            chunk = json.loads(events[0].removeprefix("data: "))
+            assert chunk["choices"][0]["delta"]["role"] == "assistant"
+            assert chunk["choices"][0]["delta"]["content"] == ""
+            assert chunk["choices"][0]["finish_reason"] == "length"
+
             status = await client.post(
                 "/rl/session_status",
                 headers=_session_headers(api_key),
