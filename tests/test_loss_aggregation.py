@@ -1,9 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from areal.trainer.ppo.actor import trajectory_token_weights
+from areal.api.cli_args import MicroBatchSpec
+from areal.trainer.ppo import actor as actor_module
+from areal.trainer.ppo.actor import (
+    PPOActor,
+    _trajectory_row_group_sizes,
+    trajectory_token_weights,
+)
+from areal.utils.data import (
+    _resolve_microbatch_sequence_groups,
+    split_padded_tensor_dict_into_mb_list,
+)
 from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 
 # Three packed sequences of length 2, 3 and 5. Per-token losses are constant
@@ -140,6 +152,38 @@ class TestNarrowedNumerator:
         assert result.item() == pytest.approx((LOSS.sum().item() - 1.0) / 10)
 
 
+class TestMicrobatchSequenceGroups:
+    """No atomic groups must reproduce the pre-feature granularity split."""
+
+    @pytest.mark.parametrize("bs,granularity", [(6, 1), (8, 2), (12, 3), (130, 1)])
+    def test_matches_legacy_granularity_split(self, bs, granularity):
+        groups = _resolve_microbatch_sequence_groups(bs, granularity, None)
+        assert groups == [
+            list(range(i * granularity, (i + 1) * granularity))
+            for i in range(bs // granularity)
+        ]
+
+    def test_indivisible_batch_still_raises(self):
+        with pytest.raises(RuntimeError, match="cannot divide granularity"):
+            _resolve_microbatch_sequence_groups(7, 2, None)
+
+    def test_explicit_ragged_groups(self):
+        groups = _resolve_microbatch_sequence_groups(6, 1, [3, 1, 2])
+        assert groups == [[0, 1, 2], [3], [4, 5]]
+
+    def test_explicit_groups_accept_tensors(self):
+        groups = _resolve_microbatch_sequence_groups(6, 1, torch.tensor([3, 1, 2]))
+        assert groups == [[0, 1, 2], [3], [4, 5]]
+
+    def test_group_sizes_must_cover_the_batch(self):
+        with pytest.raises(ValueError, match="group_sizes sum to"):
+            _resolve_microbatch_sequence_groups(6, 1, [3, 1, 1])
+
+    def test_group_sizes_must_be_positive(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            _resolve_microbatch_sequence_groups(6, 1, [3, 0, 3])
+
+
 # Four padded rows forming two trajectories: the first spans three rows
 # (2 + 3 + 5 = 10 masked tokens), the second is a single 4-token row.
 TRAJ_BEGIN = torch.tensor([1, 0, 0, 1], dtype=torch.int32)
@@ -193,6 +237,103 @@ class TestTrajectoryTokenWeights:
             )
 
 
+class TestTrajectoryAtomicMinibatches:
+    def test_row_group_sizes_follow_trajectory_markers(self):
+        assert _trajectory_row_group_sizes(TRAJ_BEGIN, len(TRAJ_BEGIN)) == [3, 1]
+
+    def test_missing_markers_make_each_row_atomic(self):
+        assert _trajectory_row_group_sizes(None, 4) == [1, 1, 1, 1]
+
+    def test_split_keeps_trajectory_rows_together(self):
+        row_ids = torch.arange(4).reshape(-1, 1).expand(-1, 5)
+        data = {
+            "attention_mask": TRAJ_MASK,
+            "input_ids": row_ids,
+        }
+
+        batches = split_padded_tensor_dict_into_mb_list(
+            data,
+            MicroBatchSpec(n_mbs=2),
+            atomic_group_sizes=[3, 1],
+        ).mbs
+
+        row_sets = [{int(row) for row in mb["input_ids"][:, 0]} for mb in batches]
+        assert {frozenset(rows) for rows in row_sets} == {
+            frozenset({0, 1, 2}),
+            frozenset({3}),
+        }
+        assert all("group_sizes" not in mb for mb in batches)
+
+    def test_single_minibatch_preserves_token_layout(self):
+        row_ids = torch.arange(4).reshape(-1, 1).expand(-1, 5)
+        data = {"attention_mask": TRAJ_MASK, "input_ids": row_ids}
+        baseline = split_padded_tensor_dict_into_mb_list(
+            data,
+            MicroBatchSpec(n_mbs=1),
+        )
+        grouped = split_padded_tensor_dict_into_mb_list(
+            data,
+            MicroBatchSpec(n_mbs=1),
+            atomic_group_sizes=[3, 1],
+        )
+
+        torch.testing.assert_close(
+            grouped.mbs[0]["input_ids"], baseline.mbs[0]["input_ids"], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            grouped.mbs[0]["attention_mask"],
+            baseline.mbs[0]["attention_mask"],
+            rtol=0,
+            atol=0,
+        )
+        assert grouped.forward_indices == baseline.forward_indices
+        assert grouped.backward_indices == baseline.backward_indices
+        assert "group_sizes" not in grouped.mbs[0]
+
+    @pytest.mark.parametrize("n_minibatches", [1, 2])
+    def test_actor_uses_trajectory_groups_for_optimizer_minibatches(
+        self, monkeypatch, n_minibatches
+    ):
+        captured = {}
+
+        def capture_split(data, mb_spec, group=None, atomic_group_sizes=None):
+            captured["n_mbs"] = mb_spec.n_mbs
+            captured["atomic_group_sizes"] = atomic_group_sizes
+            return SimpleNamespace(mbs=[])
+
+        monkeypatch.setattr(
+            actor_module, "split_padded_tensor_dict_into_mb_list", capture_split
+        )
+        actor = object.__new__(PPOActor)
+        actor.config = SimpleNamespace(
+            c_clip=None,
+            eps_clip=0.2,
+            log_agent_stats=False,
+            loss_aggregation="traj-mean",
+            loss_aggregation_divisor=None,
+            mask_no_eos_with_zero=False,
+            ppo_n_minibatches=n_minibatches,
+            rejection_sampling=None,
+        )
+        actor.engine = SimpleNamespace(train=lambda: None, get_version=lambda: 0)
+        actor._ppo_update(
+            {
+                "attention_mask": TRAJ_MASK,
+                "loss_mask": TRAJ_MASK,
+                "begin_of_trajectory": TRAJ_BEGIN,
+                "rewards": torch.tensor([1.0, 1.0, 1.0, 0.0]),
+                "advantages": torch.zeros_like(TRAJ_LOSS),
+                "kl_rewards": torch.zeros_like(TRAJ_LOSS),
+                "tot_rewards": torch.zeros_like(TRAJ_LOSS),
+            }
+        )
+
+        assert captured == {
+            "n_mbs": n_minibatches,
+            "atomic_group_sizes": [3, 1],
+        }
+
+
 class TestTrajMean:
     def _weights(self):
         return trajectory_token_weights(TRAJ_MASK, TRAJ_BEGIN)
@@ -213,7 +354,7 @@ class TestTrajMean:
         ],
     )
     def test_partitioning_does_not_change_the_result(self, partition):
-        """A trajectory may be split across microbatches."""
+        """A trajectory may be split across forward microbatches in one step."""
         reduction = PolicyGradientReduction("traj-mean")
         weights = self._weights()
         numerator = 0.0
