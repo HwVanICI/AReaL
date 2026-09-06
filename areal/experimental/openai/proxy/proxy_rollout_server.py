@@ -10,7 +10,7 @@ import os
 import secrets
 import threading
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
@@ -52,6 +52,7 @@ from .server import (
     RL_END_PROCESSOR_CACHE_GROUP_PATHNAME,
     RL_END_SESSION_PATHNAME,
     RL_FETCH_SHARED_TENSORS_PATHNAME,
+    RL_SESSION_STATUS_PATHNAME,
     RL_SET_REWARD_PATHNAME,
     RL_START_SESSION_PATHNAME,
     ExportTrajectoriesRequest,
@@ -678,9 +679,48 @@ def set_reward(
     return {"message": "success"}
 
 
+@app.post(f"/{RL_SESSION_STATUS_PATHNAME}")
+def session_status(session_id: str = Depends(_require_session_key)):
+    """Return idle and terminal-response watchdog signals."""
+    with _lock:
+        session = _session_cache.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=410, detail="Session ended or expired")
+    return session.watchdog_status()
+
+
 # =============================================================================
 # OpenAI-Compatible Endpoints
 # =============================================================================
+
+
+class _ActivityStream:
+    """Track stream activity and release its request lease on every close path."""
+
+    def __init__(self, stream: AsyncIterator[Any], session: SessionData, lease: Any):
+        self._iterator = stream.__aiter__()
+        self._session = session
+        self._lease = lease
+
+    def __aiter__(self) -> _ActivityStream:
+        return self
+
+    async def __anext__(self):
+        try:
+            chunk = await self._iterator.__anext__()
+        except BaseException:
+            self._lease.close()
+            raise
+        self._session.update_last_access()
+        return chunk
+
+    async def aclose(self) -> None:
+        try:
+            close = getattr(self._iterator, "aclose", None)
+            if close is not None:
+                await close()
+        finally:
+            self._lease.close()
 
 
 async def _call_client_create(
@@ -690,7 +730,7 @@ async def _call_client_create(
     extra_ignored_args: list[str] | None = None,
     stream: bool = False,
     max_tokens_arg: str = "max_completion_tokens",
-) -> ChatCompletion | Response | AsyncGenerator[ChatCompletionChunk, None]:
+) -> ChatCompletion | Response | AsyncIterator[ChatCompletionChunk]:
     """Common logic for chat completions and responses."""
     if _openai_client is None:
         raise HTTPException(
@@ -704,8 +744,6 @@ async def _call_client_create(
                 status_code=410, detail=f"Session {session_id} already ended or expired"
             )
         session_data = _session_cache[session_id]
-
-    session_data.update_last_access()
 
     sig = inspect.signature(create_fn)
     supports_processor_cache = "processor_cache" in sig.parameters or any(
@@ -771,6 +809,7 @@ async def _call_client_create(
     if stream:
         kwargs["stream"] = True
 
+    request_lease = session_data.start_generation_request()
     try:
         client_kwargs: dict[str, Any] = {
             "areal_cache": session_data.completions,
@@ -778,11 +817,26 @@ async def _call_client_create(
         }
         if supports_processor_cache:
             client_kwargs["processor_cache"] = session_data.processor_cache
-        return await create_fn(**client_kwargs)
+        result = await create_fn(**client_kwargs)
+    except asyncio.CancelledError:
+        request_lease.close()
+        raise
     except ValueError as e:
+        request_lease.close()
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
+        request_lease.close()
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+    if stream:
+        try:
+            return _ActivityStream(result, session_data, request_lease)
+        except Exception:
+            request_lease.close()
+            raise
+
+    request_lease.close()
+    return result
 
 
 @app.post(
@@ -804,6 +858,10 @@ async def chat_completions(
             status_code=500,
             detail='Proxy server not initialized. Send requests to /create_engine then /call "initialize" first.',
         )
+    with _lock:
+        session_data = _session_cache.get(session_id)
+    if session_data is None:
+        raise HTTPException(status_code=410, detail="Session ended or expired")
 
     # CompletionCreateParams is a TypedDict (dict subclass), so use dict access.
     is_streaming = request.get("stream") is True
@@ -820,13 +878,26 @@ async def chat_completions(
 
             # Convert ChatCompletionChunk objects to OpenAI SSE format
             async def _openai_sse_generator(
-                chunk_stream: AsyncGenerator[ChatCompletionChunk, None],
+                chunk_stream: AsyncIterator[ChatCompletionChunk],
             ) -> AsyncGenerator[str, None]:
+                saw_tool_calls = False
                 async for chunk in chunk_stream:
+                    finish_reason = None
+                    for choice in chunk.choices:
+                        if choice.delta.tool_calls:
+                            saw_tool_calls = True
+                        if choice.finish_reason is not None:
+                            finish_reason = choice.finish_reason
+                    session_data.record_generation(
+                        finish_reason=finish_reason,
+                        has_tool_calls=saw_tool_calls,
+                    )
                     yield f"data: {chunk.model_dump_json()}\n\n"
                 yield "data: [DONE]\n\n"
 
-            safe_stream = _safe_stream_wrapper(_openai_sse_generator(openai_stream))
+            safe_stream = _safe_stream_wrapper(
+                _openai_sse_generator(openai_stream), upstream=openai_stream
+            )
 
             return StreamingResponse(
                 safe_stream,
@@ -843,11 +914,17 @@ async def chat_completions(
             logger.error(f"Error setting up streaming response: {e}")
             raise HTTPException(status_code=500, detail=f"Streaming setup failed: {e}")
 
-    return await _call_client_create(
+    completion = await _call_client_create(
         create_fn=_openai_client.chat.completions.create,
         request=request,
         session_id=session_id,
     )
+    for choice in completion.choices:
+        session_data.record_generation(
+            finish_reason=choice.finish_reason,
+            has_tool_calls=bool(choice.message.tool_calls),
+        )
+    return completion
 
 
 @app.post(
@@ -901,29 +978,46 @@ def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) ->
     return openai_request
 
 
-async def _safe_stream_wrapper(
-    stream: AsyncGenerator,
-) -> AsyncGenerator:
-    """Wrap an async generator to handle client disconnection gracefully.
+class _SafeStream:
+    """Close both a protocol adapter stream and its owned upstream."""
 
-    Ensures proper cleanup of the underlying stream when the client disconnects
-    or an error occurs during streaming.
+    def __init__(self, stream: AsyncIterator[Any], upstream: Any | None = None):
+        self._iterator = stream.__aiter__()
+        self._upstream = upstream
+        self._closed = False
 
-    Args:
-        stream: The async generator to wrap.
+    def __aiter__(self) -> _SafeStream:
+        return self
 
-    Yields:
-        Chunks from the underlying stream.
-    """
-    try:
-        async for chunk in stream:
-            yield chunk
-    except asyncio.CancelledError:
-        logger.info("Streaming cancelled by client disconnect")
-        raise
-    finally:
-        if hasattr(stream, "aclose"):
-            await stream.aclose()
+    async def __anext__(self):
+        try:
+            return await self._iterator.__anext__()
+        except asyncio.CancelledError:
+            logger.info("Streaming cancelled by client disconnect")
+            await self.aclose()
+            raise
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            close = getattr(self._iterator, "aclose", None)
+            if close is not None:
+                await close()
+        finally:
+            close_upstream = getattr(self._upstream, "aclose", None)
+            if close_upstream is not None:
+                await close_upstream()
+
+
+def _safe_stream_wrapper(
+    stream: AsyncIterator[Any], *, upstream: Any | None = None
+) -> _SafeStream:
+    return _SafeStream(stream, upstream)
 
 
 @app.post(
@@ -998,7 +1092,9 @@ async def anthropic_messages(
             )
 
             # Wrap the stream to handle client disconnection gracefully
-            safe_stream = _safe_stream_wrapper(anthropic_sse_stream)
+            safe_stream = _safe_stream_wrapper(
+                anthropic_sse_stream, upstream=openai_stream
+            )
 
             # Return streaming response
             return StreamingResponse(

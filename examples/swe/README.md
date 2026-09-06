@@ -66,7 +66,12 @@ The SWE example reads an `econfig` block (see `examples/swe/utils.py`):
 | `step_limit`            | Max agent interaction steps per episode.                                                                    |
 | `max_tokens`            | Total context window advertised to OpenCode.                                                                |
 | `max_completion_tokens` | Max completion tokens per agent LLM call.                                                                   |
-| `timeout`               | Max wall-clock time per episode (seconds).                                                                  |
+| `harness_timeout`       | Optional wall-clock override for a delegated E2B CLI process.                                               |
+| `eval_timeout`          | Independent wall-clock limit for fresh-sandbox evaluation.                                                  |
+| `session_idle_timeout`  | Stop a delegated E2B CLI after this much proxy inactivity.                                                  |
+| `session_poll_interval` | Interval between proxy session-status checks.                                                               |
+| `terminal_exit_grace`   | Grace after a terminal response for harnesses that opt in; currently OpenCode.                              |
+| `timeout`               | Hard wall-clock deadline for the complete episode, including delegated E2B stages.                          |
 
 ## 4. Dataset format
 
