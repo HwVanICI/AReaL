@@ -98,6 +98,19 @@ async def _fake_create(
                 model="test",
                 object="chat.completion.chunk",
             )
+            yield ChatCompletionChunk(
+                id="chatcmpl-test",
+                choices=[
+                    ChunkChoice(
+                        delta=ChoiceDelta(),
+                        index=0,
+                        finish_reason="stop",
+                    )
+                ],
+                created=0,
+                model="test",
+                object="chat.completion.chunk",
+            )
 
         return _gen()
 
@@ -174,6 +187,12 @@ class TestChatCompletionsEndpoint:
             chunk = json.loads(events[0].removeprefix("data: "))
             assert chunk["object"] == "chat.completion.chunk"
             assert chunk["choices"][0]["delta"]["content"] == "hello"
+            status = await client.post(
+                "/rl/session_status",
+                headers=_session_headers(api_key),
+                json={},
+            )
+            assert status.json()["terminal_seconds"] is not None
 
     @pytest.mark.asyncio
     async def test_non_streaming_returns_json(self, monkeypatch, _mock_openai_client):
@@ -202,3 +221,9 @@ class TestChatCompletionsEndpoint:
             data = resp.json()
             assert data["object"] == "chat.completion"
             assert data["choices"][0]["message"]["content"] == "hello"
+            status = await client.post(
+                "/rl/session_status",
+                headers=_session_headers(api_key),
+                json={},
+            )
+            assert status.json()["terminal_seconds"] is not None

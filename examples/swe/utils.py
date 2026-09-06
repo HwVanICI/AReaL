@@ -30,7 +30,14 @@ class SWEEnvConfig:
         step_limit: Maximum number of agent interaction steps per episode.
         max_tokens: Maximum context window advertised to the agent LLM.
         max_completion_tokens: Maximum completion tokens for the agent LLM.
-        timeout: Maximum time allowed for a single episode in seconds.
+        timeout: Hard wall-clock deadline for the complete episode.
+        harness_timeout: Optional wall-clock override for a delegated E2B harness.
+        eval_timeout: Wall-clock limit for fresh-sandbox reward evaluation.
+        session_idle_timeout: Kill a delegated E2B harness after this much proxy
+            inactivity.
+        session_poll_interval: Seconds between proxy session status checks.
+        terminal_exit_grace: Grace after a terminal model response for harnesses
+            that declare such a response final.
     """
 
     dataset_path: str = field(
@@ -150,7 +157,39 @@ class SWEEnvConfig:
     )
     timeout: float = field(
         default=1800.0,
-        metadata={"help": "Maximum time allowed for a single episode in seconds."},
+        metadata={"help": "Hard wall-clock deadline for the complete episode."},
+    )
+    harness_timeout: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional wall-clock override for a delegated E2B harness process; "
+                "the selected agent config supplies the default when unset."
+            )
+        },
+    )
+    eval_timeout: float = field(
+        default=900.0,
+        metadata={"help": "Wall-clock limit for fresh-sandbox evaluation."},
+    )
+    session_idle_timeout: float | None = field(
+        default=1200.0,
+        metadata={
+            "help": "Delegated E2B proxy-activity watchdog timeout; null disables it."
+        },
+    )
+    session_poll_interval: float = field(
+        default=30.0,
+        metadata={"help": "Delegated E2B session-status polling interval."},
+    )
+    terminal_exit_grace: float | None = field(
+        default=15.0,
+        metadata={
+            "help": (
+                "Grace after a harness-declared terminal model response; null "
+                "disables terminal-response teardown."
+            )
+        },
     )
 
 

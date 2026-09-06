@@ -172,6 +172,16 @@ class TestSessionForwardAuth:
             assert resp.status_code == 401
 
     @pytest.mark.asyncio
+    async def test_session_status_rejects_unknown_session(self):
+        async with _make_client() as client:
+            resp = await client.post(
+                "/rl/session_status",
+                headers={"Authorization": "Bearer unknown-session-key"},
+                json={},
+            )
+            assert resp.status_code == 401
+
+    @pytest.mark.asyncio
     async def test_end_session_rejects_unknown_session(self):
         async with _make_client() as client:
             resp = await client.post(

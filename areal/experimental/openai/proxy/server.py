@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
@@ -89,6 +90,22 @@ class ExportTrajectoriesResponse(BaseModel):
 # =============================================================================
 
 
+class _GenerationRequestLease:
+    """Idempotent ownership token for one in-flight generation request."""
+
+    def __init__(self, close_fn: Callable[[], None]):
+        self._close_fn = close_fn
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._close_fn()
+
+
 class SessionData:
     """Data associated with a single RL session."""
 
@@ -109,8 +126,11 @@ class SessionData:
             prefix_matcher=prefix_matcher,
         )
         self._completed_event = threading.Event()
-        self._start_time = time.time()
-        self._last_access_time = time.time()
+        self._start_time = time.monotonic()
+        self._last_access_time = self._start_time
+        self._first_request_seen = False
+        self._active_generation_requests = 0
+        self._terminal_response_time: float | None = None
         self._end_time = None
         self._lock = threading.Lock()
         self._processor_cache_released = False
@@ -118,7 +138,53 @@ class SessionData:
     def update_last_access(self):
         """Update the last access time for this session."""
         with self._lock:
-            self._last_access_time = time.time()
+            self._last_access_time = time.monotonic()
+
+    def start_generation_request(self) -> _GenerationRequestLease:
+        """Record a request and clear any prior terminal-response signal."""
+        with self._lock:
+            self._first_request_seen = True
+            self._active_generation_requests += 1
+            self._last_access_time = time.monotonic()
+            self._terminal_response_time = None
+        return _GenerationRequestLease(self._finish_generation_request)
+
+    def _finish_generation_request(self):
+        """Record that one in-flight model request has completed or failed."""
+        with self._lock:
+            self._active_generation_requests = max(
+                0, self._active_generation_requests - 1
+            )
+            self._last_access_time = time.monotonic()
+
+    def record_generation(self, *, finish_reason: str | None, has_tool_calls: bool):
+        """Record committed model output for coding-agent watchdog status."""
+        with self._lock:
+            now = time.monotonic()
+            self._last_access_time = now
+            if finish_reason == "stop" and not has_tool_calls:
+                self._terminal_response_time = now
+            elif finish_reason is not None:
+                self._terminal_response_time = None
+
+    def watchdog_status(self) -> dict[str, float | int | None]:
+        with self._lock:
+            now = time.monotonic()
+            idle_seconds = (
+                max(0.0, now - self._last_access_time)
+                if self._first_request_seen
+                else 0.0
+            )
+            terminal_seconds = (
+                max(0.0, now - self._terminal_response_time)
+                if self._terminal_response_time is not None
+                else None
+            )
+            return {
+                "idle_seconds": idle_seconds,
+                "terminal_seconds": terminal_seconds,
+                "active_requests": self._active_generation_requests,
+            }
 
     def take_processor_cache_group_id(self) -> str | None:
         """Detach the cache and return its group ID once for idempotent release."""
@@ -132,11 +198,11 @@ class SessionData:
     def is_stale(self, timeout_seconds: float = SESSION_TIMEOUT_SECONDS) -> bool:
         """Check if this session has been inactive for too long."""
         with self._lock:
-            return time.time() - self._last_access_time > timeout_seconds
+            return time.monotonic() - self._last_access_time > timeout_seconds
 
     def finish(self):
         self._completed = True
-        self._end_time = time.time()
+        self._end_time = time.monotonic()
         self._completed_event.set()
 
     @property
@@ -320,6 +386,7 @@ RL_END_SESSION_PATHNAME = "rl/end_session"
 RL_END_PROCESSOR_CACHE_GROUP_PATHNAME = "rl/end_processor_cache_group"
 RL_FETCH_SHARED_TENSORS_PATHNAME = "rl/fetch_shared_tensors"
 RL_SET_REWARD_PATHNAME = "rl/set_reward"
+RL_SESSION_STATUS_PATHNAME = "rl/session_status"
 CHAT_COMPLETIONS_PATHNAME = "chat/completions"
 RESPONSES_PATHNAME = "responses"
 ANTHROPIC_MESSAGES_PATHNAME = "v1/messages"

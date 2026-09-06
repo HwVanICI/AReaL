@@ -115,9 +115,9 @@ class SWEAgentWorkflow:
     """AReaL-SWEAgent workflow for AReaL proxy mode.
 
     This workflow runs an AReaL-SWEAgent agent type (``swe``, ``cc``,
-    ``codex``, or ``opencode``) on SWE-bench style records in sandboxed
-    environments. The agent's LLM calls are routed through AReaL's proxy server
-    for on-policy RL training.
+    ``codex``, or ``opencode``) on normalized R2E-Gym, Scale-SWE, or SWE-bench
+    records in sandboxed environments. The agent's LLM calls are routed through
+    AReaL's proxy server for on-policy RL training.
 
     The workflow delegates to AReaL-SWEAgent's ``run_agent_with_reward``, passing
     the AReaL proxy URL + per-rollout API key as explicit kwargs so that the
@@ -163,6 +163,7 @@ class SWEAgentWorkflow:
                 - instance_id (str): SWE-bench instance ID
                 - problem_statement (str): The GitHub issue description
                 - eval_script (str): Shell script for reward evaluation
+                - eval_setup_script (str): Optional trusted grader preparation
                 - image/image_url (str): E2B image routing metadata value
                 - workdir (str): Repository path in the image (default /testbed)
             **extra_kwargs: Additional kwargs injected by AReaL proxy infra:
@@ -202,6 +203,26 @@ class SWEAgentWorkflow:
                 self.gen_args.get("max_completion_tokens", 16384),
             )
         )
+        configured_harness_timeout = econfig.get("harness_timeout")
+        harness_timeout = (
+            float(configured_harness_timeout)
+            if configured_harness_timeout is not None
+            else None
+        )
+        eval_timeout = float(econfig.get("eval_timeout", 900.0))
+        configured_idle_timeout = econfig.get("session_idle_timeout", 1200.0)
+        session_idle_timeout = (
+            float(configured_idle_timeout)
+            if configured_idle_timeout is not None
+            else None
+        )
+        session_poll_interval = float(econfig.get("session_poll_interval", 30.0))
+        configured_terminal_grace = econfig.get("terminal_exit_grace", 15.0)
+        terminal_exit_grace = (
+            float(configured_terminal_grace)
+            if configured_terminal_grace is not None
+            else None
+        )
         instance_id = data.get("instance_id", "unknown")
 
         logger.info(
@@ -210,24 +231,29 @@ class SWEAgentWorkflow:
         )
         start_time = time.time()
 
+        episode = self._run_episode(
+            data=data,
+            agent_type=agent_type,
+            config_name=config_name,
+            base_url=base_url,
+            api_key=api_key,
+            llm_model=llm_model,
+            opencode_provider=opencode_provider,
+            opencode_config=opencode_config,
+            codex_provider=codex_provider,
+            sandbox_backend=sandbox_backend,
+            max_tokens=max_tokens,
+            max_completion_tokens=max_completion_tokens,
+            harness_timeout=harness_timeout,
+            eval_timeout=eval_timeout,
+            session_idle_timeout=session_idle_timeout,
+            session_poll_interval=session_poll_interval,
+            terminal_exit_grace=terminal_exit_grace,
+        )
         try:
-            reward = await asyncio.wait_for(
-                self._run_episode(
-                    data=data,
-                    agent_type=agent_type,
-                    config_name=config_name,
-                    base_url=base_url,
-                    api_key=api_key,
-                    llm_model=llm_model,
-                    opencode_provider=opencode_provider,
-                    opencode_config=opencode_config,
-                    codex_provider=codex_provider,
-                    sandbox_backend=sandbox_backend,
-                    max_tokens=max_tokens,
-                    max_completion_tokens=max_completion_tokens,
-                ),
-                timeout=self.timeout,
-            )
+            # Delegated E2B harnesses and evaluators have independent stage
+            # timeouts, while this remains the final whole-episode deadline.
+            reward = await asyncio.wait_for(episode, timeout=self.timeout)
         except TimeoutError:
             elapsed = time.time() - start_time
             logger.error(
@@ -257,6 +283,11 @@ class SWEAgentWorkflow:
         opencode_config: dict[str, Any] | None = None,
         max_tokens: int | None = None,
         max_completion_tokens: int | None = None,
+        harness_timeout: float | None = None,
+        eval_timeout: float | None = None,
+        session_idle_timeout: float | None = None,
+        session_poll_interval: float | None = None,
+        terminal_exit_grace: float | None = None,
     ) -> float:
         """Execute one episode through AReaL-SWEAgent and return the reward.
 
@@ -286,6 +317,11 @@ class SWEAgentWorkflow:
                 override_codex_provider=codex_provider,
                 override_max_tokens=max_tokens,
                 override_max_completion_tokens=max_completion_tokens,
+                override_harness_timeout=harness_timeout,
+                override_eval_timeout=eval_timeout,
+                override_session_idle_timeout=session_idle_timeout,
+                override_session_poll_interval=session_poll_interval,
+                override_terminal_exit_grace=terminal_exit_grace,
                 sandbox_backend=sandbox_backend,
             )
         except Exception as e:
