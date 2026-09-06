@@ -20,6 +20,15 @@ def test_swe_env_config_supports_omegaconf_structured_config():
 
     assert config.sandbox_backend == "aenv"
     assert config.opencode_config == {}
+    assert config.harness_timeout is None
+    assert config.eval_timeout == 900.0
+    assert config.session_idle_timeout == 1200.0
+    assert config.session_poll_interval == 30.0
+    assert config.terminal_exit_grace == 15.0
+    config.session_idle_timeout = None
+    config.terminal_exit_grace = None
+    assert config.session_idle_timeout is None
+    assert config.terminal_exit_grace is None
     config.sandbox_backend = "e2b"
     assert config.sandbox_backend == "e2b"
 
@@ -71,6 +80,11 @@ async def test_run_episode_forwards_e2b_and_proxy_session(monkeypatch, tmp_path)
         opencode_provider=None,
         codex_provider=None,
         sandbox_backend="e2b",
+        harness_timeout=222.0,
+        eval_timeout=111.0,
+        session_idle_timeout=321.0,
+        session_poll_interval=7.0,
+        terminal_exit_grace=11.0,
     )
 
     assert reward == 1.0
@@ -78,6 +92,11 @@ async def test_run_episode_forwards_e2b_and_proxy_session(monkeypatch, tmp_path)
     assert kwargs["override_base_url"] == "http://proxy:9000"
     assert kwargs["override_api_key"] == "trajectory-key"
     assert kwargs["sandbox_backend"] == "e2b"
+    assert kwargs["override_harness_timeout"] == 222.0
+    assert kwargs["override_eval_timeout"] == 111.0
+    assert kwargs["override_session_idle_timeout"] == 321.0
+    assert kwargs["override_session_poll_interval"] == 7.0
+    assert kwargs["override_terminal_exit_grace"] == 11.0
 
 
 @pytest.mark.asyncio
@@ -136,6 +155,11 @@ async def test_run_episode_forwards_opencode_model_and_provider(monkeypatch, tmp
         opencode_config={"tools": {"task": False}},
         max_tokens=32768,
         max_completion_tokens=4096,
+        harness_timeout=1800.0,
+        eval_timeout=900.0,
+        session_idle_timeout=1200.0,
+        session_poll_interval=30.0,
+        terminal_exit_grace=15.0,
     )
 
     assert reward == 1.0
@@ -145,4 +169,45 @@ async def test_run_episode_forwards_opencode_model_and_provider(monkeypatch, tmp
     assert kwargs["override_opencode_config"] == {"tools": {"task": False}}
     assert kwargs["override_max_tokens"] == 32768
     assert kwargs["override_max_completion_tokens"] == 4096
+    assert kwargs["override_harness_timeout"] == 1800.0
+    assert kwargs["override_eval_timeout"] == 900.0
+    assert kwargs["override_session_idle_timeout"] == 1200.0
+    assert kwargs["override_session_poll_interval"] == 30.0
+    assert kwargs["override_terminal_exit_grace"] == 15.0
     assert kwargs["sandbox_backend"] == "e2b"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_type", ["cc", "codex", "opencode"])
+async def test_delegated_e2b_run_keeps_whole_episode_timeout(monkeypatch, agent_type):
+    workflow = object.__new__(SWEAgentWorkflow)
+    workflow.econfig = {
+        "agent_type": agent_type,
+        "sandbox_backend": "e2b",
+        "harness_timeout": 1800.0,
+        "eval_timeout": 900.0,
+        "session_idle_timeout": None,
+        "terminal_exit_grace": None,
+    }
+    workflow.gen_args = {}
+    workflow.timeout = 1.0
+    workflow._run_episode = AsyncMock(return_value=1.0)
+    captured = {}
+
+    async def wait_for(awaitable, timeout):
+        captured["timeout"] = timeout
+        return await awaitable
+
+    monkeypatch.setattr("examples.swe.agent.asyncio.wait_for", wait_for)
+
+    reward = await workflow.run(
+        {"instance_id": "task", "problem_statement": "fix", "image": "img"},
+        base_url="http://proxy:9000",
+        api_key="trajectory-key",
+    )
+
+    assert reward == 1.0
+    assert captured["timeout"] == 1.0
+    kwargs = workflow._run_episode.await_args.kwargs
+    assert kwargs["session_idle_timeout"] is None
+    assert kwargs["terminal_exit_grace"] is None

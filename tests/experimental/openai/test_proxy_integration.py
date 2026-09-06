@@ -241,7 +241,7 @@ class TestProxyServerEndpoints:
         # Manually set last access time to past
         import time
 
-        session._last_access_time = time.time() - SESSION_TIMEOUT_SECONDS - 1
+        session._last_access_time = time.monotonic() - SESSION_TIMEOUT_SECONDS - 1
 
         # Now it should be stale
         assert session.is_stale()

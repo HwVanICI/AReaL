@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -92,6 +92,63 @@ def test_agent_sampling_defaults_match_generation_hyperparameters():
 
 def _admin_headers():
     return {"Authorization": f"Bearer {_ADMIN_KEY}"}
+
+
+def test_session_watchdog_status_tracks_idle_and_terminal_response():
+    session = SessionData(session_id="watchdog")
+
+    assert session.watchdog_status()["idle_seconds"] == 0.0
+    assert session.watchdog_status()["terminal_seconds"] is None
+    assert session.watchdog_status()["active_requests"] == 0
+
+    lease = session.start_generation_request()
+    session.record_generation(finish_reason="stop", has_tool_calls=False)
+    status = session.watchdog_status()
+
+    assert status["idle_seconds"] >= 0.0
+    assert status["terminal_seconds"] is not None
+    assert status["terminal_seconds"] >= 0.0
+    assert status["active_requests"] == 1
+
+    lease.close()
+    assert session.watchdog_status()["active_requests"] == 0
+
+
+def test_generation_request_lease_closes_once_with_concurrent_request():
+    session = SessionData(session_id="concurrent-watchdog")
+    first = session.start_generation_request()
+    second = session.start_generation_request()
+
+    first.close()
+    first.close()
+    assert session.watchdog_status()["active_requests"] == 1
+
+    second.close()
+    assert session.watchdog_status()["active_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_session_status_endpoint_uses_session_key(monkeypatch):
+    monkeypatch.setattr(srv, "_capacity", 1)
+    async with _client() as client:
+        started = await client.post(
+            "/rl/start_session",
+            headers=_admin_headers(),
+            json={"task_id": "watchdog"},
+        )
+        api_key = started.json()["api_key"]
+        response = await client.post(
+            "/rl/session_status",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "idle_seconds": 0.0,
+        "terminal_seconds": None,
+        "active_requests": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +281,112 @@ async def test_call_client_create_injects_configured_generation_params(monkeypat
     assert create_fn.await_args.kwargs["max_completion_tokens"] == 4096
     assert "max_tokens" not in create_fn.await_args.kwargs
     assert "max_output_tokens" not in create_fn.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_call_client_create_tracks_stream_activity_for_all_protocols(monkeypatch):
+    session_id = "stream-activity-session"
+    session = SessionData(session_id=session_id)
+    session.update_last_access = MagicMock(wraps=session.update_last_access)
+    srv._session_cache[session_id] = session
+    monkeypatch.setattr(srv, "_openai_client", object())
+
+    async def create(*, stream=None, areal_cache=None, **_kwargs):
+        async def chunks():
+            yield "first"
+            yield "second"
+
+        return chunks()
+
+    result = await srv._call_client_create(
+        create_fn=create,
+        request={},
+        session_id=session_id,
+        stream=True,
+    )
+
+    assert [chunk async for chunk in result] == ["first", "second"]
+    assert session.update_last_access.call_count == 2
+    assert session.watchdog_status()["active_requests"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consume_one", [False, True])
+async def test_stream_close_releases_request_lease(monkeypatch, consume_one):
+    session_id = f"stream-close-{consume_one}"
+    session = SessionData(session_id=session_id)
+    srv._session_cache[session_id] = session
+    monkeypatch.setattr(srv, "_openai_client", object())
+
+    async def create(*, stream=None, areal_cache=None, **_kwargs):
+        async def chunks():
+            yield "first"
+            yield "second"
+
+        return chunks()
+
+    result = await srv._call_client_create(
+        create_fn=create,
+        request={},
+        session_id=session_id,
+        stream=True,
+    )
+    if consume_one:
+        assert await anext(result) == "first"
+
+    await result.aclose()
+
+    assert session.watchdog_status()["active_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unstarted_protocol_stream_close_releases_upstream_lease(monkeypatch):
+    session_id = "nested-stream-close"
+    session = SessionData(session_id=session_id)
+    srv._session_cache[session_id] = session
+    monkeypatch.setattr(srv, "_openai_client", object())
+
+    async def create(*, stream=None, areal_cache=None, **_kwargs):
+        async def chunks():
+            yield "chunk"
+
+        return chunks()
+
+    upstream = await srv._call_client_create(
+        create_fn=create,
+        request={},
+        session_id=session_id,
+        stream=True,
+    )
+
+    async def protocol_stream():
+        async for chunk in upstream:
+            yield chunk
+
+    outer = srv._safe_stream_wrapper(protocol_stream(), upstream=upstream)
+    await outer.aclose()
+
+    assert session.watchdog_status()["active_requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_call_client_create_setup_error_does_not_leak_active_request(monkeypatch):
+    session_id = "setup-error-session"
+    session = SessionData(session_id=session_id)
+    srv._session_cache[session_id] = session
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(
+        srv.inspect, "signature", MagicMock(side_effect=RuntimeError("bad signature"))
+    )
+
+    with pytest.raises(RuntimeError, match="bad signature"):
+        await srv._call_client_create(
+            create_fn=AsyncMock(),
+            request={},
+            session_id=session_id,
+        )
+
+    assert session.watchdog_status()["active_requests"] == 0
 
 
 @pytest.mark.asyncio
