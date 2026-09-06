@@ -23,6 +23,8 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.transformation im
 )
 from litellm.types.utils import ModelResponse as LitellmModelResponse
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response
 from openai.types.responses.response_create_params import ResponseCreateParams
@@ -32,7 +34,7 @@ from areal.api.cli_args import NameResolveConfig
 from areal.experimental.openai.chat_template_patches import (
     apply_keep_all_reasoning_patches,
 )
-from areal.experimental.openai.client import ArealOpenAI
+from areal.experimental.openai.client import ArealOpenAI, PromptContextOverflowError
 from areal.infra.processor_cache import ProcessorCacheRegistry
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
@@ -821,6 +823,9 @@ async def _call_client_create(
     except asyncio.CancelledError:
         request_lease.close()
         raise
+    except PromptContextOverflowError:
+        request_lease.close()
+        raise
     except ValueError as e:
         request_lease.close()
         raise HTTPException(status_code=500, detail=str(e))
@@ -837,6 +842,25 @@ async def _call_client_create(
 
     request_lease.close()
     return result
+
+
+async def _length_finish_sse(model: str) -> AsyncGenerator[str, None]:
+    """Return a valid empty assistant turn that terminates with length."""
+    chunk = ChatCompletionChunk(
+        id=f"chatcmpl-length-{secrets.token_hex(12)}",
+        choices=[
+            ChunkChoice(
+                delta=ChoiceDelta(role="assistant", content=""),
+                index=0,
+                finish_reason="length",
+            )
+        ],
+        created=int(time.time()),
+        model=model,
+        object="chat.completion.chunk",
+    )
+    yield f"data: {chunk.model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 @app.post(
@@ -911,6 +935,23 @@ async def chat_completions(
         except Exception as e:
             if openai_stream is not None and hasattr(openai_stream, "aclose"):
                 await openai_stream.aclose()
+            if isinstance(e, PromptContextOverflowError):
+                logger.warning(
+                    "Prompt context exhausted; returning finish_reason=length: %s",
+                    e,
+                )
+                session_data.record_generation(
+                    finish_reason="length", has_tool_calls=False
+                )
+                return StreamingResponse(
+                    _length_finish_sse(str(request.get("model") or "default")),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
             logger.error(f"Error setting up streaming response: {e}")
             raise HTTPException(status_code=500, detail=f"Streaming setup failed: {e}")
 
