@@ -31,6 +31,22 @@ class StripAnthropicBillingHeader:
         return messages
 
 
+class StripOpenCodeEnvironmentDate:
+    """Remove OpenCode's per-request date from its environment system prompt."""
+
+    _PATTERN = re.compile(
+        r"(?m)^[ \t]*Today's date: "
+        r"[A-Z][a-z]{2} [A-Z][a-z]{2} \d{2} \d{4}\r?\n(?=</env>)"
+    )
+
+    def __call__(self, messages: list[dict]) -> list[dict]:
+        for msg in messages:
+            content = msg.get("content")
+            if msg.get("role") == "system" and isinstance(content, str):
+                msg["content"] = self._PATTERN.sub("", content)
+        return messages
+
+
 class NormalizeSystemReminder:
     """Remove volatile ``currentDate`` lines from system reminders."""
 
