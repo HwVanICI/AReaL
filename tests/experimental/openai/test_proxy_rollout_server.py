@@ -90,6 +90,21 @@ def test_agent_sampling_defaults_match_generation_hyperparameters():
     assert agent.max_completion_tokens == generation.max_new_tokens
 
 
+def test_anthropic_translation_defers_message_preprocessing(monkeypatch):
+    adapter = MagicMock()
+    adapter.translate_completion_input_params.return_value = {
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+    }
+    preprocessor = MagicMock()
+    monkeypatch.setattr(srv, "_adapter", adapter)
+    monkeypatch.setattr(srv, "_message_preprocessors", [preprocessor])
+
+    translated = srv._translate_anthropic_to_openai_request({"messages": []})
+
+    assert translated["messages"] == [{"role": "user", "content": "hello"}]
+    preprocessor.assert_not_called()
+
+
 def _admin_headers():
     return {"Authorization": f"Bearer {_ADMIN_KEY}"}
 
@@ -281,6 +296,57 @@ async def test_call_client_create_injects_configured_generation_params(monkeypat
     assert create_fn.await_args.kwargs["max_completion_tokens"] == 4096
     assert "max_tokens" not in create_fn.await_args.kwargs
     assert "max_output_tokens" not in create_fn.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_call_client_create_applies_message_preprocessors_once(monkeypatch):
+    session_id = "preprocessor-session"
+    monkeypatch.setattr(srv, "_openai_client", object())
+    srv._session_cache[session_id] = SessionData(session_id=session_id)
+
+    preprocessor = MagicMock(
+        side_effect=lambda messages: [
+            {**message, "content": f"normalized: {message['content']}"}
+            for message in messages
+        ]
+    )
+    monkeypatch.setattr(srv, "_message_preprocessors", [preprocessor])
+    create_fn = _create_fn_with_token_aliases()
+
+    result = await srv._call_client_create(
+        create_fn=create_fn,
+        request={"messages": [{"role": "system", "content": "original"}]},
+        session_id=session_id,
+    )
+
+    assert result == "ok"
+    preprocessor.assert_called_once_with([{"role": "system", "content": "original"}])
+    assert create_fn.await_args.kwargs["messages"] == [
+        {"role": "system", "content": "normalized: original"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_call_client_create_preprocesses_message_iterators(monkeypatch):
+    """Materialize FastAPI/Pydantic message iterators before preprocessing."""
+    session_id = "preprocessor-iterator-session"
+    monkeypatch.setattr(srv, "_openai_client", object())
+    srv._session_cache[session_id] = SessionData(session_id=session_id)
+
+    preprocessor = MagicMock(return_value=[])
+    monkeypatch.setattr(srv, "_message_preprocessors", [preprocessor])
+    create_fn = _create_fn_with_token_aliases()
+    messages = iter([{"role": "system", "content": "volatile"}])
+
+    result = await srv._call_client_create(
+        create_fn=create_fn,
+        request={"messages": messages},
+        session_id=session_id,
+    )
+
+    assert result == "ok"
+    preprocessor.assert_called_once_with([{"role": "system", "content": "volatile"}])
+    assert create_fn.await_args.kwargs["messages"] == []
 
 
 @pytest.mark.asyncio
