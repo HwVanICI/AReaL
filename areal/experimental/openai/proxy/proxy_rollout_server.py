@@ -788,6 +788,13 @@ async def _call_client_create(
             f"{dropped_args_str}"
         )
 
+    messages = kwargs.get("messages")
+    if messages is not None:
+        messages = list(messages)
+        for preprocessor in _message_preprocessors:
+            messages = preprocessor(messages)
+        kwargs["messages"] = messages
+
     # Agent rollouts must use the experiment's generation policy, regardless of
     # defaults or explicit values sent by the coding-agent client. Normalize the
     # mutually-exclusive OpenAI token-limit aliases before injecting the one
@@ -1013,8 +1020,6 @@ def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) ->
 
     if "messages" in openai_request:
         _flatten_content_lists(openai_request["messages"])
-        for preprocessor in _message_preprocessors:
-            openai_request["messages"] = preprocessor(openai_request["messages"])
 
     return openai_request
 
