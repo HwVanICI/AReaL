@@ -1,8 +1,8 @@
 """Message preprocessors for SWE-bench agent rollouts.
 
-Preprocessors transform messages after Anthropic-to-OpenAI translation and
-before they reach AReaL's OpenAI client. They remove volatile Claude Code
-metadata that otherwise breaks prefix-based parent matching in concat export.
+Preprocessors transform OpenAI-compatible chat messages before they reach
+AReaL's rollout client. They remove volatile coding-agent metadata that
+otherwise breaks prefix-based parent matching in concat export.
 """
 
 import json

@@ -2433,12 +2433,11 @@ class AgentConfig:
         default_factory=list,
         metadata={
             "help": (
-                "List of message preprocessor class paths applied, in order, to "
-                "Anthropic-compatible `/v1/messages` requests after translating "
-                "them to OpenAI-compatible requests. Native OpenAI "
-                "`/chat/completions` and `/responses` requests are not "
-                "preprocessed. Each entry is a dotted import path to a callable "
-                "class."
+                "List of message preprocessor class paths applied, in order, "
+                "before OpenAI-compatible chat messages reach the rollout client. "
+                "This includes native `/chat/completions` requests and "
+                "Anthropic-compatible `/v1/messages` requests after translation. "
+                "Each entry is a dotted import path to a callable class."
             ),
         },
     )
