@@ -3,11 +3,14 @@
 import argparse
 import hashlib
 import importlib.metadata
+import io
 import json
 import platform
 import re
 import subprocess
 from pathlib import Path
+from urllib.parse import urlencode
+from zipfile import ZipFile
 
 
 def command(*args: str) -> str:
@@ -111,49 +114,151 @@ def report(previous: dict | None, current: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def snapshot(image: str, output: Path) -> None:
-    command("docker", "pull", "--quiet", image)
-    try:
-        digest = json.loads(command("docker", "image", "inspect", image))[0][
-            "RepoDigests"
-        ][0]
-        result = subprocess.check_output(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--network=none",
-                "--read-only",
-                "-i",
-                "--entrypoint",
-                "python3",
-                digest,
-                "-",
-                "collect",
-            ],
-            input=Path(__file__).read_bytes(),
+def image_reference(image: str, digest: str) -> str:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ValueError(f"Invalid image digest: {digest}")
+    return f"{image.rsplit(':', 1)[0]}@{digest}"
+
+
+def restore(image: str, repository: str, accelerator: str, output: Path) -> None:
+    output.unlink(missing_ok=True)
+    manifest = json.loads(
+        command(
+            "docker",
+            "buildx",
+            "imagetools",
+            "inspect",
+            image,
+            "--format",
+            "{{json .Manifest}}",
         )
-        output.write_text(
-            json.dumps({"image": digest, "dependencies": json.loads(result)}, indent=2)
-            + "\n"
+    )
+    digest = manifest["digest"]
+    reference = image_reference(image, digest)
+    # The second name supports inventories uploaded before digest-based naming.
+    names = (
+        f"image-dependencies-{accelerator}-{digest[7:]}",
+        f"image-dependencies-{accelerator}",
+    )
+    for name in names:
+        query = urlencode({"name": name, "per_page": 100})
+        artifacts = json.loads(
+            command("gh", "api", f"repos/{repository}/actions/artifacts?{query}")
+        )["artifacts"]
+        for artifact in sorted(artifacts, key=lambda item: item["id"], reverse=True):
+            if artifact["expired"]:
+                continue
+            data = subprocess.check_output(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repository}/actions/artifacts/{artifact['id']}/zip",
+                ]
+            )
+            with ZipFile(io.BytesIO(data)) as archive:
+                if "current.json" not in archive.namelist():
+                    continue
+                inventory = json.loads(archive.read("current.json"))
+            if inventory.get("image") == reference:
+                output.write_text(json.dumps(inventory, indent=2) + "\n")
+                return
+    print(
+        f"No retained inventory matches {reference}; this build will establish a baseline."
+    )
+
+
+def prepare(
+    dockerfile: str,
+    image: str,
+    cache: str,
+    revision: str,
+    repository: str,
+    output: Path,
+) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    configuration = {
+        "group": {"default": {"targets": ["runtime", "inventory"]}},
+        "target": {
+            "runtime": {
+                "context": str(Path.cwd()),
+                "dockerfile": dockerfile,
+                "tags": [image],
+                "labels": {
+                    "org.opencontainers.image.revision": revision,
+                    "org.opencontainers.image.source": f"https://github.com/{repository}",
+                },
+                "cache-from": [f"type=registry,ref={cache}"],
+                "cache-to": [f"type=registry,ref={cache},mode=min"],
+                "output": ["type=registry"],
+            },
+            "inventory": {
+                "context": str(output.resolve()),
+                "contexts": {
+                    "runtime": "target:runtime",
+                    "dependency-tools": str(Path(__file__).resolve().parent),
+                },
+                "dockerfile-inline": (
+                    "FROM runtime AS collect\n"
+                    "RUN --network=none --mount=type=bind,from=dependency-tools,"
+                    "source=image_dependencies.py,target=/tmp/image_dependencies.py "
+                    "python3 /tmp/image_dependencies.py collect > /dependencies.json\n"
+                    "FROM scratch\n"
+                    "COPY --from=collect /dependencies.json /dependencies.json\n"
+                ),
+                "output": [f"type=local,dest={output.resolve() / 'export'}"],
+            },
+        },
+    }
+    (output / "bake.json").write_text(json.dumps(configuration, indent=2) + "\n")
+
+
+def record(image: str, metadata: Path, inventory: Path, output: Path) -> None:
+    digest = json.loads(metadata.read_text())["runtime"]["containerimage.digest"]
+    output.write_text(
+        json.dumps(
+            {
+                "image": image_reference(image, digest),
+                "dependencies": json.loads(inventory.read_text()),
+            },
+            indent=2,
         )
-    finally:
-        subprocess.run(["docker", "image", "rm", image], check=False)
+        + "\n"
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("collect", "snapshot", "report"))
+    parser.add_argument(
+        "mode", choices=("collect", "restore", "prepare", "record", "report")
+    )
     parser.add_argument("--image")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--previous", type=Path)
     parser.add_argument("--current", type=Path)
+    parser.add_argument("--repository")
+    parser.add_argument("--accelerator", choices=("a2", "a3"))
+    parser.add_argument("--dockerfile")
+    parser.add_argument("--cache")
+    parser.add_argument("--revision")
+    parser.add_argument("--metadata", type=Path)
+    parser.add_argument("--inventory", type=Path)
     args = parser.parse_args()
     if args.mode == "collect":
         # stdout is the inventory protocol, including when executed inside an image.
         print(json.dumps(collect(), sort_keys=True))
-    elif args.mode == "snapshot":
-        snapshot(args.image, args.output)
+    elif args.mode == "restore":
+        restore(args.image, args.repository, args.accelerator, args.output)
+    elif args.mode == "prepare":
+        prepare(
+            args.dockerfile,
+            args.image,
+            args.cache,
+            args.revision,
+            args.repository,
+            args.output,
+        )
+    elif args.mode == "record":
+        record(args.image, args.metadata, args.inventory, args.output)
     else:
         previous = (
             json.loads(args.previous.read_text()) if args.previous.exists() else None

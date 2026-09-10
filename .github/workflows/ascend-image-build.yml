@@ -19,6 +19,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: read
   packages: write
 
@@ -35,7 +36,7 @@ jobs:
     name: build-and-publish-${{ matrix.accelerator }}-nightly
     if: github.repository == 'HwVanICI/AReaL'
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 240
+    timeout-minutes: 180
 
     strategy:
       fail-fast: false
@@ -93,13 +94,17 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             docker login ghcr.io --username "${{ github.actor }}" --password-stdin
 
-      - name: Inventory previous nightly image
+      - name: Restore previous nightly dependency inventory
         id: previous
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 "${RUNNER_TEMP}/image-dependencies/image_dependencies.py" snapshot \
+          python3 "${RUNNER_TEMP}/image-dependencies/image_dependencies.py" restore \
             --image "${IMAGE}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --accelerator "${ACCELERATOR}" \
             --output "${RUNNER_TEMP}/image-dependencies/previous.json"
 
       - name: Build and publish Dockerfile.${{ matrix.accelerator }}
@@ -114,36 +119,43 @@ jobs:
             --use
           docker buildx inspect --bootstrap
 
+          report_dir="${RUNNER_TEMP}/image-dependencies"
+          python3 "${report_dir}/image_dependencies.py" prepare \
+            --dockerfile "${DOCKERFILE}" \
+            --image "${IMAGE}" \
+            --cache "${IMAGE_CACHE}" \
+            --revision "${SOURCE_SHA}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --output "${report_dir}"
+
           SECONDS=0
-          docker buildx build \
-            --cache-from "type=registry,ref=${IMAGE_CACHE}" \
-            --cache-to "type=registry,ref=${IMAGE_CACHE},mode=min" \
-            --file "${DOCKERFILE}" \
-            --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
-            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-            --metadata-file "${RUNNER_TEMP}/image-dependencies/build.json" \
-            --progress=plain \
-            --push \
-            --tag "${IMAGE}" \
-            .
+          docker buildx bake \
+            --file "${report_dir}/bake.json" \
+            --allow "fs.read=${GITHUB_WORKSPACE}" \
+            --allow "fs.read=${report_dir}" \
+            --allow "fs.write=${report_dir}/export" \
+            --metadata-file "${report_dir}/build.json" \
+            --progress=plain
           echo "Build duration: ${SECONDS}s"
 
-          docker buildx imagetools inspect "${IMAGE}"
-
-      - name: Release local build cache
-        run: docker buildx rm "areal-${ACCELERATOR}-builder"
-
-      - name: Inventory published image and summarize changes
-        id: dependencies
-        continue-on-error: true
-        timeout-minutes: 30
+      - name: Record published image dependency inventory
+        id: inventory
         run: |
           set -euo pipefail
           report_dir="${RUNNER_TEMP}/image-dependencies"
-          digest=$(jq -er '."containerimage.digest"' "${report_dir}/build.json")
-          python3 "${report_dir}/image_dependencies.py" snapshot \
-            --image "${IMAGE%:*}@${digest}" \
+          python3 "${report_dir}/image_dependencies.py" record \
+            --image "${IMAGE}" \
+            --metadata "${report_dir}/build.json" \
+            --inventory "${report_dir}/export/dependencies.json" \
             --output "${report_dir}/current.json"
+          digest=$(jq -er '.runtime["containerimage.digest"]' "${report_dir}/build.json")
+          echo "artifact_name=image-dependencies-${ACCELERATOR}-${digest#sha256:}" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize dependency changes
+        id: dependencies
+        continue-on-error: true
+        run: |
+          report_dir="${RUNNER_TEMP}/image-dependencies"
           python3 "${report_dir}/image_dependencies.py" report \
             --previous "${report_dir}/previous.json" \
             --current "${report_dir}/current.json" \
@@ -151,20 +163,21 @@ jobs:
           cat "${report_dir}/summary.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report inventory failures
-        if: always() && (steps.previous.outcome == 'failure' || steps.dependencies.outcome == 'failure')
+        if: always() && (steps.previous.outcome == 'failure' || steps.inventory.outcome == 'failure' || steps.dependencies.outcome == 'failure')
         run: |
           echo '::warning::Dependency inventory is incomplete. See the inventory step logs.'
-          echo 'Dependency inventory is incomplete. See the inventory step logs; a missing baseline may also mean this is the first build.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Dependency inventory is incomplete. See the inventory step logs.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload dependency inventories
-        if: always()
+        if: always() && steps.inventory.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: image-dependencies-${{ matrix.accelerator }}
+          name: ${{ steps.inventory.outputs.artifact_name }}
           path: |
-            ${{ runner.temp }}/image-dependencies/*.json
+            ${{ runner.temp }}/image-dependencies/current.json
             ${{ runner.temp }}/image-dependencies/summary.md
-          if-no-files-found: ignore
+          if-no-files-found: error
+          overwrite: true
 
       - name: Report final storage usage
         if: always()
