@@ -133,7 +133,7 @@ jobs:
             --file "${report_dir}/bake.json" \
             --allow "fs.read=${GITHUB_WORKSPACE}" \
             --allow "fs.read=${report_dir}" \
-            --allow "fs.write=${report_dir}/export" \
+            --allow "fs.write=${report_dir}" \
             --metadata-file "${report_dir}/build.json" \
             --progress=plain
           echo "Build duration: ${SECONDS}s"
