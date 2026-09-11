@@ -14,9 +14,23 @@ import sys
 import time
 from typing import Any
 
-from areal.utils import logging
+from areal.infra import workflow_context
+from areal.utils import logging, stats_tracker
 
 logger = logging.getLogger("AReaL-SWEAgent")
+
+# How an episode ended. The first five are the values of
+# ``aweagent.runner.EXIT_CODE``; the ``areal_`` ones cover episodes that die on
+# this side of the boundary, where aweagent never gets to report anything.
+_EXIT_CODES = (
+    "success",
+    "aenv_init_fail",
+    "agent_error",
+    "reward_compute_error",
+    "other",
+    "areal_exception",
+    "areal_timeout",
+)
 
 _DEFAULT_AGENT_CONFIGS = {
     "swe": "1_0_0/min-swe-agent-train-top1",
@@ -25,6 +39,57 @@ _DEFAULT_AGENT_CONFIGS = {
     "opencode": "train_opencode_time3600",
     "codex": "train_codex_time3600",
 }
+
+
+def _log_episode_outcome(
+    reward: float,
+    stats: dict[str, Any] | None = None,
+    exit_code: str | None = None,
+) -> None:
+    """Record how an episode ended, alongside ``rollout/reward``.
+
+    Every failure reaches the trainer as ``reward=0.0``, so a sandbox that
+    never booted, a verifier that crashed, and a patch that genuinely failed
+    its tests are indistinguishable downstream -- all three are optimized
+    against as if the policy had erred. ``run_agent_with_reward`` already
+    separates them; this publishes that split so the share of zeros carrying
+    no policy signal is visible.
+
+    Pass ``exit_code`` for failures on this side of the aweagent boundary,
+    where no stats dict exists.
+    """
+    try:
+        stats = stats or {}
+        if exit_code is None:
+            exit_code = str(stats.get("exit_code", "other"))
+        if exit_code not in _EXIT_CODES:
+            exit_code = "other"
+
+        tracker = stats_tracker.get(workflow_context.stat_scope())
+        tracker.scalar(
+            **{f"exit/{code}": float(exit_code == code) for code in _EXIT_CODES}
+        )
+
+        # A patch separates "tried and got it wrong" from "never got as far as
+        # submitting one" -- only the former is a failure worth learning from.
+        has_patch = bool(stats.get("has_patch", False))
+        tracker.scalar(has_patch=float(has_patch))
+
+        if reward <= 0:
+            infra_failure = exit_code != "success"
+            tracker.scalar(
+                **{
+                    "zero/infra": float(infra_failure),
+                    "zero/no_patch": float(not infra_failure and not has_patch),
+                    "zero/real_failure": float(not infra_failure and has_patch),
+                }
+            )
+
+        tool_call_failed = stats.get("tool_call_failed")
+        if tool_call_failed is not None:
+            tracker.scalar(tool_call_failed=float(tool_call_failed))
+    except Exception as e:  # metrics must never take down a rollout
+        logger.warning(f"Failed to log episode outcome: {e}")
 
 
 def _default_aweagent_root() -> str:
@@ -260,6 +325,8 @@ class SWEAgentWorkflow:
                 f"TIMEOUT: Instance {instance_id} exceeded {self.timeout}s "
                 f"(elapsed: {elapsed:.1f}s). Discarding trajectory."
             )
+            # _run_episode is cancelled here, so it never reports this one.
+            _log_episode_outcome(0.0, exit_code="areal_timeout")
             raise
 
         elapsed = time.time() - start_time
@@ -304,7 +371,7 @@ class SWEAgentWorkflow:
 
         result_dir = os.getenv("LOG_DIR", "./logs")
         try:
-            reward, _ = await run_agent_with_reward(
+            reward, stats = await run_agent_with_reward(
                 data,
                 agent_type=agent_type,
                 agent_config=config_name,
@@ -331,6 +398,8 @@ class SWEAgentWorkflow:
             logger.error(
                 f"[{instance_id}] Episode error: {e}\n{traceback.format_exc()}"
             )
+            _log_episode_outcome(0.0, exit_code="areal_exception")
             return 0.0
 
+        _log_episode_outcome(float(reward), stats=stats)
         return float(reward)
