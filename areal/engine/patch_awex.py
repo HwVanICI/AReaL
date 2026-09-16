@@ -21,4 +21,4 @@ def _patch_vllm_expert_names():
 
 
 def patch_awex():
-    _patch_vllm_expert_names()
+    pass
