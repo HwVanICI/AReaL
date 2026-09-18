@@ -5,10 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from areal.api.cli_args import MicroBatchSpec
+from areal.api.cli_args import MicroBatchSpec, NormConfig, PPOActorConfig
 from areal.trainer.ppo import actor as actor_module
 from areal.trainer.ppo.actor import (
     PPOActor,
+    _atomic_row_group_sizes,
     _trajectory_row_group_sizes,
     trajectory_token_weights,
 )
@@ -407,3 +408,138 @@ class TestTrajMean:
         assert reduction.aggregate(
             packed_loss, packed_mask, unit_weights=packed_weights
         ).item() == pytest.approx(5.4)
+
+
+class TestPromptMean:
+    """One rollout group carries weight one, pooling its tokens.
+
+    The fixture's two trajectories stand in for a group of two rollouts: 10
+    masked tokens summing to 28, and 4 summing to 32.
+    """
+
+    def _weights(self):
+        return trajectory_token_weights(TRAJ_MASK, TRAJ_BEGIN, 2)
+
+    def test_weights_sum_to_the_group_count(self):
+        assert self._weights().sum().item() == pytest.approx(1.0)
+
+    def test_hand_computed_value(self):
+        # Tokens pool across the group: (28 + 32) / (10 + 4).
+        reduction = PolicyGradientReduction("prompt-mean")
+        result = reduction.aggregate(TRAJ_LOSS, TRAJ_MASK, unit_weights=self._weights())
+        assert result.item() == pytest.approx(60.0 / 14.0)
+
+    def test_pooling_differs_from_averaging_rollouts(self):
+        """The longer rollout pulls the group mean; traj-mean gives 5.4."""
+        prompt = PolicyGradientReduction("prompt-mean").aggregate(
+            TRAJ_LOSS, TRAJ_MASK, unit_weights=self._weights()
+        )
+        traj = PolicyGradientReduction("traj-mean").aggregate(
+            TRAJ_LOSS,
+            TRAJ_MASK,
+            unit_weights=trajectory_token_weights(TRAJ_MASK, TRAJ_BEGIN),
+        )
+        assert prompt.item() == pytest.approx(60.0 / 14.0)
+        assert traj.item() == pytest.approx(5.4)
+
+    def test_a_group_of_one_is_traj_mean(self):
+        assert torch.allclose(
+            trajectory_token_weights(TRAJ_MASK, TRAJ_BEGIN, 1),
+            trajectory_token_weights(TRAJ_MASK, TRAJ_BEGIN),
+        )
+
+    @pytest.mark.parametrize(
+        "partition",
+        [
+            [[0], [1], [2], [3]],
+            [[0, 3], [1, 2]],
+            [[2], [0], [3], [1]],
+            [[0, 1, 2, 3]],
+        ],
+    )
+    def test_partitioning_does_not_change_the_result(self, partition):
+        """A group may be split across forward microbatches in one step."""
+        reduction = PolicyGradientReduction("prompt-mean")
+        weights = self._weights()
+        numerator = 0.0
+        denominator = 0.0
+        for rows in partition:
+            index = torch.tensor(rows)
+            mask, loss, unit = TRAJ_MASK[index], TRAJ_LOSS[index], weights[index]
+            local_mean = reduction.aggregate(loss, mask, unit_weights=unit)
+            local_weight = reduction.normalizer_fn(
+                {"loss_mask": mask, "unit_weights": unit}
+            )
+            numerator += local_mean.item() * local_weight.item()
+            denominator += local_weight.item()
+        assert numerator / denominator == pytest.approx(60.0 / 14.0, rel=1e-5)
+
+    def test_atomic_rows_cover_the_whole_group(self):
+        """A group spans its trajectories' rows, not one row per rollout."""
+        assert _trajectory_row_group_sizes(TRAJ_BEGIN, 4) == [3, 1]
+        assert _atomic_row_group_sizes(TRAJ_BEGIN, 4, 2) == [4]
+
+    def test_group_of_one_leaves_atomic_rows_per_trajectory(self):
+        assert _atomic_row_group_sizes(TRAJ_BEGIN, 4, 1) == [3, 1]
+
+    def test_incomplete_group_is_rejected_not_silently_shifted(self):
+        begin = torch.tensor([1, 0, 0, 1, 1], dtype=torch.int32)
+        mask = torch.ones(5, 4, dtype=torch.bool)
+        with pytest.raises(ValueError, match="do not divide into groups"):
+            trajectory_token_weights(mask, begin, 2)
+        with pytest.raises(ValueError, match="do not divide into groups"):
+            _atomic_row_group_sizes(begin, 5, 2)
+
+    def test_requires_unit_weights(self):
+        reduction = PolicyGradientReduction("prompt-mean")
+        with pytest.raises(ValueError, match="unit_weights are required"):
+            reduction.aggregate(TRAJ_LOSS, TRAJ_MASK)
+
+    def test_normalizer_requires_unit_weights(self):
+        reduction = PolicyGradientReduction("prompt-mean")
+        with pytest.raises(ValueError, match="unit_weights are required"):
+            reduction.normalizer_fn({"loss_mask": TRAJ_MASK})
+
+
+class TestPromptMeanConfig:
+    @staticmethod
+    def _grouped_norm(group_size=8):
+        return NormConfig(mean_level="group", std_level="group", group_size=group_size)
+
+    def test_inherits_group_size_from_reward_norm(self):
+        config = PPOActorConfig(
+            path="dummy",
+            loss_aggregation="prompt-mean",
+            reward_norm=self._grouped_norm(),
+        )
+        assert config.loss_aggregation_group_size == 8
+
+    def test_explicit_group_size_wins(self):
+        config = PPOActorConfig(
+            path="dummy",
+            loss_aggregation="prompt-mean",
+            loss_aggregation_group_size=4,
+            reward_norm=self._grouped_norm(8),
+        )
+        assert config.loss_aggregation_group_size == 4
+
+    def test_batch_level_norm_is_not_inherited(self):
+        """group_size sits at its unused default there, and 1 is not a group."""
+        with pytest.raises(ValueError, match="needs the number of"):
+            PPOActorConfig(
+                path="dummy",
+                loss_aggregation="prompt-mean",
+                reward_norm=NormConfig(mean_level="batch", std_level="batch"),
+            )
+
+    def test_no_reward_norm_needs_an_explicit_size(self):
+        with pytest.raises(ValueError, match="needs the number of"):
+            PPOActorConfig(path="dummy", loss_aggregation="prompt-mean")
+
+    def test_group_size_rejected_for_other_modes(self):
+        with pytest.raises(ValueError, match="only used when"):
+            PPOActorConfig(
+                path="dummy",
+                loss_aggregation="traj-mean",
+                loss_aggregation_group_size=8,
+            )
