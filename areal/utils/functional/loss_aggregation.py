@@ -10,8 +10,18 @@ from typing import Any, Literal
 
 import torch
 
-LossAggregationMode = Literal["token-mean", "seq-mean", "traj-mean", "constant"]
-_LOSS_AGGREGATIONS = ("token-mean", "seq-mean", "traj-mean", "constant")
+LossAggregationMode = Literal[
+    "token-mean", "seq-mean", "traj-mean", "prompt-mean", "constant"
+]
+_LOSS_AGGREGATIONS = (
+    "token-mean",
+    "seq-mean",
+    "traj-mean",
+    "prompt-mean",
+    "constant",
+)
+# Reductions carrying their denominator as a precomputed per-token column.
+_WEIGHTED_AGGREGATIONS = ("traj-mean", "prompt-mean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,12 +31,13 @@ class PolicyGradientReduction:
     The training engine combines microbatches as
     ``sum(local_mean * local_weight) / sum(local_weight)``.
 
-    ``traj-mean`` instead takes a precomputed per-token ``unit_weights`` column
-    holding ``1 / (tokens in this token's trajectory)``. PPO optimizer
-    minibatches keep trajectory rows atomic. Within one optimizer step, the
-    trajectory may still be split across forward microbatches and data-parallel
-    ranks: summing the weights recovers the trajectory count, which is exactly
-    the denominator the engine divides by.
+    ``traj-mean`` and ``prompt-mean`` instead take a precomputed per-token
+    ``unit_weights`` column holding ``1 / (tokens in this token's unit)`` -- the
+    unit being one trajectory, or one whole rollout group. PPO optimizer
+    minibatches keep a unit's rows atomic. Within one optimizer step the unit
+    may still be split across forward microbatches and data-parallel ranks:
+    summing the weights recovers the unit count, which is exactly the
+    denominator the engine divides by.
     """
 
     mode: LossAggregationMode = "token-mean"
@@ -56,7 +67,7 @@ class PolicyGradientReduction:
         loss_mask = data["loss_mask"].bool()
         if self.mode == "token-mean":
             return loss_mask.count_nonzero()
-        if self.mode == "traj-mean":
+        if self.mode in _WEIGHTED_AGGREGATIONS:
             return self._unit_weight_sum(data.get("unit_weights"))
 
         self._require_sequence_boundaries(loss_mask, data.get("cu_seqlens"))
@@ -88,7 +99,7 @@ class PolicyGradientReduction:
             numerator = torch.where(numerator_mask, loss, 0).sum()
             return numerator / denominator_mask.count_nonzero().clamp_min(1)
 
-        if self.mode == "traj-mean":
+        if self.mode in _WEIGHTED_AGGREGATIONS:
             weights = self._require_unit_weights(loss, unit_weights)
             numerator = (self._masked_loss(loss, numerator_mask) * weights).sum()
             return numerator / self._unit_weight_sum(weights).clamp_min(
@@ -112,7 +123,8 @@ class PolicyGradientReduction:
     def _unit_weight_sum(unit_weights: torch.Tensor | None) -> torch.Tensor:
         if unit_weights is None:
             raise ValueError(
-                "unit_weights are required for loss_aggregation='traj-mean'."
+                "unit_weights are required for loss_aggregation in "
+                f"{_WEIGHTED_AGGREGATIONS}."
             )
         return unit_weights.to(torch.float32).sum()
 
@@ -122,7 +134,8 @@ class PolicyGradientReduction:
     ) -> torch.Tensor:
         if unit_weights is None:
             raise ValueError(
-                "unit_weights are required for loss_aggregation='traj-mean'."
+                "unit_weights are required for loss_aggregation in "
+                f"{_WEIGHTED_AGGREGATIONS}."
             )
         if unit_weights.shape != loss.shape:
             raise ValueError(
