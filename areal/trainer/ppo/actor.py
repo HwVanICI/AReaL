@@ -339,16 +339,25 @@ class PPOActor:
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
-        trajectory_group_sizes = None
-        if self.config.loss_aggregation == "traj-mean":
+        atomic_row_groups = None
+        if self.config.loss_aggregation in ("traj-mean", "prompt-mean"):
             begin_of_trajectory = data.get("begin_of_trajectory")
-            data["unit_weights"] = trajectory_token_weights(
-                data["loss_mask"], begin_of_trajectory
+            # prompt-mean pools a whole rollout group; traj-mean stops at one
+            # trajectory, which is the same thing with a group of one.
+            trajectories_per_group = (
+                self.config.loss_aggregation_group_size
+                if self.config.loss_aggregation == "prompt-mean"
+                else 1
             )
-            # Keep trajectory rows atomic only across optimizer minibatches.
+            data["unit_weights"] = trajectory_token_weights(
+                data["loss_mask"], begin_of_trajectory, trajectories_per_group
+            )
+            # Keep a unit's rows atomic only across optimizer minibatches.
             # Engine-internal forward microbatches may still split them.
-            trajectory_group_sizes = _trajectory_row_group_sizes(
-                begin_of_trajectory, data["loss_mask"].shape[0]
+            atomic_row_groups = _atomic_row_group_sizes(
+                begin_of_trajectory,
+                data["loss_mask"].shape[0],
+                trajectories_per_group,
             )
         for key in ["rewards", "tot_rewards", "kl_rewards", "begin_of_trajectory"]:
             data.pop(key, None)
@@ -357,7 +366,7 @@ class PPOActor:
         mb_inputs = split_padded_tensor_dict_into_mb_list(
             data,
             mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
-            atomic_group_sizes=trajectory_group_sizes,
+            atomic_group_sizes=atomic_row_groups,
         )
 
         with stats_tracker.scope("update"):
@@ -495,19 +504,64 @@ def _trajectory_row_group_sizes(
     ]
 
 
+def _atomic_row_group_sizes(
+    begin_of_trajectory: torch.Tensor | None,
+    n_rows: int,
+    trajectories_per_group: int = 1,
+) -> list[int]:
+    """Row counts that must not be split across PPO optimizer minibatches.
+
+    One trajectory for ``traj-mean``; one whole rollout group for
+    ``prompt-mean``. A group spans however many rows its trajectories happen to
+    occupy, which is not ``trajectories_per_group`` whenever context compaction
+    exported a rollout as several rows.
+    """
+    trajectory_rows = _trajectory_row_group_sizes(begin_of_trajectory, n_rows)
+    if trajectories_per_group <= 1:
+        return trajectory_rows
+    _require_whole_groups(len(trajectory_rows), trajectories_per_group)
+    return [
+        sum(trajectory_rows[i : i + trajectories_per_group])
+        for i in range(0, len(trajectory_rows), trajectories_per_group)
+    ]
+
+
+def _require_whole_groups(n_trajectories: int, trajectories_per_group: int) -> None:
+    """Refuse to group when a rollout group is missing members.
+
+    Grouping by a fixed stride silently shifts every later window when one
+    group is short, mixing unrelated tasks into a single denominator. That is
+    invisible downstream, so it has to fail here.
+    """
+    if n_trajectories % trajectories_per_group:
+        raise ValueError(
+            f"{n_trajectories} trajectories do not divide into groups of "
+            f"{trajectories_per_group}; a rollout group lost members, and "
+            "grouping by a fixed stride would mix tasks together."
+        )
+
+
 def trajectory_token_weights(
     loss_mask: torch.Tensor,
     begin_of_trajectory: torch.Tensor | None,
+    trajectories_per_group: int = 1,
 ) -> torch.Tensor:
-    """Per-token reciprocal of the token count of the trajectory it belongs to.
+    """Per-token reciprocal of the token count of the unit it belongs to.
 
-    Summing this column over a batch yields the number of trajectories in it,
-    so ``traj-mean`` can use it as both the loss weight and the engine weight
-    without requiring a trajectory to stay inside one microbatch.
+    The unit is one trajectory by default, which is what ``traj-mean`` divides
+    by. ``prompt-mean`` passes ``trajectories_per_group`` so consecutive
+    trajectories pool into their rollout group: each group then carries total
+    weight one, and inside a group a longer rollout contributes more tokens and
+    so weighs more. That is the upstream prompt-mean semantics -- a token mean
+    within the group, not an average of per-rollout means.
+
+    Summing this column over a batch yields the number of units in it, so the
+    reduction can use it as both the loss weight and the engine weight without
+    requiring a unit to stay inside one forward microbatch.
 
     ``begin_of_trajectory`` marks the first row of every agent rollout. When it
     is absent the workflow emits one row per rollout, so each row counts as its
-    own trajectory and the result matches ``seq-mean``.
+    own trajectory and ``traj-mean`` matches ``seq-mean``.
     """
     mask = loss_mask.bool()
     n_rows = mask.shape[0]
@@ -526,14 +580,21 @@ def trajectory_token_weights(
                 "the first row must begin a trajectory, but begin_of_trajectory[0] is 0"
             )
     n_trajs = int(row_to_traj[-1].item()) + 1
+    if trajectories_per_group > 1:
+        _require_whole_groups(n_trajs, trajectories_per_group)
+        row_to_unit = row_to_traj // trajectories_per_group
+        n_units = n_trajs // trajectories_per_group
+    else:
+        row_to_unit = row_to_traj
+        n_units = n_trajs
     tokens_per_row = mask.sum(dim=-1, dtype=torch.float32)
-    tokens_per_traj = torch.zeros(
-        n_trajs, dtype=torch.float32, device=mask.device
-    ).scatter_add_(0, row_to_traj, tokens_per_row)
-    # Empty trajectories contribute no unmasked token, so the clamp only keeps
-    # the division defined; their weights stay zero.
-    row_weights = 1.0 / tokens_per_traj.clamp_min(1.0)
-    return mask.to(torch.float32) * row_weights[row_to_traj].unsqueeze(-1)
+    tokens_per_unit = torch.zeros(
+        n_units, dtype=torch.float32, device=mask.device
+    ).scatter_add_(0, row_to_unit, tokens_per_row)
+    # Empty units contribute no unmasked token, so the clamp only keeps the
+    # division defined; their weights stay zero.
+    row_weights = 1.0 / tokens_per_unit.clamp_min(1.0)
+    return mask.to(torch.float32) * row_weights[row_to_unit].unsqueeze(-1)
 
 
 def grpo_loss_fn(

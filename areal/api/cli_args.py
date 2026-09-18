@@ -1693,6 +1693,9 @@ class PPOActorConfig(TrainEngineConfig):
             "'seq-mean': average per-response token means. "
             "'traj-mean': average per-trajectory token means, so an agent "
             "rollout exported as several rows still counts once. "
+            "'prompt-mean': give every rollout group weight one and pool its "
+            "tokens, so a longer rollout weighs more inside its group; set "
+            "loss_aggregation_group_size to the rollouts per prompt. "
             "'constant': average each response's masked token sum divided by "
             "loss_aggregation_divisor. Non-token modes require sequence "
             "boundaries; tree-packed actor training currently supports only "
@@ -1701,6 +1704,7 @@ class PPOActorConfig(TrainEngineConfig):
                 "token-mean",
                 "seq-mean",
                 "traj-mean",
+                "prompt-mean",
                 "constant",
             ],
         },
@@ -1710,6 +1714,15 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={
             "help": "Positive fixed denominator L for loss_aggregation='constant'. "
             "Unused by other loss aggregation modes.",
+        },
+    )
+    loss_aggregation_group_size: int | None = field(
+        default=None,
+        metadata={
+            "help": "Rollouts per prompt, for loss_aggregation='prompt-mean'. "
+            "Left unset it is inherited from reward_norm.group_size, which the "
+            "config templates already tie to gconfig.n_samples. Unused by "
+            "other loss aggregation modes.",
         },
     )
 
@@ -1747,11 +1760,42 @@ class PPOActorConfig(TrainEngineConfig):
             "token-mean",
             "seq-mean",
             "traj-mean",
+            "prompt-mean",
             "constant",
         ):
             raise ValueError(
                 "loss_aggregation must be 'token-mean', 'seq-mean', "
-                f"'traj-mean', or 'constant', got {self.loss_aggregation!r}."
+                f"'traj-mean', 'prompt-mean', or 'constant', got "
+                f"{self.loss_aggregation!r}."
+            )
+        if self.loss_aggregation == "prompt-mean":
+            if self.loss_aggregation_group_size is None:
+                # Rollouts per prompt is the same quantity the reward
+                # normalizer groups by. Inherit it only where group
+                # normalization is actually on: elsewhere group_size is left
+                # at its unused default of one, and silently taking that
+                # would turn prompt-mean into traj-mean.
+                levels = (
+                    getattr(self.reward_norm, "mean_level", None),
+                    getattr(self.reward_norm, "std_level", None),
+                )
+                if "group" not in levels:
+                    raise ValueError(
+                        "loss_aggregation='prompt-mean' needs the number of "
+                        "rollouts per prompt. Set loss_aggregation_group_size, "
+                        "or enable group-level reward_norm to inherit it from "
+                        "reward_norm.group_size."
+                    )
+                self.loss_aggregation_group_size = self.reward_norm.group_size
+            if self.loss_aggregation_group_size < 1:
+                raise ValueError(
+                    "loss_aggregation_group_size must be a positive integer, "
+                    f"got {self.loss_aggregation_group_size}."
+                )
+        elif self.loss_aggregation_group_size is not None:
+            raise ValueError(
+                "loss_aggregation_group_size is only used when "
+                "loss_aggregation='prompt-mean'."
             )
         if self.loss_aggregation == "constant":
             if (
