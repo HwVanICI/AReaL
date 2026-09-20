@@ -117,6 +117,19 @@ ls -la
 </tool_call><|im_end|>"""
 
 
+def test_tool_names_from_definitions_supports_chat_and_responses_tools():
+    tools = [
+        {"type": "function", "function": {"name": "bash"}},
+        {"type": "function", "name": "read"},
+        {"type": "custom", "name": "shell"},
+        {"type": "web_search"},
+    ]
+
+    assert parser_module.tool_names_from_definitions(tools) == frozenset(
+        {"bash", "read", "shell"}
+    )
+
+
 def _assert_tool_calls(tool_calls, new_text: str, new_finish_reason: str) -> None:
     assert new_finish_reason == "tool_calls"
     assert tool_calls is not None, "Tool calls should be detected and returned"

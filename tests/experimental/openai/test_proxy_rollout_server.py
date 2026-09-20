@@ -569,6 +569,7 @@ class TestExportTrajectories:
                 "n_turns": 0,
                 "generated_tokens": 0,
                 "tool_counts": {},
+                "invalid_tool_calls": 0,
             }
 
     @pytest.mark.asyncio
