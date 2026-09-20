@@ -231,6 +231,7 @@ def test_behaviour_metrics_count_all_turns_before_concat_filter():
         ],
         model_response=MagicMock(output_tokens=[1, 2, 3]),
         chat_template_type="concat",
+        declared_tool_names=frozenset({"read"}),
     )
     i1.interaction_id = "1"
     i2 = InteractionWithTokenLogpReward(
@@ -246,11 +247,14 @@ def test_behaviour_metrics_count_all_turns_before_concat_filter():
                 "tool_calls": [
                     {"function": {"name": "bash"}},
                     {"function": {"name": "bash"}},
+                    {"function": {"name": "unknown"}},
+                    {"function": {"name": "bad\nname"}},
                 ],
             }
         ],
         model_response=MagicMock(output_tokens=[4, 5, 6, 7, 8]),
         chat_template_type="concat",
+        declared_tool_names=frozenset({"bash", "bad\nname"}),
     )
     i2.interaction_id = "2"
     cache = InteractionCache()
@@ -265,6 +269,7 @@ def test_behaviour_metrics_count_all_turns_before_concat_filter():
         "n_turns": 2,
         "generated_tokens": 8,
         "tool_counts": {"read": 1, "bash": 2},
+        "invalid_tool_calls": 2,
     }
 
 

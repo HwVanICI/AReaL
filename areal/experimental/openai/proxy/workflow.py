@@ -54,13 +54,15 @@ def _log_interaction_behaviour_metrics(metrics: dict[str, Any]) -> None:
         return
     generated = metrics["generated_tokens"]
     tool_counts = metrics["tool_counts"]
-    calls = sum(tool_counts.values())
+    invalid_calls = metrics["invalid_tool_calls"]
+    calls = sum(tool_counts.values()) + invalid_calls
     tracker = stats_tracker.get(workflow_context.stat_scope())
     tracker.scalar(
         n_turns=turns,
         generated_tokens_per_turn=generated / turns,
         tool_calls=calls,
         tool_calls_per_turn=calls / turns,
+        invalid_tool_calls=invalid_calls,
     )
     for name, count in tool_counts.items():
         tracker.scalar(**{f"tool/{name}": count})
