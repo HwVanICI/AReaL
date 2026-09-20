@@ -563,7 +563,13 @@ class TestExportTrajectories:
                 json={"session_id": session_id},
             )
             assert resp_export.status_code == 200
-            assert "interactions" in resp_export.json()
+            payload = resp_export.json()
+            assert "interactions" in payload
+            assert payload["behaviour_metrics"] == {
+                "n_turns": 0,
+                "generated_tokens": 0,
+                "tool_counts": {},
+            }
 
     @pytest.mark.asyncio
     async def test_group_exports_share_multimodal_tensor_reference(self):

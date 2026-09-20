@@ -4,7 +4,7 @@ import json
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -81,6 +81,34 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
     @property
     def total_reward(self) -> float:
         return self._total_reward
+
+    def behaviour_metrics(self) -> dict[str, Any]:
+        """Summarize completed model turns independently of export filtering."""
+        n_turns = 0
+        generated_tokens = 0
+        tool_counts: Counter[str] = Counter()
+        for interaction in self.values():
+            if (
+                interaction.model_response is None
+                or interaction.output_message_list is None
+            ):
+                continue
+            n_turns += 1
+            generated_tokens += len(interaction.model_response.output_tokens)
+            for output in interaction.output_message_list:
+                for call in output.get("tool_calls") or []:
+                    name = (call.get("function") or {}).get("name")
+                    if name:
+                        tool_counts[name] += 1
+                if output.get("type") in {"function_call", "custom_tool_call"}:
+                    name = output.get("name")
+                    if name:
+                        tool_counts[name] += 1
+        return {
+            "n_turns": n_turns,
+            "generated_tokens": generated_tokens,
+            "tool_counts": dict(tool_counts),
+        }
 
     def set_reward(self, interaction_id: str, reward: float) -> None:
         """Set reward for a specific completion/response by its ID."""
