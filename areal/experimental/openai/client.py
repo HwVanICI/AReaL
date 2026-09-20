@@ -57,7 +57,10 @@ from pydantic import BaseModel
 from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai.cache import InteractionCache
-from areal.experimental.openai.tool_call_parser import process_tool_calls
+from areal.experimental.openai.tool_call_parser import (
+    process_tool_calls,
+    tool_names_from_definitions,
+)
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCallCache
 from areal.utils import logging
@@ -1058,6 +1061,10 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             if not isinstance(tools, Iterable):
                 raise TypeError("tools must be an iterable of ChatCompletionToolParam")
             tools_list = list(tools)
+        if interaction is not None:
+            interaction.declared_tool_names = tool_names_from_definitions(
+                tools_list or []
+            )
 
         image_data, messages_for_tokenizer, _ = _extract_images_from_messages(
             messages_list
@@ -1577,6 +1584,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             if not isinstance(tools, Iterable):
                 raise TypeError("tools must be an iterable of ChatCompletionToolParam")
             tools_list = list(tools)
+        interaction.declared_tool_names = tool_names_from_definitions(tools_list or [])
 
         image_data, messages_for_tokenizer, _ = _extract_images_from_messages(
             messages_list

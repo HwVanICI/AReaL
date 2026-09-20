@@ -86,6 +86,21 @@ def _iter_tool_definitions(tools: list[Any]) -> list[dict[str, Any]]:
     return tool_defs
 
 
+def tool_names_from_definitions(tools: list[Any]) -> frozenset[str]:
+    """Return the function names declared by chat or Responses API tools."""
+    names: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_def = tool.get("function")
+        if not isinstance(tool_def, dict):
+            tool_def = tool
+        name = tool_def.get("name")
+        if isinstance(name, str):
+            names.add(name)
+    return frozenset(names)
+
+
 def _tool_argument_schemas(tools: list[Any]) -> dict[str, dict[str, dict[str, Any]]]:
     schemas: dict[str, dict[str, dict[str, Any]]] = {}
     for tool_def in _iter_tool_definitions(tools):

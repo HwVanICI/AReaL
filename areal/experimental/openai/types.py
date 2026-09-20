@@ -68,6 +68,10 @@ class InteractionWithTokenLogpReward:
     trajectory_metadata: dict[str, str] = field(default_factory=dict)
     _cache: dict[str, torch.Tensor] | None = None
 
+    # Request-scoped telemetry state. Kept only in the live proxy cache so
+    # behavior metrics can distinguish declared tools from malformed names.
+    declared_tool_names: frozenset[str] = field(default_factory=frozenset)
+
     # Vision payload for VLM training. ``mm_token_type_ids`` covers the prompt
     # only (it is extended with zeros over the output at tensor-dict time);
     # ``multi_modal_input`` holds a single dict for the whole sequence, matching

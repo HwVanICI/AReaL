@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import threading
 import time
 from collections import Counter, OrderedDict
@@ -13,6 +14,8 @@ from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
 
 logger = logging.getLogger("OpenAICache")
+
+_TOOL_METRIC_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # Debug-only: dumping mismatched parent/child messages is OFF by default because
 # the payloads can contain full conversations. Set the dump dir env var to opt in.
@@ -86,7 +89,20 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         """Summarize completed model turns independently of export filtering."""
         n_turns = 0
         generated_tokens = 0
+        invalid_tool_calls = 0
         tool_counts: Counter[str] = Counter()
+
+        def record_tool_call(name: Any, declared_names: frozenset[str]) -> None:
+            nonlocal invalid_tool_calls
+            if (
+                isinstance(name, str)
+                and name in declared_names
+                and _TOOL_METRIC_NAME_RE.fullmatch(name)
+            ):
+                tool_counts[name] += 1
+            else:
+                invalid_tool_calls += 1
+
         for interaction in self.values():
             if (
                 interaction.model_response is None
@@ -98,16 +114,15 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
             for output in interaction.output_message_list:
                 for call in output.get("tool_calls") or []:
                     name = (call.get("function") or {}).get("name")
-                    if name:
-                        tool_counts[name] += 1
+                    record_tool_call(name, interaction.declared_tool_names)
                 if output.get("type") in {"function_call", "custom_tool_call"}:
                     name = output.get("name")
-                    if name:
-                        tool_counts[name] += 1
+                    record_tool_call(name, interaction.declared_tool_names)
         return {
             "n_turns": n_turns,
             "generated_tokens": generated_tokens,
             "tool_counts": dict(tool_counts),
+            "invalid_tool_calls": invalid_tool_calls,
         }
 
     def set_reward(self, interaction_id: str, reward: float) -> None:

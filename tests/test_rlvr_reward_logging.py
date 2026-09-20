@@ -62,13 +62,15 @@ def test_agent_behaviour_metrics_use_exported_session_summary():
             "n_turns": 4,
             "generated_tokens": 100,
             "tool_counts": {"read": 1, "bash": 3},
+            "invalid_tool_calls": 2,
         }
     )
 
     stats = stats_tracker.export_all(reset=True)
     assert stats["rollout/n_turns"] == 4
     assert stats["rollout/generated_tokens_per_turn"] == 25
-    assert stats["rollout/tool_calls"] == 4
-    assert stats["rollout/tool_calls_per_turn"] == 1
+    assert stats["rollout/tool_calls"] == 6
+    assert stats["rollout/tool_calls_per_turn"] == 1.5
+    assert stats["rollout/invalid_tool_calls"] == 2
     assert stats["rollout/tool/read"] == 1
     assert stats["rollout/tool/bash"] == 3
