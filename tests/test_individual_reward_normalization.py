@@ -85,6 +85,7 @@ async def test_discounted_individual_rows_keep_episode_reference(
     class ProxyClient:
         session_api_key = "test-session"
         session_id = "session-1"
+        behaviour_metrics = {"n_turns": 0, "generated_tokens": 0, "tool_counts": {}}
 
         async def __aenter__(self):
             return self

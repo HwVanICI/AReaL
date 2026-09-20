@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from areal.experimental.openai.proxy.workflow import (
+    _log_interaction_behaviour_metrics,
     _log_interaction_reward_metrics,
 )
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -53,3 +54,21 @@ def test_agent_reward_metrics_records_domain_reward():
     assert stats["rollout/reward"] == pytest.approx(1.0)
     assert stats["rollout/reward/leetcode"] == pytest.approx(1.0)
     assert stats["rollout/n_seqs/leetcode"] == 2
+
+
+def test_agent_behaviour_metrics_use_exported_session_summary():
+    _log_interaction_behaviour_metrics(
+        {
+            "n_turns": 4,
+            "generated_tokens": 100,
+            "tool_counts": {"read": 1, "bash": 3},
+        }
+    )
+
+    stats = stats_tracker.export_all(reset=True)
+    assert stats["rollout/n_turns"] == 4
+    assert stats["rollout/generated_tokens_per_turn"] == 25
+    assert stats["rollout/tool_calls"] == 4
+    assert stats["rollout/tool_calls_per_turn"] == 1
+    assert stats["rollout/tool/read"] == 1
+    assert stats["rollout/tool/bash"] == 3

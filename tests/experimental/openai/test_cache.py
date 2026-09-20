@@ -218,6 +218,56 @@ def test_export_interactions_concat_style(mock_interaction):
     assert i1.parent is None
 
 
+def test_behaviour_metrics_count_all_turns_before_concat_filter():
+    """A concat leaf must retain behaviour statistics from all model turns."""
+    i1 = InteractionWithTokenLogpReward(
+        messages=[{"role": "user", "content": "inspect"}],
+        output_message_list=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "read"}}],
+            }
+        ],
+        model_response=MagicMock(output_tokens=[1, 2, 3]),
+        chat_template_type="concat",
+    )
+    i1.interaction_id = "1"
+    i2 = InteractionWithTokenLogpReward(
+        messages=[
+            *i1.messages,
+            *i1.output_message_list,
+            {"role": "tool", "content": "file contents"},
+        ],
+        output_message_list=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "bash"}},
+                    {"function": {"name": "bash"}},
+                ],
+            }
+        ],
+        model_response=MagicMock(output_tokens=[4, 5, 6, 7, 8]),
+        chat_template_type="concat",
+    )
+    i2.interaction_id = "2"
+    cache = InteractionCache()
+    cache["1"] = i1
+    cache["2"] = i2
+
+    exported = cache.export_interactions(style="concat")
+    metrics = cache.behaviour_metrics()
+
+    assert list(exported) == ["2"]
+    assert metrics == {
+        "n_turns": 2,
+        "generated_tokens": 8,
+        "tool_counts": {"read": 1, "bash": 2},
+    }
+
+
 def test_export_interactions_concat_style_output_be_refactored(mock_interaction):
     """
     Tests that if a parent's response is refactored (e.g. 'think' tokens removed),

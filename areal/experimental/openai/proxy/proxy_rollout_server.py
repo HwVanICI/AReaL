@@ -1224,6 +1224,7 @@ async def export_trajectories(
         discount=request.discount,
         style=request.style,
     )
+    behaviour_metrics = session_data.completions.behaviour_metrics()
 
     # Remove session from cache and clean up API key mapping
     with _lock:
@@ -1245,6 +1246,7 @@ async def export_trajectories(
     serialized = serialize_interactions(interactions, tensor_store=tensor_store)
     return ExportTrajectoriesResponse(
         interactions=serialized,
+        behaviour_metrics=behaviour_metrics,
         tensor_reference_group_id=tensor_reference_group_id,
     )
 
