@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from pydantic import BaseModel
@@ -110,6 +110,7 @@ class OpenAIProxyClient:
             self._shared_tensor_resolver = SharedTensorResolver()
         self.session_id: str | None = None
         self._session_api_key: str | None = None
+        self.behaviour_metrics: dict[str, Any] = {}
 
     @property
     def session_api_key(self) -> str:
@@ -202,6 +203,7 @@ class OpenAIProxyClient:
             resp.raise_for_status()
             data = await resp.json()
 
+        self.behaviour_metrics = data["behaviour_metrics"]
         serialized_interactions = data["interactions"]
         tensor_group_id = data.get("tensor_reference_group_id")
         if tensor_group_id is not None:
