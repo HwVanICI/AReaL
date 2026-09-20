@@ -6,7 +6,6 @@ import asyncio
 import atexit
 import os
 import threading
-from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from typing import TYPE_CHECKING, Any
 
@@ -41,9 +40,7 @@ _executor_lock = threading.Lock()
 _executor_max_workers: int | None = None
 
 
-def _log_interaction_behaviour_metrics(
-    interactions: dict[str, InteractionWithTokenLogpReward],
-) -> None:
+def _log_interaction_behaviour_metrics(metrics: dict[str, Any]) -> None:
     """Record what the policy did, not how well it did.
 
     Sequence length is dominated by tool output -- a large file read moves it
@@ -52,38 +49,21 @@ def _log_interaction_behaviour_metrics(
     rather than the raw text, so the count follows whatever the harness's
     parser already agreed the call was.
     """
-    if not interactions:
+    turns = metrics["n_turns"]
+    if turns == 0:
         return
-    try:
-        tracker = stats_tracker.get(workflow_context.stat_scope())
-        generated = 0
-        tool_counts: Counter[str] = Counter()
-        for interaction in interactions.values():
-            response = interaction.model_response
-            if response is not None:
-                generated += len(response.output_tokens)
-            completion = interaction.completion
-            if completion is None or not completion.choices:
-                continue
-            for call in (
-                getattr(completion.choices[0].message, "tool_calls", None) or []
-            ):
-                name = getattr(getattr(call, "function", None), "name", None)
-                if name:
-                    tool_counts[str(name)] += 1
-
-        turns = len(interactions)
-        calls = sum(tool_counts.values())
-        tracker.scalar(
-            n_turns=float(turns),
-            generated_tokens_per_turn=generated / turns,
-            tool_calls=float(calls),
-            tool_calls_per_turn=calls / turns,
-        )
-        for name, count in tool_counts.items():
-            tracker.scalar(**{f"tool/{name}": float(count)})
-    except Exception as e:  # metrics must never take down a rollout
-        logger.warning(f"Failed to log interaction behaviour metrics: {e}")
+    generated = metrics["generated_tokens"]
+    tool_counts = metrics["tool_counts"]
+    calls = sum(tool_counts.values())
+    tracker = stats_tracker.get(workflow_context.stat_scope())
+    tracker.scalar(
+        n_turns=turns,
+        generated_tokens_per_turn=generated / turns,
+        tool_calls=calls,
+        tool_calls_per_turn=calls / turns,
+    )
+    for name, count in tool_counts.items():
+        tracker.scalar(**{f"tool/{name}": count})
 
 
 def _log_interaction_reward_metrics(
@@ -308,7 +288,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 return None
 
             _log_interaction_reward_metrics(interactions, data)
-            _log_interaction_behaviour_metrics(interactions)
+            _log_interaction_behaviour_metrics(proxy_client.behaviour_metrics)
             return interactions
 
         # ---- Normal mode (inline / subproc) ----
@@ -351,6 +331,6 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         )
 
         _log_interaction_reward_metrics(interactions, data)
-        _log_interaction_behaviour_metrics(interactions)
+        _log_interaction_behaviour_metrics(proxy_client.behaviour_metrics)
 
         return interactions
