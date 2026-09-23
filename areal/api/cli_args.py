@@ -1643,7 +1643,8 @@ class PPOActorConfig(TrainEngineConfig):
     use_decoupled_loss: bool = field(
         default=False,
         metadata={
-            "help": "Use the decoupled loss. Implicitly enables recompute_logprob."
+            "help": "Use the decoupled loss. prox_logp_method controls how the "
+            "proximal log-probability is obtained."
         },
     )
     rejection_sampling: RejectionSamplingConfig | None = field(
@@ -1668,6 +1669,7 @@ class PPOActorConfig(TrainEngineConfig):
             "help": "Method for computing proximal policy log-probabilities in decoupled PPO. "
             "Only effective when use_decoupled_loss=True. Options: "
             "'recompute' (default): Standard decoupled PPO, recompute proximal policy via forward pass. "
+            "'reuse': Reuse detached log-probabilities from the current training forward pass; requires ppo_n_minibatches=1. "
             "'loglinear': Use log-linear interpolation to approximate proximal policy (skip forward pass). "
             "'metrics': Like 'recompute', but also compute approximation metrics for evaluation.",
             "choices": PROX_LOGP_METHODS_ALL,
@@ -1704,6 +1706,20 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        from areal.utils.constants import ProxLogpMethod
+
+        method = ProxLogpMethod(self.prox_logp_method)
+        if method == ProxLogpMethod.REUSE:
+            if not self.use_decoupled_loss:
+                raise ValueError(
+                    "prox_logp_method='reuse' requires use_decoupled_loss=True."
+                )
+            if self.ppo_n_minibatches != 1:
+                raise ValueError(
+                    "prox_logp_method='reuse' requires ppo_n_minibatches=1, "
+                    f"got {self.ppo_n_minibatches}."
+                )
+
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(
