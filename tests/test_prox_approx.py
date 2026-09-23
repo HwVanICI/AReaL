@@ -12,6 +12,7 @@ from areal.utils.constants import (
     PROX_APPROX_METHOD_ROLLOUT,
     PROX_APPROX_METHODS_ALL,
     PROX_LOGP_METHOD_RECOMPUTE,
+    PROX_LOGP_METHOD_REUSE,
     PROX_LOGP_METHODS_ALL,
     ProxApproxMethod,
     ProxLogpMethod,
@@ -280,30 +281,35 @@ class TestProxLogpMethodEnum:
     def test_enum_values(self):
         """Test that enum values match expected strings."""
         assert ProxLogpMethod.RECOMPUTE.value == "recompute"
+        assert ProxLogpMethod.REUSE.value == "reuse"
         assert ProxLogpMethod.LOGLINEAR.value == "loglinear"
         assert ProxLogpMethod.METRICS.value == "metrics"
 
     def test_enum_from_string(self):
         """Test enum construction from string."""
         assert ProxLogpMethod("recompute") == ProxLogpMethod.RECOMPUTE
+        assert ProxLogpMethod("reuse") == ProxLogpMethod.REUSE
         assert ProxLogpMethod("loglinear") == ProxLogpMethod.LOGLINEAR
         assert ProxLogpMethod("metrics") == ProxLogpMethod.METRICS
 
     def test_skips_forward_pass(self):
         """Test the skips_forward_pass() helper method."""
         assert not ProxLogpMethod.RECOMPUTE.skips_forward_pass()
+        assert ProxLogpMethod.REUSE.skips_forward_pass()
         assert ProxLogpMethod.LOGLINEAR.skips_forward_pass()
         assert not ProxLogpMethod.METRICS.skips_forward_pass()
 
     def test_string_equality(self):
         """Test that enum compares equal to its string value (str, Enum behavior)."""
         assert ProxLogpMethod.RECOMPUTE == "recompute"
+        assert ProxLogpMethod.REUSE == "reuse"
         assert ProxLogpMethod.LOGLINEAR == "loglinear"
         assert ProxLogpMethod.METRICS == "metrics"
 
     def test_backward_compat_constants(self):
         """Test backward compatibility with old string constants."""
         assert PROX_LOGP_METHOD_RECOMPUTE == ProxLogpMethod.RECOMPUTE.value
+        assert PROX_LOGP_METHOD_REUSE == ProxLogpMethod.REUSE.value
         assert "loglinear" == ProxLogpMethod.LOGLINEAR.value
         assert "metrics" == ProxLogpMethod.METRICS.value
 
@@ -377,6 +383,10 @@ class TestComputeLogpOptimization:
         method_loglinear = ProxLogpMethod("loglinear")
         assert method_loglinear.skips_forward_pass() is True
 
+        # reuse method uses the training forward pass
+        method_reuse = ProxLogpMethod("reuse")
+        assert method_reuse.skips_forward_pass() is True
+
         # recompute method does forward pass
         method_recompute = ProxLogpMethod("recompute")
         assert method_recompute.skips_forward_pass() is False
@@ -392,6 +402,7 @@ class TestComputeLogpOptimization:
         # Test various configurations and verify expected call decision
         test_cases = [
             # (use_decoupled_loss, prox_logp_method, recompute_logprob, should_compute)
+            (True, "reuse", False, False),  # reuse uses training forward
             (True, "loglinear", False, False),  # loglinear skips
             (True, "recompute", False, True),  # recompute computes
             (True, "metrics", False, True),  # metrics computes
@@ -405,6 +416,7 @@ class TestComputeLogpOptimization:
                 use_decoupled_loss=use_decoupled,
                 prox_logp_method=method_str,
                 recompute_logprob=recompute_logprob,
+                ppo_n_minibatches=1 if method_str == "reuse" else 4,
             )
 
             method = ProxLogpMethod(config.prox_logp_method)
@@ -486,6 +498,71 @@ class TestGrpoLossFnNoneHandling:
                 current_version=5,
                 prox_logp_method="loglinear",
             )
+
+    def test_reuse_method_uses_detached_training_logprobs(self):
+        """Reuse mode uses theta logprobs without a second forward pass."""
+        from areal.trainer.ppo.actor import _resolve_proximal_logp
+
+        logprobs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
+
+        prox_logp = _resolve_proximal_logp(
+            prox_logp_gt=None,
+            prox_logp_method="reuse",
+            old_logp=torch.tensor([[-1.5, -2.5]]),
+            logprobs=logprobs,
+            versions=None,
+            current_version=None,
+        )
+
+        torch.testing.assert_close(prox_logp, logprobs, rtol=0, atol=0)
+        assert not prox_logp.requires_grad
+
+    def test_reuse_method_preserves_gradient_and_rollout_correction(self):
+        """Reuse mode keeps PPO gradients and corrects against behavior logp."""
+        from areal.api.cli_args import RejectionSamplingConfig
+        from areal.trainer.ppo.actor import _resolve_proximal_logp
+        from areal.utils.functional import ppo_actor_loss_fn
+
+        logprobs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
+        old_logprobs = torch.tensor([[-2.0, -2.5]])
+        prox_logp = _resolve_proximal_logp(
+            prox_logp_gt=None,
+            prox_logp_method="reuse",
+            old_logp=old_logprobs,
+            logprobs=logprobs,
+            versions=None,
+            current_version=None,
+        )
+
+        loss, stat = ppo_actor_loss_fn(
+            logprobs=logprobs,
+            proximal_logprobs=prox_logp,
+            old_logprobs=old_logprobs,
+            advantages=torch.ones_like(logprobs),
+            eps_clip=0.2,
+            loss_mask=torch.ones_like(logprobs, dtype=torch.bool),
+            rejection_sampling=RejectionSamplingConfig(
+                level="token", action="mask", metric="ratio", upper=5.0
+            ),
+        )
+        loss.backward()
+
+        expected_correction = torch.exp(logprobs.detach() - old_logprobs)
+        torch.testing.assert_close(
+            stat["importance_weight"],
+            torch.ones_like(logprobs),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            stat["behave_imp_weight"], expected_correction, rtol=1e-6, atol=1e-6
+        )
+        torch.testing.assert_close(
+            logprobs.grad,
+            -expected_correction / logprobs.numel(),
+            rtol=1e-6,
+            atol=1e-6,
+        )
 
     def test_grpo_loss_fn_computes_approximation_when_prox_logp_none(self):
         """Test that grpo_loss_fn() successfully computes approximation when prox_logp is None."""
@@ -641,6 +718,7 @@ class TestEndToEndOptimization:
 
         test_cases = [
             # (prox_logp_method, should_call_compute_logp, description)
+            ("reuse", False, "reuse -> use training forward"),
             ("loglinear", False, "loglinear -> skip forward (caller skips)"),
             ("recompute", True, "recompute -> do forward (caller calls)"),
             ("metrics", True, "metrics -> do forward (caller calls)"),
@@ -651,6 +729,7 @@ class TestEndToEndOptimization:
                 backend="fsdp:d1",
                 use_decoupled_loss=True,
                 prox_logp_method=method_str,
+                ppo_n_minibatches=1 if method_str == "reuse" else 4,
             )
 
             mock_engine = MagicMock()
@@ -703,12 +782,43 @@ class TestConfigValidation:
                 backend="fsdp:d1",
                 use_decoupled_loss=True,
                 prox_logp_method=method,
+                ppo_n_minibatches=1 if method == "reuse" else 4,
             )
             # Should not raise any errors
             mock_engine = MagicMock()
             mock_engine.module.config = MagicMock()
             actor = PPOActor(config, mock_engine)
             assert actor.config.prox_logp_method == method
+
+    def test_reuse_method_requires_single_minibatch(self):
+        """Reused proximal logp requires a single PPO minibatch."""
+        from areal.api.cli_args import PPOActorConfig
+
+        with pytest.raises(
+            ValueError,
+            match="prox_logp_method='reuse' requires ppo_n_minibatches=1",
+        ):
+            PPOActorConfig(
+                backend="fsdp:d1",
+                use_decoupled_loss=True,
+                prox_logp_method="reuse",
+                ppo_n_minibatches=2,
+            )
+
+    def test_reuse_method_requires_decoupled_loss(self):
+        """Reused proximal logp is only meaningful for decoupled PPO."""
+        from areal.api.cli_args import PPOActorConfig
+
+        with pytest.raises(
+            ValueError,
+            match="prox_logp_method='reuse' requires use_decoupled_loss=True",
+        ):
+            PPOActorConfig(
+                backend="fsdp:d1",
+                use_decoupled_loss=False,
+                prox_logp_method="reuse",
+                ppo_n_minibatches=1,
+            )
 
     def test_prox_logp_method_metadata_choices(self):
         """Test that prox_logp_method has correct choices in metadata."""
