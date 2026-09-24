@@ -559,7 +559,11 @@ def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
     causal_conv1d = None
     if os.environ.get("AREAL_DISABLE_NPU_GDN_CAUSAL_CONV1D") != "1":
         try:
-            from areal.engine.fsdp_utils.gdn_triton.causal_conv1d import causal_conv1d
+            try:
+                import fla_npu
+                from mindspeed.core.ssm.ops.npu_causal_conv1d import causal_conv1d
+            except:
+                from areal.engine.fsdp_utils.gdn_triton.causal_conv1d import causal_conv1d
         except ImportError as exc:
             logger.warning(
                 "Failed to import vendored NPU GDN causal_conv1d: %s. "
