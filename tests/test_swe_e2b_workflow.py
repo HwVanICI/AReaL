@@ -59,6 +59,36 @@ def test_configured_agent_config_selects_opencode_config():
 
 
 @pytest.mark.asyncio
+async def test_run_episode_raises_on_sandbox_initialization_failure(
+    monkeypatch, tmp_path
+):
+    run_agent = AsyncMock(
+        return_value=(0.0, {"env": "fail", "exit_code": "aenv_init_fail"})
+    )
+    lifecycle = ModuleType("aweagent.lifecycle")
+    lifecycle.run_agent_with_reward = run_agent
+    package = ModuleType("aweagent")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "aweagent", package)
+    monkeypatch.setitem(sys.modules, "aweagent.lifecycle", lifecycle)
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+    workflow = object.__new__(SWEAgentWorkflow)
+
+    with pytest.raises(RuntimeError, match="sandbox initialization failed"):
+        await workflow._run_episode(
+            data={"instance_id": "task-fail", "problem_statement": "fix"},
+            agent_type="opencode",
+            config_name="train_opencode_time3600",
+            base_url="http://proxy:9000",
+            api_key="trajectory-key",
+            llm_model="qwen3-coder",
+            opencode_provider="areal",
+            codex_provider=None,
+            sandbox_backend="e2b",
+        )
+
+
+@pytest.mark.asyncio
 async def test_run_episode_forwards_e2b_and_proxy_session(monkeypatch, tmp_path):
     run_agent = AsyncMock(return_value=(1.0, {"env": "success"}))
     lifecycle = ModuleType("aweagent.lifecycle")

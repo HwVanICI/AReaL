@@ -402,4 +402,9 @@ class SWEAgentWorkflow:
             return 0.0
 
         _log_episode_outcome(float(reward), stats=stats)
+        if stats.get("exit_code") == "aenv_init_fail":
+            raise RuntimeError(
+                f"{sandbox_backend} sandbox initialization failed for "
+                f"{data.get('instance_id', 'unknown')}; reject the rollout"
+            )
         return float(reward)
