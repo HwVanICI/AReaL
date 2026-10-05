@@ -13,7 +13,7 @@ class SWEEnvConfig:
     Attributes:
         dataset_path: Path to the SWE-bench JSONL dataset file.
         agent_type: AReaL-SWEAgent agent type to train: ``swe``, ``cc``,
-            ``codex``, or ``opencode``.
+            ``codex``, ``opencode``, or ``openhands``.
         sandbox_backend: Remote sandbox provider, ``aenv`` or ``e2b``.
         agent_config: Generic AReaL-SWEAgent config name. When set, this overrides
             the compatibility fields below.
@@ -21,6 +21,7 @@ class SWEEnvConfig:
         cc_agent_config: Compatibility config field for ``agent_type=cc``.
         codex_agent_config: Config field for ``agent_type=codex``.
         opencode_agent_config: Config field for ``agent_type=opencode``.
+        openhands_agent_config: Config field for the reference CodeAct harness.
         agent_root: Root directory of the bundled or external AReaL-SWEAgent checkout.
         swe_agent_root: Legacy alias for ``agent_root``.
         llm_model: Optional LLM model override for OH/OpenCode/Codex agents.
@@ -49,7 +50,7 @@ class SWEEnvConfig:
         metadata={
             "help": (
                 "AReaL-SWEAgent agent type to run: 'swe', 'cc', 'codex', or "
-                "'opencode'. Codex and OpenCode require sandbox_backend='e2b'."
+                "'opencode', or 'openhands'. Codex, OpenCode and OpenHands require sandbox_backend='e2b'."
             )
         },
     )
@@ -58,7 +59,7 @@ class SWEEnvConfig:
         metadata={
             "help": (
                 "Sandbox backend used by AReaL-SWEAgent. E2B supports Claude Code, "
-                "Codex, and OpenCode; AEnvironment supports SWE and Claude Code."
+                "Codex, OpenCode and OpenHands; AEnvironment supports SWE and Claude Code."
             )
         },
     )
@@ -106,6 +107,10 @@ class SWEEnvConfig:
                 "agent_type='opencode'."
             )
         },
+    )
+    openhands_agent_config: str = field(
+        default="train_openhands_mlperf",
+        metadata={"help": "Pinned OpenHands CodeAct configuration for E2B."},
     )
     agent_root: str = field(
         default="",

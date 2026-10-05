@@ -1,0 +1,76 @@
+# Single-task bring-up recipe; algorithm/compliance alignment is a later stage.
+defaults:
+  - qwen3_30b_a3b_grpo
+  - _self_
+
+experiment_name: mlperf_openhands_smoke
+tokenizer_path: ${actor.path}
+
+gconfig:
+  n_samples: 1
+  max_tokens: 65536
+  max_new_tokens: 65536
+  temperature: 1.0
+  top_p: 1.0
+  top_k: -1
+
+rollout:
+  backend: ${oc.env:AREAL_ROLLOUT_BACKEND}
+  max_concurrent_rollouts: 1
+  pause_grace_period: 1
+  agent:
+    chat_template_type: hf
+    chat_template_kwargs:
+      enable_thinking: false
+    tool_call_parser: qwen3_xml
+    reasoning_parser: qwen3
+    export_style: concat
+    message_preprocessors: []
+    prefix_matcher: null
+
+actor:
+  path: ${oc.env:AREAL_MODEL_PATH}
+  backend: ${oc.env:AREAL_ACTOR_BACKEND}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      image: ${oc.env:AREAL_WORKER_IMAGE}
+      env_vars:
+        PYTHONPATH: ${oc.env:AWEAGENT_ROOT}:${oc.env:AREAL_ROOT}
+        AWEAGENT_ROOT: ${oc.env:AWEAGENT_ROOT}
+        E2B_API_KEY: ${oc.env:E2B_API_KEY}
+        AWEAGENT_E2B_IMAGE_METADATA_KEY: ${oc.env:AWEAGENT_E2B_IMAGE_METADATA_KEY}
+
+vllm:
+  model: ${actor.path}
+  max_model_len: 65536
+  no_enable_prefix_caching: false
+  skip_tokenizer_init: false
+
+econfig:
+  agent_type: openhands
+  sandbox_backend: e2b
+  agent_root: ${oc.env:AWEAGENT_ROOT}
+  agent_config: train_openhands_mlperf
+  max_tokens: ${gconfig.max_tokens}
+  max_completion_tokens: ${gconfig.max_new_tokens}
+  harness_timeout: 1800.0
+  eval_timeout: 180.0
+  timeout: 2400.0
+  session_idle_timeout: null
+  terminal_exit_grace: null
+
+train_dataset:
+  path: ${oc.env:MLPERF_PREPARED_DATA}
+  batch_size: 1
+  shuffle: false
+  drop_last: false
+
+valid_dataset:
+  path: ${train_dataset.path}
+
+should_accept_fn: null

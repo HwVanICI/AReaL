@@ -37,6 +37,7 @@ _DEFAULT_AGENT_CONFIGS = {
     "cc": "train_cc_time3600",
     "oh": "eval_oh",
     "opencode": "train_opencode_time3600",
+    "openhands": "train_openhands_mlperf",
     "codex": "train_codex_time3600",
 }
 
@@ -180,7 +181,7 @@ class SWEAgentWorkflow:
     """AReaL-SWEAgent workflow for AReaL proxy mode.
 
     This workflow runs an AReaL-SWEAgent agent type (``swe``, ``cc``,
-    ``codex``, or ``opencode``) on normalized R2E-Gym, Scale-SWE, or SWE-bench
+    ``codex``, ``opencode``, or ``openhands``) on normalized R2E-Gym, Scale-SWE, or SWE-bench
     records in sandboxed environments. The agent's LLM calls are routed through
     AReaL's proxy server for on-policy RL training.
 
@@ -399,9 +400,15 @@ class SWEAgentWorkflow:
                 f"[{instance_id}] Episode error: {e}\n{traceback.format_exc()}"
             )
             _log_episode_outcome(0.0, exit_code="areal_exception")
+            if "r2e_instance" in data:
+                raise
             return 0.0
 
         _log_episode_outcome(float(reward), stats=stats)
+        if "r2e_instance" in data and stats.get("exit_code") != "success":
+            raise RuntimeError(
+                f"Official R2E episode did not complete: {stats.get('exit_code')}"
+            )
         if stats.get("exit_code") == "aenv_init_fail":
             raise RuntimeError(
                 f"{sandbox_backend} sandbox initialization failed for "

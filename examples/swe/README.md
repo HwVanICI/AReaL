@@ -7,6 +7,10 @@ instance it edits code inside an isolated sandbox, grades the patch, and returns
 reward for the RL loop. AReaL serves the policy being trained and drives rollouts
 through its OpenAI-compatible proxy.
 
+For the reference OpenHands CodeAct / official R2E-Gym grader integration, see
+[MLPERF.md](MLPERF.md). It includes runtime-image preparation and single-task
+gold/empty-patch checks before model rollout.
+
 ```
 AReaL (this repo)                         AReaL-SWEAgent (separate checkout)
   PPOTrainer / rollout proxy  ──▶  run_agent_with_reward()  ──▶  sandbox + grade

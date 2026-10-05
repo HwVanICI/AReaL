@@ -58,6 +58,75 @@ def test_configured_agent_config_selects_opencode_config():
     )
 
 
+def test_configured_agent_config_selects_openhands_config():
+    assert (
+        _configured_agent_config(
+            {"openhands_agent_config": "train_openhands_mlperf"}, "openhands"
+        )
+        == "train_openhands_mlperf"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exit_code", ["success", "agent_error", "reward_compute_error", "other"]
+)
+async def test_official_r2e_accepts_only_completed_results(
+    monkeypatch, tmp_path, exit_code
+):
+    lifecycle = ModuleType("aweagent.lifecycle")
+    lifecycle.run_agent_with_reward = AsyncMock(
+        return_value=(0.0, {"exit_code": exit_code})
+    )
+    package = ModuleType("aweagent")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "aweagent", package)
+    monkeypatch.setitem(sys.modules, "aweagent.lifecycle", lifecycle)
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+    workflow = object.__new__(SWEAgentWorkflow)
+    episode = workflow._run_episode(
+        data={"instance_id": "task", "r2e_instance": {}},
+        agent_type="openhands",
+        config_name="train_openhands_mlperf",
+        base_url="http://proxy",
+        api_key="key",
+        llm_model="model",
+        opencode_provider=None,
+        codex_provider=None,
+        sandbox_backend="e2b",
+    )
+    if exit_code == "success":
+        assert await episode == 0.0
+    else:
+        with pytest.raises(RuntimeError, match="did not complete"):
+            await episode
+
+
+@pytest.mark.asyncio
+async def test_official_r2e_infrastructure_exception_rejects(monkeypatch):
+    lifecycle = ModuleType("aweagent.lifecycle")
+    lifecycle.run_agent_with_reward = AsyncMock(
+        side_effect=RuntimeError("grader unavailable")
+    )
+    package = ModuleType("aweagent")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "aweagent", package)
+    monkeypatch.setitem(sys.modules, "aweagent.lifecycle", lifecycle)
+    workflow = object.__new__(SWEAgentWorkflow)
+    with pytest.raises(RuntimeError, match="grader unavailable"):
+        await workflow._run_episode(
+            data={"instance_id": "task", "r2e_instance": {}},
+            agent_type="openhands",
+            config_name="train_openhands_mlperf",
+            base_url="http://proxy",
+            api_key="key",
+            llm_model="model",
+            opencode_provider=None,
+            codex_provider=None,
+            sandbox_backend="e2b",
+        )
+
+
 @pytest.mark.asyncio
 async def test_run_episode_raises_on_sandbox_initialization_failure(
     monkeypatch, tmp_path
