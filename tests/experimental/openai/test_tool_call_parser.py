@@ -1,8 +1,11 @@
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
+from typing import Any, Literal
 
 import pytest
 from openai.types.chat import ChatCompletionMessageToolCall, ChatCompletionToolParam
+from pydantic import BaseModel
 
 from areal.experimental.openai import tool_call_parser as parser_module
 
@@ -270,27 +273,44 @@ class FakeReasoningParser:
         pass
 
 
+class FakeFunctionDefinition(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+
+
+class FakeChatCompletionToolsParam(BaseModel):
+    type: Literal["function"] = "function"
+    function: FakeFunctionDefinition
+
+
 def _patch_vllm_parsers(monkeypatch):
-    tool_parsers = pytest.importorskip(
+    modules = {}
+    for name in (
+        "vllm",
+        "vllm.entrypoints",
+        "vllm.entrypoints.openai",
+        "vllm.entrypoints.openai.chat_completion",
+        "vllm.entrypoints.openai.chat_completion.protocol",
         "vllm.tool_parsers",
-        reason="vllm is required for vllm parser tests",
-    )
-    reasoning_mod = pytest.importorskip(
         "vllm.reasoning",
-        reason="vllm is required for vllm parser tests",
+    ):
+        module = ModuleType(name)
+        modules[name] = module
+        monkeypatch.setitem(sys.modules, name, module)
+    protocol = modules["vllm.entrypoints.openai.chat_completion.protocol"]
+    protocol.ChatCompletionToolsParam = FakeChatCompletionToolsParam
+    tool_parsers = modules["vllm.tool_parsers"]
+    tool_parsers.ToolParserManager = SimpleNamespace(get_tool_parser=lambda name: None)
+    modules["vllm.reasoning"].ReasoningParserManager = SimpleNamespace(
+        get_reasoning_parser=lambda name: FakeReasoningParser
     )
     monkeypatch.setattr(
         parser_module, "_process_tool_calls_sglang", _raise_module_not_found
     )
-    monkeypatch.setattr(
-        reasoning_mod.ReasoningParserManager,
-        "get_reasoning_parser",
-        staticmethod(lambda name: FakeReasoningParser),
-    )
     return tool_parsers
 
 
-@pytest.mark.vllm
 def test_process_tool_calls_qwen25_chat_completions_vllm(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -302,6 +322,13 @@ def test_process_tool_calls_qwen25_chat_completions_vllm(
 
         def extract_tool_calls(self, content_text, request):
             assert request.skip_special_tokens is True
+            assert all(
+                isinstance(tool, FakeChatCompletionToolsParam) for tool in request.tools
+            )
+            assert (
+                request.tools[0].function.parameters
+                == TOOLS[0]["function"]["parameters"]
+            )
             return SimpleNamespace(
                 tools_called=True,
                 content=content_text.replace(
@@ -339,7 +366,6 @@ def test_process_tool_calls_qwen25_chat_completions_vllm(
     assert "<tool_call>" not in new_text
 
 
-@pytest.mark.vllm
 def test_process_tool_calls_qwen25_chat_completions_with_tool_call_in_thinking_vllm(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -351,6 +377,10 @@ def test_process_tool_calls_qwen25_chat_completions_with_tool_call_in_thinking_v
 
         def extract_tool_calls(self, content_text, request):
             assert request.skip_special_tokens is True
+            assert all(
+                isinstance(tool, FakeChatCompletionToolsParam) for tool in request.tools
+            )
+            assert request.tools[0].function.name == "search"
             return SimpleNamespace(
                 tools_called=True,
                 content=content_text.replace(
@@ -388,3 +418,175 @@ def test_process_tool_calls_qwen25_chat_completions_with_tool_call_in_thinking_v
 
     _assert_tool_calls(tool_calls, new_text, new_finish_reason)
     assert "<tool_call>" in new_text
+
+
+@pytest.mark.parametrize("use_responses", [False, True], ids=["chat", "responses"])
+def test_vllm_tool_definitions_typed_schema_preserves_argument_types(
+    monkeypatch, use_responses
+):
+    """Chat and Responses schemas remain available through typed tool attributes."""
+    tool_parsers = _patch_vllm_parsers(monkeypatch)
+    parameters = {
+        "type": "object",
+        "properties": {
+            "count": {"type": "integer"},
+            "ratio": {"type": "number"},
+            "enabled": {"type": "boolean"},
+            "items": {"type": "array", "items": {"type": "integer"}},
+            "options": {
+                "type": "object",
+                "properties": {"nested": {"type": "boolean"}},
+            },
+            "command": {"type": "string"},
+        },
+        "required": ["count", "enabled"],
+        "additionalProperties": False,
+    }
+    definition = {
+        "name": "execute",
+        "description": "Execute a command with typed options.",
+        "parameters": parameters,
+    }
+    tools = [
+        {"type": "function", **definition}
+        if use_responses
+        else {"type": "function", "function": definition}
+    ]
+    original_tools = json.loads(json.dumps(tools))
+    raw_arguments = {
+        "count": "3",
+        "ratio": "0.5",
+        "enabled": "false",
+        "items": "[1, 2]",
+        "options": '{"nested": true}',
+        "command": "123",
+    }
+
+    class FakeParser:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+        def extract_tool_calls(self, content_text, request):
+            tool = request.tools[0]
+            assert isinstance(tool, FakeChatCompletionToolsParam)
+            assert isinstance(tool.function, FakeFunctionDefinition)
+            assert tool.type == "function"
+            assert tool.function.name == definition["name"]
+            assert tool.function.description == definition["description"]
+            assert tool.function.parameters == parameters
+            assert request.tool_choice is None
+            assert request.skip_special_tokens is True
+            arguments = {
+                name: value
+                if tool.function.parameters["properties"][name]["type"] == "string"
+                else json.loads(value)
+                for name, value in raw_arguments.items()
+            }
+            return SimpleNamespace(
+                tools_called=True,
+                content="",
+                tool_calls=[
+                    SimpleNamespace(
+                        function=SimpleNamespace(
+                            name=tool.function.name, arguments=json.dumps(arguments)
+                        )
+                    )
+                ],
+            )
+
+    def get_tool_parser(name):
+        assert name == "qwen3_xml"
+        return FakeParser
+
+    monkeypatch.setattr(
+        tool_parsers.ToolParserManager, "get_tool_parser", get_tool_parser
+    )
+
+    tool_calls, content, finish_reason = parser_module.process_tool_calls(
+        text="<tool_call>typed arguments</tool_call>",
+        tools=tools,
+        tool_call_parser="qwen3_xml",
+        reasoning_parser="qwen3",
+        finish_reason="stop",
+        use_responses=use_responses,
+        tokenizer=object(),
+    )
+
+    assert tools == original_tools
+    assert content == ""
+    assert finish_reason == "tool_calls"
+    assert tool_calls is not None and len(tool_calls) == 1
+    call = tool_calls[0]
+    arguments = json.loads(call.arguments if use_responses else call.function.arguments)
+    assert arguments == {
+        "count": 3,
+        "ratio": 0.5,
+        "enabled": False,
+        "items": [1, 2],
+        "options": {"nested": True},
+        "command": "123",
+    }
+    assert type(arguments["count"]) is int
+    assert type(arguments["ratio"]) is float
+    assert arguments["enabled"] is False
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("use_responses", [False, True], ids=["chat", "responses"])
+@pytest.mark.parametrize(
+    ("parameter_type", "raw_value", "expected"),
+    [
+        ("integer", "3", 3),
+        ("number", "0.5", 0.5),
+        ("boolean", "false", False),
+        ("array", "[1, 2]", [1, 2]),
+        ("object", '{"nested": true}', {"nested": True}),
+        ("string", "123", "123"),
+    ],
+)
+def test_vllm_qwen3_xml_real_parser_typed_schema_preserves_argument_type(
+    monkeypatch, use_responses, parameter_type, raw_value, expected
+):
+    """Exercise the real XML parser on CPU without loading a model or tokenizer."""
+    tool_parsers = pytest.importorskip("vllm.tool_parsers")
+    xml_parser = pytest.importorskip("vllm.tool_parsers.qwen3xml_tool_parser")
+    monkeypatch.setattr(
+        tool_parsers.ToolParserManager,
+        "get_tool_parser",
+        lambda name: xml_parser.Qwen3XMLToolParser,
+    )
+    definition = {
+        "name": "execute",
+        "parameters": {
+            "type": "object",
+            "properties": {"value": {"type": parameter_type}},
+        },
+    }
+    tools = [
+        {"type": "function", **definition}
+        if use_responses
+        else {"type": "function", "function": definition}
+    ]
+    text = (
+        "<tool_call><function=execute>"
+        f"<parameter=value>{raw_value}</parameter>"
+        "</function></tool_call>"
+    )
+
+    tool_calls, content, finish_reason = parser_module._process_tool_calls_vllm(
+        text=text,
+        tools=tools,
+        tool_call_parser="qwen3_xml",
+        reasoning_parser="",
+        finish_reason="stop",
+        use_responses=use_responses,
+        tokenizer=object(),
+    )
+
+    assert content == ""
+    assert finish_reason == "tool_calls"
+    assert tool_calls is not None and len(tool_calls) == 1
+    call = tool_calls[0]
+    arguments = json.loads(call.arguments if use_responses else call.function.arguments)
+    assert arguments["value"] == expected
+    assert type(arguments["value"]) is type(expected)

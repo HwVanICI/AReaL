@@ -365,6 +365,9 @@ def _process_tool_calls_vllm(
     str,
     str,
 ]:
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionToolsParam,
+    )
     from vllm.reasoning import ReasoningParserManager
     from vllm.tool_parsers import ToolParserManager
 
@@ -415,13 +418,16 @@ def _process_tool_calls_vllm(
         return None, text, finish_reason
 
     tool_parser = tool_parser_cls(tokenizer)
-    request = SimpleNamespace(
-        tools=tools,
-        tool_choice=None,
-        skip_special_tokens=True,
-    )
-
     try:
+        # vLLM parsers consult schemas through tool.function.parameters attributes.
+        request = SimpleNamespace(
+            tools=[
+                ChatCompletionToolsParam(function=tool_def)
+                for tool_def in _iter_tool_definitions(tools)
+            ],
+            tool_choice=None,
+            skip_special_tokens=True,
+        )
         tool_call_info = tool_parser.extract_tool_calls(content_text, request)
     except Exception as e:
         logger.error("vLLM tool call parsing error: %s", e)
