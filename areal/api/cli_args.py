@@ -68,6 +68,14 @@ class NormConfig:
             "help": "Whether to use unbiased standard deviation computation. Defaults to True (changed from False in v0.3.4)."
         },
     )
+    std_leave1out: bool = field(
+        default=False,
+        metadata={
+            "help": "Compute each element's standard deviation from the other "
+            "elements at std_level ('batch' or 'group'). Ignored when std_level "
+            "is None. Zero standard deviation leaves the centered value unscaled."
+        },
+    )
     eps: float = field(
         default=1e-5,
         metadata={

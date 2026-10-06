@@ -1632,6 +1632,7 @@ class Normalization:
         self.mean_leave1out = config.mean_leave1out
         self.std_level = config.std_level
         self.std_unbiased = config.std_unbiased
+        self.std_leave1out = config.std_leave1out
         self.group_size = config.group_size
         self.eps = config.eps
 
@@ -1692,7 +1693,16 @@ class Normalization:
                 group_sizes=group_sizes,
                 unpenalized_rewards=unpenalized_rewards,
             )
-        if loss_mask is not None and loss_mask.sum().item() == 0:
+        # Batch LOO ranks must join collectives even when locally all masked.
+        if (
+            loss_mask is not None
+            and not (
+                self.std_leave1out
+                and self.std_level is not None
+                and "batch" in (self.mean_level, self.std_level)
+            )
+            and loss_mask.sum().item() == 0
+        ):
             return x.float()
         mean, scale = self.affine_parameters(
             x,
@@ -1774,6 +1784,7 @@ class Normalization:
                 high_precision=high_precision,
                 all_reduce=True,
                 reduce_group=reduce_group,
+                leave_one_out=self.std_leave1out,
             )
             std = std.expand_as(x)
         elif self.std_level == "group":
@@ -1787,7 +1798,7 @@ class Normalization:
                 )
 
                 # Special case: with group_size=1 and std_unbiased=True, std should be 1 for numerical stability
-                if group_size == 1 and self.std_unbiased:
+                if group_size == 1 and self.std_unbiased and not self.std_leave1out:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_std = torch.ones(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device
@@ -1801,13 +1812,17 @@ class Normalization:
                         high_precision=high_precision,
                         all_reduce=False,
                         reduce_group=reduce_group,
+                        leave_one_out=self.std_leave1out,
                     )
                 std[s] = group_std.expand_as(xx)
         else:
             std = torch.ones_like(x)
             eps = 0.0
 
-        return mean, std + eps
+        denominator = std + eps
+        if self.std_leave1out and self.std_level is not None:
+            denominator = torch.where(std > 0, denominator, torch.ones_like(std))
+        return mean, denominator
 
     @torch.no_grad()
     def _normalize_per_trajectory(
@@ -1962,10 +1977,27 @@ class Normalization:
         high_precision: bool,
         all_reduce: bool,
         reduce_group,
+        leave_one_out: bool = False,
     ) -> torch.Tensor:
-        """Compute std only, given precomputed mean."""
+        """Compute ordinary spread around mean, or LOO std around peer means."""
         dtype = torch.float64 if high_precision else torch.float32
         x = x.to(dtype)
+        if leave_one_out:
+            weights = torch.ones_like(x) if mask is None else mask.to(dtype)
+            x_masked = x * weights
+            x_square_masked = x.square() * weights
+            stats = torch.stack([weights.sum(), x_masked.sum(), x_square_masked.sum()])
+            if dist.is_initialized() and all_reduce:
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=reduce_group)
+            # Exclude each local element from the global/group reward moments.
+            count = stats[0] - weights
+            peer_mean = (stats[1] - x_masked) / count.clamp_min(1)
+            variance = (
+                (stats[2] - x_square_masked) / count.clamp_min(1) - peer_mean.square()
+            ).clamp_min(0)
+            correction = int(unbiased)
+            variance = variance * count / (count - correction).clamp_min(1)
+            return torch.where(count > correction, variance.sqrt(), 0.0)
         mean = mean.to(dtype)
         dim = tuple(range(len(x.shape)))
 
