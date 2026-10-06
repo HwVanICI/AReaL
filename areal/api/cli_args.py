@@ -1792,6 +1792,15 @@ class PPOActorConfig(TrainEngineConfig):
             "help": "Recompute log probability and replace the log probability returned by inference."
         },
     )
+    seq_logprob_error_threshold: float | None = field(
+        default=None,
+        metadata={
+            "help": "Mask whole sequences whose mean exp(abs(recomputed logp - "
+            "generation logp)) over generated tokens exceeds this positive finite "
+            "threshold. None disables masking. Requires a logprob forward pass "
+            "even with prox_logp_method='reuse'; the PPO ratio still uses reuse."
+        },
+    )
     use_decoupled_loss: bool = field(
         default=False,
         metadata={
@@ -1896,8 +1905,10 @@ class PPOActorConfig(TrainEngineConfig):
         from areal.utils.constants import ProxLogpMethod
 
         method = ProxLogpMethod(self.prox_logp_method)
-        return (self.use_decoupled_loss and not method.skips_forward_pass()) or (
-            not self.use_decoupled_loss and self.recompute_logprob
+        return (
+            self.seq_logprob_error_threshold is not None
+            or (self.use_decoupled_loss and not method.skips_forward_pass())
+            or (not self.use_decoupled_loss and self.recompute_logprob)
         )
 
     def __post_init__(self):
@@ -1905,6 +1916,11 @@ class PPOActorConfig(TrainEngineConfig):
         from areal.utils.constants import ProxLogpMethod
 
         method = ProxLogpMethod(self.prox_logp_method)
+        if self.seq_logprob_error_threshold is not None and (
+            not math.isfinite(self.seq_logprob_error_threshold)
+            or self.seq_logprob_error_threshold <= 0
+        ):
+            raise ValueError("seq_logprob_error_threshold must be positive and finite.")
         if method == ProxLogpMethod.REUSE:
             if not self.use_decoupled_loss:
                 raise ValueError(

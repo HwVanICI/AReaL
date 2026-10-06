@@ -192,11 +192,27 @@ def test_real_all_masked_step_keeps_positive_weight_and_zero_gradient(mode):
 
 
 @pytest.mark.parametrize("mode", ["traj-mean", "prompt-mean"])
-def test_prepared_unit_mean_rejects_globally_empty_update(mode):
+@pytest.mark.parametrize("n_steps", [1, 3])
+def test_prepared_unit_mean_all_masked_update_has_zero_gradient(mode, n_steps):
     data = {"loss_mask": torch.zeros(3, 2, dtype=torch.bool)}
     prepared = prepare_policy_gradient_batch(data, mode=mode, group_sizes=[2, 1])
-    with pytest.raises(ValueError, match="active"):
-        prepared.for_steps([data])
+    batches = [
+        {key: value[rows] for key, value in data.items()}
+        for rows in torch.tensor_split(torch.arange(3), n_steps)
+    ]
+    for step, batch in zip(prepared.for_steps(batches), batches, strict=True):
+        values = torch.ones_like(batch["unit_weights"], requires_grad=True)
+        loss = _aggregate(step, values, batch)
+        torch.testing.assert_close(
+            step.normalizer_fn(batch), torch.tensor(1.0), rtol=0, atol=0
+        )
+        torch.testing.assert_close(loss, torch.tensor(0.0), rtol=0, atol=0)
+        torch.testing.assert_close(
+            torch.autograd.grad(loss, values)[0],
+            torch.zeros_like(values),
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_optimizer_steps_are_capped_by_available_rows():

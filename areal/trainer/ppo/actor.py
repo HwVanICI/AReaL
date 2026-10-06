@@ -327,6 +327,32 @@ class PPOActor:
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
         behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+        if self.config.seq_logprob_error_threshold is not None:
+            recomputed_logp = data.get("prox_logp")
+            if recomputed_logp is None:
+                raise ValueError(
+                    "seq_logprob_error_threshold requires recomputed prox_logp."
+                )
+            data["prompt_lens"] = data["attention_mask"].sum(-1) - loss_mask.sum(-1)
+            logp_error = torch.where(
+                loss_mask.bool(),
+                (recomputed_logp.float() - behavior_logp.float()).abs(),
+                0.0,
+            )
+            seq_error = (logp_error.exp() * loss_mask).sum(-1) / loss_mask.sum(
+                -1
+            ).clamp_min(1)
+            # Filter before loss normalization, without dropping rewards from
+            # the prompt group's baseline or changing the rollout group size.
+            loss_mask *= (
+                seq_error <= self.config.seq_logprob_error_threshold
+            ).unsqueeze(-1)
+            if (
+                self.config.use_decoupled_loss
+                and self.config.prox_logp_method == PROX_LOGP_METHOD_LOGLINEAR
+            ):
+                # This forward was for filtering, not the proximal approximation.
+                data["prox_logp"] = None
         # Apply the mask to log probabilities.
         if data.get("prox_logp") is not None:
             log_train_inference_stats(
@@ -492,7 +518,7 @@ class PPOActor:
             advantage_zero_fraction=(data["advantages"] == 0).float(),
         )
 
-        prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
+        prompt_lens = data.pop("prompt_lens", seqlens - loss_mask.sum(-1))
         seq_stats = dict(
             no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),
             task_reward=reward_score.float(),

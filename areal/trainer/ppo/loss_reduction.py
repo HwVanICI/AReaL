@@ -57,13 +57,9 @@ class _PreparedLossBatch:
         if dist.is_initialized():
             dist.all_reduce(counts, group=dp_group)
         active_groups, *global_rows = counts.cpu().tolist()
-        if active_groups == 0:
-            raise ValueError(
-                f"{self.reduction.mode} requires active units in the update."
-            )
         if any(rows <= 0 for rows in global_rows):
             raise ValueError("Every optimizer step must contain real responses.")
-        step_scale = len(microbatches) / active_groups
+        step_scale = len(microbatches) / max(active_groups, 1)
         return [
             replace(self.reduction, _step_scale=step_scale, _global_rows=rows)
             for rows in global_rows

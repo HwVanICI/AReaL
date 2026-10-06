@@ -1693,13 +1693,15 @@ class Normalization:
                 group_sizes=group_sizes,
                 unpenalized_rewards=unpenalized_rewards,
             )
-        # Batch LOO ranks must join collectives even when locally all masked.
+        # Ranks using batch statistics must join collectives even when all masked.
         if (
             loss_mask is not None
             and not (
-                self.std_leave1out
-                and self.std_level is not None
-                and "batch" in (self.mean_level, self.std_level)
+                "batch" in (self.mean_level, self.std_level)
+                and (
+                    dist.is_initialized()
+                    or (self.std_leave1out and self.std_level is not None)
+                )
             )
             and loss_mask.sum().item() == 0
         ):

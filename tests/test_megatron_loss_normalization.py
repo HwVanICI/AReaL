@@ -311,8 +311,8 @@ def test_main_and_auxiliary_gradients_share_optimizer_scale(per_token, loss_scal
 
 
 @pytest.mark.parametrize("per_token", [False, True])
-def test_train_all_zero_weight_batch_is_rejected(per_token):
-    """Retain the positive global-weight guard before any forward/backward work."""
+def test_train_negative_weight_batch_is_rejected(per_token):
+    """Invalid weights still fail before any forward/backward work."""
     namespace = {
         "torch": torch,
         "dist": SimpleNamespace(all_reduce=lambda *args, **kwargs: None),
@@ -324,7 +324,7 @@ def test_train_all_zero_weight_batch_is_rejected(per_token):
         _ensure_ready=lambda: None,
         optimizer_zero_grad=lambda: None,
         _normalize_batch_input=lambda inputs: (inputs, None),
-        _prepare_mb_list=lambda inputs: _MicroBatches([{"weight": torch.tensor(0)}]),
+        _prepare_mb_list=lambda inputs: _MicroBatches([{"weight": torch.tensor(-1)}]),
         model=[
             SimpleNamespace(config=SimpleNamespace(calculate_per_token_loss=per_token))
         ],
@@ -332,19 +332,18 @@ def test_train_all_zero_weight_batch_is_rejected(per_token):
     )
     _bind_per_token_loss_methods(engine, namespace)
     with pytest.raises(
-        AssertionError, match="Global total loss weight must be positive"
+        AssertionError, match="Global total loss weight must be nonnegative"
     ):
         train(engine, {}, None, lambda mb: mb["weight"])
 
 
 @pytest.mark.parametrize("per_token", [False, True])
-@pytest.mark.parametrize("aggregation", ["traj-mean", "prompt-mean"])
 @pytest.mark.parametrize("cp_size", [1, 2])
 @pytest.mark.parametrize("global_tokens", [0, 5])
-def test_train_all_masked_rank_uses_global_valid_token_guard(
-    per_token, aggregation, cp_size, global_tokens
+def test_train_all_masked_rank_clears_gradients_only_when_globally_empty(
+    per_token, cp_size, global_tokens
 ):
-    """Reject globally empty steps before routing, but allow an empty DP rank."""
+    """Only globally empty steps clear auxiliary gradients after backward."""
     dp_group = object()
     dp_cp_group = object()
     reductions = []
@@ -374,13 +373,12 @@ def test_train_all_masked_rank_uses_global_valid_token_guard(
     train = _load_function(ENGINE_SOURCE, "train_batch", namespace)
     engine = SimpleNamespace(
         _ensure_ready=lambda: None,
-        optimizer_zero_grad=lambda: None,
+        optimizer_zero_grad=lambda: calls.append("zero_grad"),
         _normalize_batch_input=lambda inputs: (inputs, None),
         _prepare_mb_list=lambda inputs: batches,
         model=[
             SimpleNamespace(config=SimpleNamespace(calculate_per_token_loss=per_token))
         ],
-        config=SimpleNamespace(loss_aggregation=aggregation),
         # Real routers see input tokens even when every action mask is zero.
         forward_backward_batch=lambda *args, **kwargs: calls.append("router"),
         optimizer_step=lambda: calls.append("optimizer") or {},
@@ -388,16 +386,100 @@ def test_train_all_masked_rank_uses_global_valid_token_guard(
     )
     _bind_per_token_loss_methods(engine, namespace)
 
+    train(engine, {}, None, lambda mb: mb["weight"])
+    expected = ["zero_grad", "router"]
     if global_tokens == 0:
-        with pytest.raises(
-            ValueError, match="Global valid token count must be positive"
-        ):
-            train(engine, {}, None, lambda mb: mb["weight"])
-        assert calls == []
-    else:
-        train(engine, {}, None, lambda mb: mb["weight"])
-        assert calls == ["router", "optimizer"]
+        expected.append("zero_grad")
+    assert calls == [*expected, "optimizer"]
     assert reductions == [dp_cp_group]
+
+
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("physical_weight", [0.0, 1.0])
+def test_train_filtered_minibatch_zeroes_main_and_auxiliary_gradients(
+    per_token, physical_weight
+):
+    """A filtered minibatch still runs backward; the next valid one is unchanged."""
+    parameter = torch.tensor([2.0, 3.0], requires_grad=True)
+    optimizer_gradients = []
+    forwarded = []
+    namespace = {
+        "torch": torch,
+        "dist": SimpleNamespace(all_reduce=lambda *args, **kwargs: None),
+        "mpu": SimpleNamespace(
+            get_data_parallel_group=lambda **kwargs: None,
+            get_data_parallel_world_size=lambda: 1,
+            get_context_parallel_world_size=lambda: 1,
+            get_context_parallel_rank=lambda: 0,
+        ),
+        "get_model_config": lambda model: model.config,
+    }
+    train = _load_function(ENGINE_SOURCE, "train_batch", namespace)
+    compute = _load_function(ENGINE_SOURCE, "_compute_logprobs_and_loss", namespace)
+    build_output = _load_function(
+        ENGINE_SOURCE, "_build_per_token_loss_output", namespace
+    )
+
+    def zero_grad():
+        if parameter.grad is not None:
+            parameter.grad.zero_()
+
+    def optimizer_step():
+        optimizer_gradients.append(parameter.grad.clone())
+        return {}
+
+    engine = SimpleNamespace(
+        _ensure_ready=lambda: None,
+        optimizer_zero_grad=zero_grad,
+        optimizer_step=optimizer_step,
+        _normalize_batch_input=lambda inputs: (inputs, None),
+        _prepare_mb_list=lambda inputs: inputs,
+        model=[
+            SimpleNamespace(config=SimpleNamespace(calculate_per_token_loss=per_token))
+        ],
+        config=SimpleNamespace(is_critic=True),
+        enable_tree_training=False,
+        device="cpu",
+    )
+    _bind_per_token_loss_methods(engine, namespace)
+    engine._compute_logprobs_and_loss = functools.partial(compute, engine)
+    engine._build_per_token_loss_output = functools.partial(build_output, engine)
+
+    def forward_backward(batches, process_output, forward_only):
+        assert not forward_only
+        for batch in batches:
+            forwarded.append(batch)
+            output = _AuxiliaryLoss.apply(
+                parameter[:1], parameter[1].square(), torch.tensor(1.0)
+            )
+            result = process_output(output, batch)
+            if per_token:
+                loss, tokens = result
+                assert tokens == batch["loss_mask"].count_nonzero()
+            else:
+                loss = result
+            assert torch.isfinite(loss)
+            loss.backward()
+        # Auxiliary autograd can contribute even when the policy loss is zero.
+        assert parameter.grad[1] != 0
+
+    engine.forward_backward_batch = forward_backward
+    filtered = {"weight": torch.tensor(physical_weight), "loss_mask": torch.zeros(1)}
+    valid = {"weight": torch.tensor(1.0), "loss_mask": torch.ones(1)}
+    for batch in (filtered, valid):
+        train(
+            engine,
+            _MicroBatches([batch]),
+            lambda values, inputs: (values.square() * inputs["loss_mask"]).sum(),
+            lambda inputs: inputs["weight"],
+        )
+
+    assert len(forwarded) == 2
+    assert forwarded[0] is filtered and forwarded[1] is valid
+    torch.testing.assert_close(optimizer_gradients[0], torch.zeros(2), rtol=0, atol=0)
+    torch.testing.assert_close(
+        optimizer_gradients[1], torch.tensor([4.0, 6.0]), rtol=0, atol=0
+    )
 
 
 def test_valid_token_guard_keeps_reward_model_count_contract():

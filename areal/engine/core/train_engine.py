@@ -59,10 +59,11 @@ def compute_total_loss_weight(
         .to(dtype=torch.float32)
     )
     dist.all_reduce(total_weight, group=dp_group)
-    assert total_weight > 0, (
-        "Global total loss weight must be positive after all_reduce"
+    assert total_weight >= 0, (
+        "Global total loss weight must be nonnegative after all_reduce"
     )
-    return total_weight
+    # A fully masked batch still runs backward with zero local weights.
+    return torch.where(total_weight > 0, total_weight, torch.ones_like(total_weight))
 
 
 def aggregate_eval_losses(

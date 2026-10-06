@@ -2224,6 +2224,10 @@ class MegatronEngine(TrainEngine):
             process_output,
             forward_only=False,
         )
+        if total_tokens == 0:
+            # Still run every row, but do not train on MoE auxiliary gradients
+            # when the entire optimizer minibatch has been filtered out.
+            self.optimizer_zero_grad()
 
         # Step 4: Optimizer step
         stats = self.optimizer_step()
@@ -2245,14 +2249,10 @@ class MegatronEngine(TrainEngine):
             totals, group=mpu.get_data_parallel_group(with_context_parallel=True)
         )
         weight, tokens = totals.unbind()
-        assert weight > 0, "Global total loss weight must be positive after all_reduce"
-        # Positive response weights do not imply positive action-token counts.
-        # Reject globally empty steps before routing can produce auxiliary grads.
-        if tokens <= 0:
-            raise ValueError(
-                "Global valid token count must be positive for an optimizer step."
-            )
-        return weight, tokens
+        assert weight >= 0, (
+            "Global total loss weight must be nonnegative after all_reduce"
+        )
+        return torch.where(weight > 0, weight, torch.ones_like(weight)), tokens
 
     @staticmethod
     def _per_token_count(
