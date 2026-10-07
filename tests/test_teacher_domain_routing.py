@@ -25,6 +25,48 @@ class _FakeTeacher:
         return [torch.full_like(traj["loss_mask"], self.value) for traj in batch]
 
 
+@pytest.mark.parametrize("routing_mode", ["domain", "mixed"])
+def test_teacher_scoring_keeps_actor_routes_out_of_teacher_batches(routing_mode):
+    trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer.config = SimpleNamespace(
+        teacher=SimpleNamespace(
+            routing_mode=routing_mode,
+            domain_key="domain",
+            rl_loss_weight=1.0,
+            distill_loss_weight=0.25,
+            distill_loss_type="mopd_pg",
+            mopd_adv_clip=3.0,
+        )
+    )
+    trainer.teachers = [_FakeTeacher(-1.0), _FakeTeacher(-2.0)]
+    trainer.teacher_domain_to_idx = {"coding": 1}
+    trainer.teacher_mixture_weights = [0.5, 0.5]
+    mask = torch.ones(1, 3)
+    routes = torch.ones(1, 3, 2, 2, dtype=torch.int32)
+    validity = torch.tensor([True])
+    trajectory = {
+        "domain": "coding",
+        "loss_mask": mask,
+        "routed_experts": routes,
+        "r3_routing_valid": validity,
+    }
+
+    trainer._assign_teacher_logps([trajectory])
+
+    assert [len(teacher.seen_batches) for teacher in trainer.teachers] == (
+        [0, 1] if routing_mode == "domain" else [1, 1]
+    )
+    for teacher in trainer.teachers:
+        for batch in teacher.seen_batches:
+            assert batch[0]["loss_mask"] is mask
+            assert "routed_experts" not in batch[0]
+            assert "r3_routing_valid" not in batch[0]
+            assert "domain" not in batch[0]
+    assert trajectory["routed_experts"] is routes
+    assert trajectory["r3_routing_valid"] is validity
+    assert trajectory["teacher_logp"].shape == mask.shape
+
+
 def _teacher_config(domain: str):
     return SimpleNamespace(domain=domain)
 

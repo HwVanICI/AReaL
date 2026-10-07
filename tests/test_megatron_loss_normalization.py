@@ -453,6 +453,9 @@ def test_forward_callback_preserves_loss_contract(with_count):
     )
     engine = SimpleNamespace(
         _ensure_ready=lambda: None,
+        _prepare_r3_forward_context=lambda mb_list: None,
+        _model_vp_stage=lambda model: 0,
+        _r3_enabled=False,
         enable_tree_training=False,
         is_vision_model=False,
         use_padded_seq=False,

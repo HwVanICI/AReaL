@@ -139,6 +139,11 @@ _message_preprocessors: list = []
 # Pluggable prefix matcher for InteractionCache parent-child matching.
 _prefix_matcher = None
 
+# R3 routed_experts shape for server-side tensor export.
+_r3_num_moe_layers: int | None = None
+_r3_topk: int | None = None
+_r3_moe_layer_indices: tuple[int, ...] | None = None
+
 # Server address (set at startup)
 _server_host: str = "0.0.0.0"
 _server_port: int = 8000
@@ -386,10 +391,28 @@ async def _run_multimodal_canary(client) -> None:
 
 @app.post("/configure")
 async def configure(raw_request: Request):
+    global _r3_num_moe_layers, _r3_topk, _r3_moe_layer_indices
     data = await raw_request.json()
     config = deserialize_value(data.get("config"))
     rank = data.get("rank", 0)
     seeding.set_random_seed(config.seed, key=f"proxy{rank}")
+    if getattr(config.rollout, "return_routed_experts", False):
+        from transformers import AutoConfig
+
+        from areal.engine.r3.config import resolve_r3_moe_config
+
+        hf_config = AutoConfig.from_pretrained(
+            config.actor.path,
+            trust_remote_code=True,
+        )
+        r3_config = resolve_r3_moe_config(hf_config)
+        _r3_num_moe_layers = r3_config.num_moe_layers
+        _r3_topk = r3_config.topk
+        _r3_moe_layer_indices = r3_config.moe_layer_indices
+    else:
+        _r3_num_moe_layers = None
+        _r3_topk = None
+        _r3_moe_layer_indices = None
     return {"status": "success"}
 
 
@@ -1243,7 +1266,13 @@ async def export_trajectories(
         if tensor_reference_group_id is not None
         else None
     )
-    serialized = serialize_interactions(interactions, tensor_store=tensor_store)
+    serialized = serialize_interactions(
+        interactions,
+        tensor_store=tensor_store,
+        r3_num_moe_layers=_r3_num_moe_layers,
+        r3_topk=_r3_topk,
+        r3_moe_layer_indices=_r3_moe_layer_indices,
+    )
     return ExportTrajectoriesResponse(
         interactions=serialized,
         behaviour_metrics=behaviour_metrics,

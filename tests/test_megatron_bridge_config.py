@@ -479,6 +479,7 @@ def test_mbridge_fusion_override_is_independent_of_checkpointing(
         mindspeed_config=config.mindspeed,
         dtype="bf16",
         logger=SimpleNamespace(info=lambda *args: None),
+        _r3_enabled=config.megatron.enable_router_replay,
         moe_token_dispatcher_type=(
             config.mindspeed.moe_token_dispatcher_type
             if is_npu
@@ -762,6 +763,7 @@ def test_cuda_mbridge_passes_selected_dispatcher(dispatcher):
         mcore_config=config.megatron,
         mindspeed_config=config.mindspeed,
         moe_token_dispatcher_type=config.megatron.moe_token_dispatcher_type,
+        _r3_enabled=config.megatron.enable_router_replay,
         dtype="bf16",
         logger=SimpleNamespace(info=lambda *args: None),
     )

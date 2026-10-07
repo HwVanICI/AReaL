@@ -234,10 +234,10 @@ class TestTrajectoryMetadata:
         captured = {}
         original_split = actor_module.split_training_batch_into_microbatches
 
-        def capture_split(data, n_mbs, group=None):
+        def capture_split(data, n_mbs, group=None, **kwargs):
             captured["n_mbs"] = n_mbs
             captured["weights"] = data["unit_weights"].clone()
-            return original_split(data, n_mbs, group)
+            return original_split(data, n_mbs, group, **kwargs)
 
         monkeypatch.setattr(
             actor_module, "split_training_batch_into_microbatches", capture_split

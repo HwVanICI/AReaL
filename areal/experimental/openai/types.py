@@ -13,6 +13,7 @@ from openai.types.responses.response import Response
 from openai.types.responses.response_input_param import ResponseInputParam
 
 from areal.api import ModelResponse
+from areal.engine.r3.preprocess import preprocess_routed_experts_batch
 from areal.utils import logging
 
 logger = logging.getLogger("TokenLogpReward")
@@ -67,6 +68,9 @@ class InteractionWithTokenLogpReward:
     parent: InteractionWithTokenLogpReward | None = None
     chat_template_type: str = "hf"
     trajectory_metadata: dict[str, str] = field(default_factory=dict)
+    r3_num_moe_layers: int | None = None
+    r3_topk: int | None = None
+    r3_moe_layer_indices: tuple[int, ...] | None = None
     _cache: dict[str, torch.Tensor] | None = None
 
     # Request-scoped telemetry state. Kept only in the live proxy cache so
@@ -201,6 +205,15 @@ class InteractionWithTokenLogpReward:
         resp = self.model_response
         assert resp is not None, "Model response is not set."
         self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
+        if self.parent is not None and self.r3_num_moe_layers is not None:
+            if self.parent.r3_num_moe_layers is None:
+                self.parent.r3_num_moe_layers = self.r3_num_moe_layers
+            if self.parent.r3_topk is None:
+                self.parent.r3_topk = self.r3_topk
+            if self.parent.r3_moe_layer_indices is None:
+                self.parent.r3_moe_layer_indices = self.r3_moe_layer_indices
+        routed_experts = None
+        r3_routing_valid = None
         if self.chat_template_type == "concat" and self.parent is not None:
             parent_res = self.parent.to_tensor_dict()
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
@@ -208,6 +221,7 @@ class InteractionWithTokenLogpReward:
             parent_versions = parent_res["versions"].squeeze(0).tolist()
             parent_len = len(parent_logprobs)
             assert parent_len == len(parent_loss_mask) == len(parent_versions)
+            current_r3 = self._r3_tensor_dict(seq_len=len(seq))
             if resp.input_len > parent_len:
                 logprobs = (
                     parent_logprobs
@@ -224,6 +238,24 @@ class InteractionWithTokenLogpReward:
                     + [-1] * (resp.input_len - parent_len)
                     + resp.output_versions
                 )
+                if current_r3 is not None:
+                    parent_routed = parent_res.get("routed_experts")
+                    parent_valid = parent_res.get("r3_routing_valid")
+                    if parent_routed is not None and parent_valid is not None:
+                        current_routed = current_r3["routed_experts"].squeeze(0)
+                        routed_experts = torch.cat(
+                            [
+                                parent_routed.squeeze(0)[:-1],
+                                current_routed[parent_len - 1 :],
+                            ],
+                            dim=0,
+                        ).unsqueeze(0)
+                        r3_routing_valid = (
+                            parent_valid.bool() & current_r3["r3_routing_valid"].bool()
+                        )
+                    else:
+                        routed_experts = current_r3["routed_experts"]
+                        r3_routing_valid = torch.zeros(1, dtype=torch.bool)
             else:
                 # FIXME: Find out why this happens occasionally
                 api_type = self.api_type
@@ -242,10 +274,17 @@ class InteractionWithTokenLogpReward:
                 logprobs = [0.0] * resp.input_len + resp.output_logprobs
                 loss_mask = [0] * resp.input_len + [1] * resp.output_len
                 versions = [-1] * resp.input_len + resp.output_versions
+                if current_r3 is not None:
+                    routed_experts = current_r3["routed_experts"]
+                    r3_routing_valid = torch.zeros(1, dtype=torch.bool)
         else:
             logprobs = [0.0] * resp.input_len + resp.output_logprobs
             loss_mask = [0] * resp.input_len + [1] * resp.output_len
             versions = [-1] * resp.input_len + resp.output_versions
+            current_r3 = self._r3_tensor_dict(seq_len=len(seq))
+            if current_r3 is not None:
+                routed_experts = current_r3["routed_experts"]
+                r3_routing_valid = current_r3["r3_routing_valid"]
         reward = self.reward if self.reward is not None else 0.0
         result = dict(
             # unsqueeze to add an additional batch dimension
@@ -257,6 +296,9 @@ class InteractionWithTokenLogpReward:
             # reward
             rewards=torch.tensor([float(reward)]),
         )
+        if routed_experts is not None and r3_routing_valid is not None:
+            result["routed_experts"] = routed_experts
+            result["r3_routing_valid"] = r3_routing_valid
         if self.multi_modal_input is not None:
             result["multi_modal_input"] = self.multi_modal_input
         if self.mm_token_type_ids is not None:
@@ -266,6 +308,64 @@ class InteractionWithTokenLogpReward:
             ).unsqueeze(0)
         self._cache = result
         return result
+
+    def _r3_tensor_dict(self, *, seq_len: int) -> dict[str, torch.Tensor] | None:
+        resp = self.model_response
+        if resp is None:
+            return None
+        if (
+            resp.routed_experts is None
+            and self.r3_num_moe_layers is None
+            and self.r3_topk is None
+        ):
+            return None
+        if self.r3_num_moe_layers is None or self.r3_topk is None:
+            raise ValueError(
+                "Interaction received routed_experts but R3 MoE shape is not "
+                "configured. Set r3_num_moe_layers and r3_topk before tensor export."
+            )
+        return preprocess_routed_experts_batch(
+            [resp.routed_experts],
+            seq_lens=[seq_len],
+            num_moe_layers=self.r3_num_moe_layers,
+            topk=self.r3_topk,
+            moe_layer_indices=self.r3_moe_layer_indices,
+        )
+
+
+def configure_r3_interactions(
+    interactions: dict[str, InteractionWithTokenLogpReward],
+    *,
+    num_moe_layers: int | None,
+    topk: int | None,
+    moe_layer_indices: tuple[int, ...] | None = None,
+) -> None:
+    if num_moe_layers is None or topk is None:
+        return
+
+    seen: set[int] = set()
+
+    def _configure(interaction: InteractionWithTokenLogpReward) -> None:
+        ident = id(interaction)
+        if ident in seen:
+            return
+        seen.add(ident)
+        interaction.r3_num_moe_layers = num_moe_layers
+        interaction.r3_topk = topk
+        interaction.r3_moe_layer_indices = moe_layer_indices
+        if (
+            interaction.model_response is not None
+            and interaction._cache is not None
+            and "routed_experts" not in interaction._cache
+        ):
+            # A missing-route response may have been exported before R3 was
+            # configured. Rebuild it with the invalid-routing side channel.
+            interaction._cache = None
+        if interaction.parent is not None:
+            _configure(interaction.parent)
+
+    for interaction in interactions.values():
+        _configure(interaction)
 
 
 def concat_string_interactions(

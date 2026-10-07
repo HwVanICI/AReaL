@@ -934,6 +934,12 @@ class MegatronEngineConfig:
             "Requires TransformerEngine >= 2.7.0.",
         },
     )
+    enable_router_replay: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable Megatron-Core native MoE router replay for R3 training."
+        },
+    )
     moe_router_bias_update_rate: float = field(
         default=0.0,
         metadata={
@@ -2091,6 +2097,7 @@ class vLLMConfig:
     tensor_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
     enable_expert_parallel: bool = False
+    enable_return_routed_experts: bool = False
     compilation_config: dict | None = None
     additional_config: dict | None = None
     # Speculative decoding config passed through to vLLM's --speculative-config.
@@ -2740,7 +2747,8 @@ class InferenceEngineConfig:
     return_routed_experts: bool = field(
         default=False,
         metadata={
-            "help": "Return routed expert indices for MoE models. Effective only when using SGLang engine with MoE models."
+            "help": "Return routed expert indices for MoE models for rollout "
+            "routing replay. Supported by SGLang and vLLM."
         },
     )
 

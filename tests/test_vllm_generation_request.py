@@ -11,10 +11,11 @@ than as messages, so the server never re-renders the conversation.
 import base64
 from io import BytesIO
 
+import numpy as np
 import pytest
 from PIL import Image
 
-from areal.api.cli_args import GenerationHyperparameters
+from areal.api.cli_args import GenerationHyperparameters, vLLMConfig
 from areal.api.io_struct import ModelRequest
 from areal.engine.vllm_remote import VLLMBackend
 
@@ -27,6 +28,14 @@ def _image_b64() -> str:
 
 IMAGE_PAD = 151655
 VIDEO_PAD = 151656
+
+
+def test_vllm_server_args_enable_routed_expert_capture():
+    config = vLLMConfig(model="model", enable_return_routed_experts=True)
+
+    args = vLLMConfig.build_args(config, tp_size=2, pp_size=1)
+
+    assert args["enable_return_routed_experts"] is True
 
 
 class _QwenLikeTokenizer:
@@ -256,6 +265,26 @@ def test_parse_reads_token_ids_directly_from_the_generate_response():
     assert result.output_tokens == [5, 6, 7]
     assert result.output_logprobs == [-0.1, -0.2, -0.3]
     assert result.stop_reason == "stop"
+
+
+def test_parse_decodes_routed_experts_from_npy_payload():
+    routes = np.arange(4 * 3 * 2, dtype=np.uint8).reshape(4, 3, 2)
+    buffer = BytesIO()
+    np.save(buffer, routes)
+    response = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "token_ids": [5],
+                "logprobs": {"content": [{"token": "a", "logprob": -0.1}]},
+                "routed_experts": base64.b64encode(buffer.getvalue()).decode(),
+            }
+        ]
+    }
+
+    result = VLLMBackend().parse_generation_response(response)
+
+    np.testing.assert_array_equal(result.routed_experts, routes)
 
 
 def test_parse_rejects_desynced_tokens_and_logprobs():

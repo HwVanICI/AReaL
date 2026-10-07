@@ -774,6 +774,15 @@ def make_mcore_model(
         if is_npu_available and hasattr(provider, "experimental_attention_variant"):
             provider.use_flash_attn = True
 
+        if mcore_config.enable_router_replay:
+            if bool(getattr(provider, "moe_router_fusion", False)):
+                raise ValueError(
+                    "megatron.enable_router_replay=True is incompatible with "
+                    "effective Megatron moe_router_fusion=True. Disable "
+                    "moe_router_fusion to use Megatron-Core native RouterReplay."
+                )
+            provider.moe_enable_routing_replay = True
+
         # Aligning tf config settings with provider for consistency.
         tf_config.variable_seq_lengths = provider.variable_seq_lengths
         tf_config.moe_token_dispatcher_type = provider.moe_token_dispatcher_type
@@ -804,6 +813,8 @@ def make_mcore_model(
 
         tf_config.batch_p2p_comm = provider.batch_p2p_comm
         tf_config.overlap_p2p_comm = provider.overlap_p2p_comm
+        if mcore_config.enable_router_replay:
+            tf_config.moe_enable_routing_replay = True
 
         provider.finalize()
 
@@ -842,6 +853,8 @@ def make_mcore_model(
         return models
 
     else:
+        if mcore_config is not None and mcore_config.enable_router_replay:
+            tf_config.moe_enable_routing_replay = True
         if (
             mcore_config is not None
             and mcore_config.virtual_pipeline_parallel_size is not None

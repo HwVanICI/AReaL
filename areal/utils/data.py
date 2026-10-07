@@ -358,14 +358,14 @@ def concat_padded_tensors(
 
 
 def _unpad_splits(
-    splits: list[torch.Tensor], traj_seqlens: list[int] | None
+    splits: list[torch.Tensor], traj_seqlens: list[int] | None, *, seq_dim: int = -1
 ) -> list[torch.Tensor]:
-    """Trim each split tensor's last dim to its original sequence length."""
+    """Trim each split tensor's sequence dimension to its original length."""
     if traj_seqlens is None:
         return splits
     for i, s in enumerate(splits):
-        if s.ndim >= 2 and s.shape[-1] > traj_seqlens[i]:
-            splits[i] = s[..., : traj_seqlens[i]]
+        if s.ndim >= 2 and s.shape[seq_dim] > traj_seqlens[i]:
+            splits[i] = s.narrow(seq_dim, 0, traj_seqlens[i])
     return splits
 
 
@@ -405,7 +405,9 @@ def split_and_unpad_tensor(
         for key, value in result.items():
             if isinstance(value, torch.Tensor) and value.shape[0] == total:
                 splits = _unpad_splits(
-                    list(value.split(traj_group_sizes, dim=0)), traj_seqlens
+                    list(value.split(traj_group_sizes, dim=0)),
+                    traj_seqlens,
+                    seq_dim=1 if key == "routed_experts" else -1,
                 )
                 for i, s in enumerate(splits):
                     split_result[i][key] = s
@@ -562,13 +564,17 @@ def split_training_batch_into_microbatches(
     data: dict[str, Any],
     n_mbs: int,
     group: dist.ProcessGroup | None = None,
-) -> list[dict[str, Any]]:
+    *,
+    return_metadata: bool = False,
+) -> "list[dict[str, Any]] | MicroBatchList":
     """Split rows into common optimizer steps backed by real data on every rank.
 
     Unlike transport padding, capping the step count by the smallest DP shard
     needs no extra model forwards. Loss preparation uses the realized schedule
     length. Prepared trajectory/prompt modes retain full-update coefficients
     when the step count is capped.
+
+    Set return_metadata to retain row permutations for training side channels.
     """
     if n_mbs < 1:
         raise ValueError(f"n_mbs must be positive, got {n_mbs}")
@@ -591,9 +597,10 @@ def split_training_batch_into_microbatches(
             n_mbs,
             effective_n_mbs,
         )
-    return split_padded_tensor_dict_into_mb_list(
+    mb_list = split_padded_tensor_dict_into_mb_list(
         data, MicroBatchSpec(n_mbs=effective_n_mbs), group=group
-    ).mbs
+    )
+    return mb_list if return_metadata else mb_list.mbs
 
 
 def all_gather_int(value: int, group):

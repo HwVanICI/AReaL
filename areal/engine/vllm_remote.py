@@ -31,6 +31,7 @@ from areal.api.io_struct import (
     detect_image_mime,
     get_versioned_lora_name,
 )
+from areal.engine.r3.preprocess import decode_vllm_routed_experts
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
@@ -187,6 +188,12 @@ class VLLMBackend:
         choice = response["choices"][0]
         stop_reason = choice.get("finish_reason") or "stop"
         output_tokens = list(choice.get("token_ids") or [])
+        routed_experts = choice.get("routed_experts")
+        if routed_experts is not None:
+            routed_experts = decode_vllm_routed_experts(
+                routed_experts,
+                source="V1 VLLMBackend",
+            )
 
         logprobs_payload = choice.get("logprobs") or {}
         content = logprobs_payload.get("content") or []
@@ -202,6 +209,7 @@ class VLLMBackend:
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
+            routed_experts=routed_experts,
         )
 
     def build_score_request(

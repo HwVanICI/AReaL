@@ -38,6 +38,8 @@ from areal.api.cli_args import (
     vLLMConfig,
 )
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
+from areal.engine.r3.config import R3MoEConfig, resolve_r3_moe_config
+from areal.engine.r3.transport import without_r3_tensors
 from areal.experimental.inference_service.controller.controller import (
     RolloutControllerV2,
 )
@@ -121,6 +123,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        self._r3_moe_config: R3MoEConfig | None = None
         self._awex_runtime = prepare_awex_runtime(config)
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
@@ -568,6 +571,7 @@ class PPOTrainer:
 
     def _trajectory_for_teacher(self, traj: dict[str, Any]) -> dict[str, Any]:
         assert self.config.teacher is not None
+        traj = without_r3_tensors(traj)
         domain_key = self.config.teacher.domain_key
         if domain_key not in traj:
             return traj
@@ -762,6 +766,12 @@ class PPOTrainer:
             raise ValueError(f"Total epochs must be positive: {total_epochs}")
         steps_per_epoch = len(self.train_dataloader)
         max_steps = total_epochs * steps_per_epoch
+        workflow_kwargs = self._maybe_inject_r3_workflow_kwargs(
+            workflow, workflow_kwargs
+        )
+        eval_workflow_kwargs = self._maybe_inject_r3_workflow_kwargs(
+            eval_workflow, eval_workflow_kwargs
+        )
 
         # Initialize proxy workers if not using RolloutWorkflow
         if workflow is None:
@@ -821,7 +831,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    values = self.critic.compute_values(rollout_batch)
+                    values = self.critic.compute_values(
+                        [without_r3_tensors(traj) for traj in rollout_batch]
+                    )
                     for traj, v in zip(rollout_batch, values):
                         traj["values"] = v
                     self.critic.get_device_stats().log("critic values")
@@ -838,7 +850,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    ref_logps = self.ref.compute_logp(rollout_batch)
+                    ref_logps = self.ref.compute_logp(
+                        [without_r3_tensors(traj) for traj in rollout_batch]
+                    )
                     for traj, logp in zip(rollout_batch, ref_logps):
                         traj["ref_logp"] = logp
                     self.ref.get_device_stats().log("ref logp")
@@ -929,7 +943,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    self.critic.ppo_update(adv_batch)
+                    self.critic.ppo_update(
+                        [without_r3_tensors(traj) for traj in adv_batch]
+                    )
                     self.critic.step_lr_scheduler()
                     self.critic.get_device_stats().log("ppo critic update")
                 if self._should_offload_critic:
@@ -1264,9 +1280,7 @@ class PPOTrainer:
             )
         elif rollout_backend == "vllm":
             if self.config.rollout.return_routed_experts:
-                raise ValueError(
-                    "return_routed_experts is not supported with vLLM backend. Please disable return_routed_experts or switch to SGLang backend."
-                )
+                self.config.vllm.enable_return_routed_experts = True
             if lora_path is not None and self.config.actor.use_lora:
                 self.config.vllm.lora_modules = [
                     f"{self.config.gconfig.lora_name}-v0={lora_path}"
@@ -1507,6 +1521,77 @@ class PPOTrainer:
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
+    def _resolve_actor_r3_moe_config(self) -> R3MoEConfig:
+        if self._r3_moe_config is None:
+            from transformers import AutoConfig
+
+            hf_config = AutoConfig.from_pretrained(
+                self.config.actor.path,
+                trust_remote_code=True,
+            )
+            self._r3_moe_config = resolve_r3_moe_config(hf_config)
+        return self._r3_moe_config
+
+    def _supports_r3_workflow_shape(self, workflow: WorkflowLike | None) -> bool:
+        if workflow is None:
+            return False
+        if self._is_unsupported_r3_vision_workflow(workflow):
+            return False
+        if isinstance(workflow, str):
+            return workflow in {
+                "areal.workflow.rlvr.RLVRWorkflow",
+                "areal.experimental.openai.proxy.workflow.OpenAIProxyWorkflow",
+            }
+
+        from areal.experimental.openai.proxy.workflow import OpenAIProxyWorkflow
+        from areal.workflow.rlvr import RLVRWorkflow
+
+        supported_types = (RLVRWorkflow, OpenAIProxyWorkflow)
+        if isinstance(workflow, type):
+            return issubclass(workflow, supported_types)
+        return isinstance(workflow, supported_types)
+
+    def _is_unsupported_r3_vision_workflow(self, workflow: WorkflowLike | None) -> bool:
+        if isinstance(workflow, str):
+            return workflow == "areal.workflow.vision_rlvr.VisionRLVRWorkflow"
+        if workflow is None:
+            return False
+
+        from areal.workflow.vision_rlvr import VisionRLVRWorkflow
+
+        if isinstance(workflow, type):
+            return issubclass(workflow, VisionRLVRWorkflow)
+        return isinstance(workflow, VisionRLVRWorkflow)
+
+    def _maybe_inject_r3_workflow_kwargs(
+        self,
+        workflow: WorkflowLike | None,
+        workflow_kwargs: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not self.config.rollout.return_routed_experts:
+            return workflow_kwargs
+        if self._is_unsupported_r3_vision_workflow(workflow):
+            raise ValueError(
+                "return_routed_experts/R3 router replay currently supports packed "
+                "text RLVR and OpenAI proxy workflows only; VisionRLVRWorkflow is "
+                "not supported."
+            )
+        if not self._supports_r3_workflow_shape(workflow):
+            return workflow_kwargs
+
+        r3_config = self._resolve_actor_r3_moe_config()
+        if not isinstance(workflow, (str, type)):
+            setattr(workflow, "r3_num_moe_layers", r3_config.num_moe_layers)
+            setattr(workflow, "r3_topk", r3_config.topk)
+            setattr(workflow, "r3_moe_layer_indices", r3_config.moe_layer_indices)
+            return workflow_kwargs
+
+        updated = dict(workflow_kwargs or {})
+        updated.setdefault("r3_num_moe_layers", r3_config.num_moe_layers)
+        updated.setdefault("r3_topk", r3_config.topk)
+        updated.setdefault("r3_moe_layer_indices", r3_config.moe_layer_indices)
+        return updated
+
     def _validate_cfg(self):
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
@@ -1539,11 +1624,18 @@ class PPOTrainer:
                 "offload is enabled. Please set enable_offload=True."
             )
 
-        if rollout_backend == "vllm" and self.config.rollout.return_routed_experts:
-            raise ValueError(
-                "return_routed_experts is only supported with SGLang backend. "
-                "Please disable return_routed_experts or switch to SGLang backend."
-            )
+        if self.config.rollout.return_routed_experts:
+            if self.config.rollout._version != "v1":
+                raise ValueError(
+                    "Rollout routing replay currently supports only the V1 "
+                    "rollout controller."
+                )
+            if actor_backend != "megatron":
+                raise ValueError(
+                    "return_routed_experts requires actor.backend='megatron' because "
+                    "R3 training replay is only supported by Megatron actors."
+                )
+            self.config.actor.megatron.enable_router_replay = True
         if (
             actor_backend == "megatron"
             and self.config.actor.use_lora

@@ -116,6 +116,10 @@ def _configure_rollout_only(config):
 
 def _init_rollout(config, scheduler):
     rollout_alloc = ModelAllocation.from_str(config.rollout.backend, name="rollout")
+    if config.rollout.return_routed_experts and config.rollout._version != "v1":
+        raise ValueError(
+            "Routed-expert capture currently supports only the V1 rollout controller."
+        )
 
     if rollout_alloc.backend == "sglang":
         if config.rollout.return_routed_experts:
@@ -129,10 +133,7 @@ def _init_rollout(config, scheduler):
         )
     elif rollout_alloc.backend == "vllm":
         if config.rollout.return_routed_experts:
-            raise ValueError(
-                "return_routed_experts is not supported with vLLM backend. "
-                "Please disable return_routed_experts or switch to SGLang backend."
-            )
+            config.vllm.enable_return_routed_experts = True
         engine_cls = RemotevLLMEngine
         server_args = vLLMConfig.build_args(
             vllm_config=config.vllm,

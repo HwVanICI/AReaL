@@ -1,4 +1,5 @@
 import math
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -207,7 +208,7 @@ def test_ppo_update_advantage_sign_fractions_ignore_padding():
         patch("areal.trainer.ppo.actor.stats_tracker", tracker),
         patch(
             "areal.trainer.ppo.actor.split_training_batch_into_microbatches",
-            return_value=[data],
+            return_value=SimpleNamespace(mbs=[data]),
         ),
     ):
         actor._ppo_update(data)
@@ -250,7 +251,7 @@ def test_ppo_update_aligns_versions_before_counting_checkpoint_age(
         patch("areal.trainer.ppo.actor.stats_tracker", tracker),
         patch(
             "areal.trainer.ppo.actor.split_training_batch_into_microbatches",
-            return_value=[data, data],
+            return_value=SimpleNamespace(mbs=[data, data]),
         ),
     ):
         actor._ppo_update(data)

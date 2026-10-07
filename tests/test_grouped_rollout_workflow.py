@@ -15,12 +15,25 @@ from tests.experimental.openai.vision_stubs import (
 
 from areal.api import ModelResponse, RolloutWorkflow
 from areal.api.cli_args import GenerationHyperparameters, NormConfig
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra import workflow_context
 from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
 from areal.trainer.ppo.actor import _trajectory_row_counts
 from areal.trainer.ppo.loss_reduction import prepare_policy_gradient_batch
 from areal.utils.data import Normalization
 from areal.workflow.vision_rlvr import VisionRLVRWorkflow
+
+
+@pytest.mark.asyncio
+async def test_grouped_string_interactions_reject_duplicate_ids():
+    class StringWorkflow(RolloutWorkflow):
+        async def arun_episode(self, engine, data):
+            return {"shared-id": InteractionWithTokenLogpReward()}
+
+    workflow = GroupedRolloutWorkflow(StringWorkflow(), 2, Mock())
+
+    with pytest.raises(RuntimeError, match="Rollout interaction IDs must be unique"):
+        await workflow.arun_episode(None, {})
 
 
 @pytest.mark.asyncio
