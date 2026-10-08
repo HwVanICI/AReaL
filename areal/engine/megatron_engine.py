@@ -181,6 +181,7 @@ from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
+from areal.utils.stats_tracker import ReduceType
 
 logger = logging.getLogger("MegatronEngine")
 
@@ -2154,18 +2155,17 @@ class MegatronEngine(TrainEngine):
             self._r3_pending_valid = None
             if r3_completed and r3_context is not None:
                 r3_stats = r3_context["stats"]
-                active_mbs = r3_stats["router_stage_microbatches"]
-                r3_scalar_stats = {
-                    f"r3/{key}": value for key, value in r3_stats.items()
-                }
-                r3_scalar_stats["r3/enabled"] = 1.0
-                r3_scalar_stats["r3/replay_fraction_active"] = r3_stats[
-                    "mode_replay_microbatches"
-                ] / max(active_mbs, 1)
-                r3_scalar_stats["r3/skip_fraction_active"] = r3_stats[
-                    "skipped_microbatches"
-                ] / max(active_mbs, 1)
-                stats_tracker.scalar(**r3_scalar_stats)
+                with stats_tracker.scope("r3"):
+                    stats_tracker.scalar(enabled=1.0)
+                    stats_tracker.stat_compact(
+                        torch.ones(1, dtype=torch.bool),
+                        ReduceType.SUM,
+                        **{
+                            key: torch.tensor([value], dtype=torch.float32)
+                            for key, value in r3_stats.items()
+                            if key != "routing_valid_fraction"
+                        },
+                    )
 
     def train_batch(
         self,
@@ -2390,6 +2390,18 @@ class MegatronEngine(TrainEngine):
                 group=mpu.get_pipeline_model_parallel_group(),
             )
             data.update(data_list[0])
+        for prefix in ("r3/", "ppo_actor/update/r3/"):
+            if prefix + "samples_total" in data:
+                active_mbs = max(data[prefix + "router_stage_microbatches"], 1)
+                data[prefix + "routing_valid_fraction"] = data[
+                    prefix + "routing_valid_samples"
+                ] / max(data[prefix + "samples_total"], 1)
+                data[prefix + "replay_fraction_active"] = (
+                    data[prefix + "mode_replay_microbatches"] / active_mbs
+                )
+                data[prefix + "skip_fraction_active"] = (
+                    data[prefix + "skipped_microbatches"] / active_mbs
+                )
         return data
 
     def offload(self) -> None:
