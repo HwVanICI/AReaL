@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 import pytest_asyncio
+from transformers import GenerationConfig
 
 from areal.experimental.inference_service.data_proxy.app import (
     _flush_ready_trajectories,
@@ -40,7 +41,7 @@ def config():
 
 
 @pytest.fixture
-def mock_tokenizer():
+def mock_tokenizer(tmp_path):
     tok = MagicMock()
     tok.tokenize = AsyncMock(return_value=[101, 102, 103])
     tok.decode_token = MagicMock(side_effect=lambda tid: f"tok_{tid}")
@@ -52,6 +53,8 @@ def mock_tokenizer():
     tok._tok = MagicMock()
     tok._tok.eos_token_id = 2
     tok._tok.pad_token_id = 0
+    GenerationConfig(eos_token_id=2).save_pretrained(tmp_path)
+    tok._tok.name_or_path = str(tmp_path)
     return tok
 
 

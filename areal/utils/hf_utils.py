@@ -13,6 +13,16 @@ from areal.utils import pkg_version
 logger = logging.getLogger("HFUtils")
 
 
+def get_eos_token_ids(tokenizer: Any) -> set[int]:
+    """Read scalar or multiple EOS ids from the model's generation config."""
+    eos_ids = transformers.GenerationConfig.from_pretrained(
+        tokenizer.name_or_path
+    ).eos_token_id
+    if eos_ids is None:
+        return set()
+    return set(eos_ids if isinstance(eos_ids, list) else [eos_ids])
+
+
 @overload
 def apply_chat_template(
     tokenizer: transformers.PreTrainedTokenizerFast,

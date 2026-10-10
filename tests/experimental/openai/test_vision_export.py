@@ -12,6 +12,7 @@ import json
 
 import pytest
 import torch
+from transformers import GenerationConfig
 
 from tests.experimental.openai.vision_stubs import (
     EOS_ID,
@@ -52,6 +53,12 @@ from areal.utils.hf_utils import (
     vision_pad_tokens,
 )
 from areal.utils.image import base642image, image2base64
+
+
+@pytest.fixture(autouse=True)
+def _generation_config_for_stub_tokenizers(tmp_path, monkeypatch):
+    GenerationConfig(eos_token_id=EOS_ID).save_pretrained(tmp_path)
+    monkeypatch.setattr(StubTokenizer, "name_or_path", str(tmp_path), raising=False)
 
 
 @pytest.fixture

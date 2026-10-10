@@ -17,6 +17,7 @@ from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GenerationHyperparameters
 from areal.infra.platforms import current_platform
 from areal.utils import logging
+from areal.utils.hf_utils import get_eos_token_ids
 
 if TYPE_CHECKING:
     from transformers import AutoProcessor
@@ -113,12 +114,11 @@ class ModelResponse:
     def end_with_stop(self) -> bool:
         if self.tokenizer is None:
             raise ValueError("tokenizer is None, cannot check end_with_stop")
-        eos_id = self.tokenizer.eos_token_id
         pad_id = self.tokenizer.pad_token_id
         if len(self.output_tokens) == 0:
             return False
         last_token = self.output_tokens[-1]
-        return (eos_id is not None and last_token == eos_id) or (
+        return last_token in get_eos_token_ids(self.tokenizer) or (
             pad_id is not None and last_token == pad_id
         )
 
@@ -127,15 +127,14 @@ class ModelResponse:
         if self.tokenizer is None:
             raise ValueError("tokenizer is None, cannot get output_tokens_without_stop")
         if self.stop_reason not in ["length", "abort"] and self.output_tokens:
-            if not self.end_with_stop:
+            pad_id = self.tokenizer.pad_token_id
+            stop_tokens = get_eos_token_ids(self.tokenizer) | {pad_id}
+            stop_tokens.discard(None)
+            if self.output_tokens[-1] not in stop_tokens:
                 raise ValueError(
                     f"output_tokens does not end with eos or pad token, it ends with {self.output_tokens[-1]}, but stop_reason is {self.stop_reason}"
                 )
             pad_or_eos_len = 0
-            eos_id = self.tokenizer.eos_token_id
-            pad_id = self.tokenizer.pad_token_id
-            stop_tokens = {eos_id, pad_id}
-            stop_tokens.discard(None)
             for tok in reversed(self.output_tokens):
                 if tok in stop_tokens:
                     pad_or_eos_len += 1
