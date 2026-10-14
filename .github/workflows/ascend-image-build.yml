@@ -41,9 +41,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        accelerator:
-          - a2
-          - a3
+        include:
+          - accelerator: a2
+          - accelerator: a3
+          - accelerator: a5
+            source_ref: ascend-950-dev
 
     env:
       ACCELERATOR: ${{ matrix.accelerator }}
@@ -66,7 +68,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ matrix.source_ref || inputs.source_ref || github.sha }}
 
       - name: Record source revision
         id: source

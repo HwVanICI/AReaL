@@ -236,7 +236,7 @@ def main() -> None:
     parser.add_argument("--previous", type=Path)
     parser.add_argument("--current", type=Path)
     parser.add_argument("--repository")
-    parser.add_argument("--accelerator", choices=("a2", "a3"))
+    parser.add_argument("--accelerator", choices=("a2", "a3", "a5"))
     parser.add_argument("--dockerfile")
     parser.add_argument("--cache")
     parser.add_argument("--revision")
