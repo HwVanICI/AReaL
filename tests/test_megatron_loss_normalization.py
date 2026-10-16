@@ -28,14 +28,25 @@ class _MicroBatches(list):
 @pytest.mark.parametrize("dp_size", [1, 2])
 @pytest.mark.parametrize("n_mbs", [1, 3])
 @pytest.mark.parametrize("loss_scale", [1.0, 128.0])
+@pytest.mark.parametrize("aggregation", ["token-mean", "traj-mean", "prompt-mean"])
 def test_train_gradient_matches_global_mean(
-    per_token, cp_size, dp_size, n_mbs, loss_scale
+    per_token, cp_size, dp_size, n_mbs, loss_scale, aggregation
 ):
     """Unequal and empty microbatches retain one global normalization."""
     parameter = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
     batches = [
         _MicroBatches(
-            {"weight": torch.tensor(float(w)), "target": float(rank + i)}
+            {
+                "weight": torch.tensor(
+                    float(w)
+                    if aggregation == "token-mean"
+                    else (i + 1) / (16 + rank)
+                    if w
+                    else 0.0
+                ),
+                "loss_mask": torch.ones(w, dtype=torch.bool),
+                "target": float(rank + i),
+            }
             for i, w in enumerate([7] if n_mbs == 1 else [3, 0, 4 + rank])
         )
         for rank in range(dp_size)
@@ -45,6 +56,9 @@ def test_train_gradient_matches_global_mean(
         return inputs["weight"]
 
     total_weight = sum(weight_fn(mb) for batch in batches for mb in batch)
+    total_tokens = sum(
+        mb["loss_mask"].count_nonzero() for batch in batches for mb in batch
+    )
     reference = (
         sum(
             (parameter - mb["target"]).square() * weight_fn(mb)
@@ -73,7 +87,10 @@ def test_train_gradient_matches_global_mean(
                     get_context_parallel_world_size=lambda: cp_size,
                     get_context_parallel_rank=lambda: cp_rank,
                 ),
-                "compute_total_loss_weight": lambda *args: total_weight * cp_size,
+                "compute_total_loss_weight": lambda mbs, fn, group: sum(
+                    fn(mb) for batch in batches for mb in batch
+                )
+                * cp_size,
             }
             train = _load_function(ENGINE_SOURCE, "train_batch", namespace)
             compute = _load_function(
@@ -94,7 +111,7 @@ def test_train_gradient_matches_global_mean(
                 model=[SimpleNamespace(config=config) for config in configs],
                 # Bridge can mutate the model config without changing tf_config.
                 tf_config=SimpleNamespace(calculate_per_token_loss=not per_token),
-                config=SimpleNamespace(is_critic=True),
+                config=SimpleNamespace(is_critic=True, loss_aggregation=aggregation),
                 enable_tree_training=False,
                 device="cpu",
                 optimizer=SimpleNamespace(
@@ -138,7 +155,7 @@ def test_train_gradient_matches_global_mean(
     loss = sum(scheduled_losses)
     if per_token:
         count = sum(counts)
-        torch.testing.assert_close(count.float(), total_weight, rtol=0, atol=0)
+        torch.testing.assert_close(count.float(), total_tokens.float(), rtol=0, atol=0)
         loss = loss / count
     gradient = torch.autograd.grad(loss / loss_scale, parameter)[0]
     torch.testing.assert_close(gradient, reference_grad, rtol=1e-6, atol=1e-7)

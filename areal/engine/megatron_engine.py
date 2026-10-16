@@ -1278,7 +1278,7 @@ class MegatronEngine(TrainEngine):
         # loss, so all_gather's backward (reduce_scatter) sums cp_size identical
         # gradients, amplifying by cp_size. Including CP in the weight all-reduce
         # introduces a matching cp_size factor in the denominator, cancelling out.
-        # Per-token mode uses this reduction only to validate a positive batch weight.
+        # Weighted per-token mode also needs this floating-point normalizer.
         total_loss_weight = compute_total_loss_weight(
             mb_list,
             loss_weight_fn,
@@ -1293,6 +1293,18 @@ class MegatronEngine(TrainEngine):
         if calculate_per_token_loss:
             # MCore normalizes all gradients by the reported global token count.
             loss_multiplier = 1.0
+            if getattr(self.config, "loss_aggregation", None) in (
+                "traj-mean",
+                "prompt-mean",
+            ):
+                # Fractional unit weights cannot be reported as integer token
+                # counts. Keep MCore's count physical and rescale the numerator.
+                total_tokens = compute_total_loss_weight(
+                    mb_list,
+                    lambda mb: mb["loss_mask"].count_nonzero(),
+                    mpu.get_data_parallel_group(with_context_parallel=True),
+                )
+                loss_multiplier = total_tokens / total_loss_weight
         else:
             # The two-value callback is already globally normalized; compensate
             # Megatron's division by num_microbatches and DDP's averaging.
@@ -3325,7 +3337,7 @@ class MegatronEngine(TrainEngine):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
         total_loss_weight: torch.Tensor | None,
-        loss_multiplier: float = 1.0,
+        loss_multiplier: float | torch.Tensor = 1.0,
         per_token_loss: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         local_weight = loss_weight_fn(inputs)
@@ -3443,6 +3455,13 @@ class MegatronEngine(TrainEngine):
             loss = loss_fn(values, inputs)
 
         if per_token_loss:
+            if getattr(self.config, "loss_aggregation", None) in (
+                "traj-mean",
+                "prompt-mean",
+            ):
+                num_tokens = inputs["loss_mask"].count_nonzero()
+                loss = loss * local_weight / num_tokens.clamp_min(1)
+                local_weight = num_tokens
             return self._build_per_token_loss_output(
                 loss, local_weight, loss_multiplier
             )
@@ -3454,7 +3473,7 @@ class MegatronEngine(TrainEngine):
         self,
         loss: torch.Tensor,
         loss_weight: torch.Tensor,
-        loss_multiplier: float,
+        loss_multiplier: float | torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Split a replicated full-sequence loss and its count across CP ranks."""
         loss_weight = loss_weight.detach().to(device=loss.device, dtype=torch.int64)
