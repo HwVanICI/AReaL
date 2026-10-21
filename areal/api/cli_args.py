@@ -1837,7 +1837,7 @@ class vLLMConfig:
     # lora
     enable_lora: bool = False
     max_lora_rank: int = 16  # vllm's default
-    max_loras: int = 8  # override default
+    max_loras: int = 4  # override default
     lora_modules: list[str] | None = None  # lora_modules is automatically filled
     data_parallel_size: int = 1
     # will use explicit vllm config tp and pp if specified otherwise use allocmode

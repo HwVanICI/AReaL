@@ -49,6 +49,7 @@ class TimedResult(Generic[T]):
     create_time: int
     data: T
     task_id: int
+    multilora_name: str = ""
 
 
 @dataclass
@@ -59,7 +60,7 @@ class _TaskInput(Generic[T]):
     args: tuple
     kwargs: dict
     task_id: int
-
+    multilora_name: str = ""
 
 @dataclass
 class _Task(Generic[T]):
@@ -372,6 +373,7 @@ class AsyncTaskRunner(Generic[T]):
                             create_time=task_obj.create_time,
                             data=cast(T, result),
                             task_id=task_obj.task_input.task_id,
+                            multilora_name=task_obj.task_input.kwargs["multilora_name"],
                         )
                         self.output_queue.put_nowait(timed_result)
 
@@ -435,16 +437,24 @@ class AsyncTaskRunner(Generic[T]):
                     f"Task with this ID is already running."
                 )
 
-            coroutine: Coroutine[Any, Any, T] = cast(
+            multilora_name = task_input.kwargs.pop("multilora_name", "")
+
+            coroutine = cast(
                 Coroutine[Any, Any, T],
                 task_input.async_fn(*task_input.args, **task_input.kwargs),
             )
+
             async_task = asyncio.create_task(coroutine, name=tid)
+
+            ## Put it back.. just so that above task creation won't fail
+            task_input.kwargs["multilora_name"] = multilora_name
+
             running_tasks[tid] = _Task(
                 create_time=time.monotonic_ns(),
                 task=async_task,
                 task_input=task_input,
             )
+
             if self.enable_tracing and self.logger:
                 self.logger.info(
                     f"AsyncTaskRunner: Submitted task {tid}. "

@@ -19,9 +19,10 @@ VALID_DATASETS = [
     "virl39k",
     "hh-rlhf",
     "torl_data",
-    "aime",
-    "leetcode",
+    "humaneval",
+    "leetcode"
 ]
+
 
 logger = logging.getLogger("Dataset")
 
@@ -202,6 +203,33 @@ def _get_custom_dataset(
         from .torl_data import get_torl_data_rl_dataset
 
         return get_torl_data_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "amc12" in path and type == 'rl':
+        from .amc12 import get_amc12_rl_dataset
+        return get_amc12_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "hotpotqa" in path and type == "rl":
+        from .wiki import get_wiki_rl_dataset
+        return get_wiki_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "humaneval" in path and type == "rl":
+        from .humaneval import get_humaneval_rl_dataset
+        return get_humaneval_rl_dataset(
             path=path,
             split=split,
             tokenizer=tokenizer,

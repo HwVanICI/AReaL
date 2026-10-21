@@ -56,6 +56,65 @@ class VLLMBackend:
         _env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
         return _env
 
+
+    def build_generation_request_multilora(
+        self, req: ModelRequest, with_lora: bool, version: int, lora_name: str,
+    ) -> HttpRequest:
+        """Build vLLM generation request."""
+        gconfig = req.gconfig
+        stop_token_ids = gconfig.stop_token_ids
+
+        # NOTE: vLLM uses flat payload structure, not nested sampling_params
+        payload = {
+            "top_p": gconfig.top_p,
+            "top_k": gconfig.top_k,
+            "max_tokens": gconfig.max_new_tokens,
+            "temperature": 0.0 if gconfig.greedy else gconfig.temperature,
+            "stop_token_ids": stop_token_ids,
+            "ignore_eos": gconfig.ignore_eos,
+            "skip_special_tokens": gconfig.skip_special_tokens,
+            "frequency_penalty": gconfig.frequency_penalty,
+            "return_tokens_as_token_ids": True,
+            "logprobs": 0,
+            "use_beam_search": gconfig.use_beam_search,
+            "stream": False,
+            "model": get_versioned_lora_name(lora_name, version),
+        }
+        if gconfig.stop:
+            payload["stop"] = gconfig.stop
+
+        # if with_lora:
+        #     lora_name = gconfig.lora_name
+        #     if not lora_name:
+        #         raise ValueError(
+        #             "LoRA name (gconfig.lora_name) is required when use_lora is enabled."
+        #         )
+        #     payload["model"] = get_versioned_lora_name(lora_name, version)
+
+        if req.vision_msg_vllm:
+            images = iter(req.image_data)
+            parsed_input = req.vision_msg_vllm[0]
+            for msg in parsed_input:
+                if isinstance(msg["content"], list):
+                    for content in msg["content"]:
+                        if content.get("type") == "image_url":
+                            try:
+                                base64_img = next(images)
+                            except StopIteration:
+                                raise ValueError(
+                                    "Not enough images in req.image_data to match image_url entries."
+                                )
+                            mime = detect_image_mime(base64_img)
+                            content["image_url"] = {
+                                "url": f"data:{mime};base64,{base64_img}"
+                            }
+            payload["messages"] = parsed_input.copy()
+            payload["logprobs"] = True
+            return HttpRequest(endpoint="/v1/chat/completions", payload=payload)
+        else:
+            payload["prompt"] = req.input_ids.copy()
+            return HttpRequest(endpoint="/v1/completions", payload=payload)
+        
     def build_generation_request(
         self, req: ModelRequest, with_lora: bool, version: int
     ) -> HttpRequest:
@@ -254,6 +313,31 @@ class VLLMBackend:
             ]
         )
 
+    def build_distributed_load_lora_adapter(
+        self, req
+    ):
+        """Build vLLM distributed lora loading; simply copying format /
+        method of weight update to pass to each rollout worker's model_runner"""
+
+        payload = {**req}
+        endpoint = "/v1/load_lora_adapter"
+
+        from dataclasses import dataclass
+        @dataclass
+        class AddLoRARequest:
+            """Collection of HTTP requests needed for a LoRA adding operation."""
+            requests: list[HttpRequest]
+        
+        return AddLoRARequest(
+            requests=[
+                HttpRequest(
+                    endpoint=endpoint,
+                    payload=payload,
+                )
+            ]
+        )
+        
+        
     def build_init_weights_group_request(
         self, addr: str, server_idx: int, meta: WeightUpdateMeta
     ) -> HttpRequest:
@@ -516,6 +600,18 @@ class RemotevLLMEngine(InferenceEngine):
         """Update weights from disk."""
         return self._engine.update_weights_from_disk(meta)
 
+    def load_lora_adapter(
+        self, req
+    ) -> Future[None]:
+        """Add lora adapter"""
+        return self._engine.load_lora_adapter(req)
+    
+    def remove_lora_adapter(
+        self, req
+    ) -> Future[None]:
+        """remove lora adapter"""
+        return self._engine.remove_lora_adapter(req)
+    
     def update_weights_from_awex(
         self,
         meta: WeightUpdateMeta,
@@ -559,10 +655,10 @@ class RemotevLLMEngine(InferenceEngine):
         return self._engine.wait(count, timeout, raise_timeout)
 
     def wait_for_task(
-        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+        self, multilora_name: str, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
         """Wait for a specific task to complete by task_id."""
-        return self._engine.wait_for_task(task_id, timeout, raise_timeout)
+        return self._engine.wait_for_task(multilora_name, task_id, timeout, raise_timeout)
 
     def rollout_batch(
         self,

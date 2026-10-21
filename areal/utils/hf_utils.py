@@ -40,12 +40,32 @@ def apply_chat_template(
     tokenize: bool = True,
     **kwargs: Any,
 ) -> list[int] | str:
-    """Apply chat template, normalising transformers >=5.0 dict return to list[int]."""
-    result = tokenizer.apply_chat_template(messages, tokenize=tokenize, **kwargs)
-    if tokenize and pkg_version.is_version_greater_or_equal("transformers", "5.0"):
-        return list(result["input_ids"])
-    return result
+    """Apply chat formatting for models without a native chat template."""
 
+    if tokenizer.chat_template is not None:
+        result = tokenizer.apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            **kwargs,
+        )
+
+        if tokenize and pkg_version.is_version_greater_or_equal(
+            "transformers", "5.0"
+        ):
+            return list(result["input_ids"])
+
+        return result
+
+    # No native chat template: concatenate message contents.
+    text = "\n".join(message["content"] for message in messages)
+
+    if tokenize:
+        return tokenizer.encode(
+            text,
+            add_special_tokens=True,
+        )
+
+    return text
 
 @lru_cache(maxsize=8)
 def load_hf_tokenizer(
