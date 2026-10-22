@@ -112,7 +112,6 @@ def main(args):
         lora_model_base_path=config.actor.path,
     ) as trainer:
         trainer.train(
-            workflow="areal.workflow.rlvr.RLVRWorkflow",
             reward_stop_thresholds=reward_stop_thresholds,
         )
 
