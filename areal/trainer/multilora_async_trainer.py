@@ -1230,21 +1230,12 @@ class MultiLoRATrainerAsync:
 
     def train(
         self,
-        workflow: WorkflowLike | None = None,
         eval_workflow: WorkflowLike | None = None,
-        workflow_kwargs: dict[str, Any] | None = None,
         eval_workflow_kwargs: dict[str, Any] | None = None,
-        dynamic_filter_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         total_epochs: int | None = None,
         reward_stop_thresholds: dict[str, float] | None = None,
     ):
         config = self.config
-
-        start_step = (
-            self.recover_info.last_step_info.next().global_step
-            if self.recover_info is not None
-            else 0
-        )
 
         if total_epochs is None:
             total_epochs = config.total_train_epochs
@@ -1264,7 +1255,6 @@ class MultiLoRATrainerAsync:
         # ============================================================
         if reward_stop_thresholds is None:
             reward_stop_thresholds = {}
-        print(f"{reward_stop_thresholds=}")
 
         # ============================================================
         # Initialize per-LoRA weight update metadata.
@@ -1477,14 +1467,6 @@ class MultiLoRATrainerAsync:
                             rollout_reward=mean_reward
                         )
 
-            print(
-                f"[ASYNC][REWARD] "
-                f"lora={lora_name} "
-                f"step={global_step} "
-                f"reward={mean_reward}",
-                flush=True,
-            )
-
             # --------------------------------------------------------
             # STEP 3:
             # Set current task.
@@ -1528,15 +1510,6 @@ class MultiLoRATrainerAsync:
             assert (
                 versioned_meta_new.lora_name
                 == lora_name
-            )
-
-            print(
-                f"[ASYNC][TRAIN] "
-                f"lora={lora_name} "
-                f"step={global_step} "
-                f"current_version={current_version} "
-                f"new_version={new_version}",
-                flush=True,
             )
 
             # --------------------------------------------------------
@@ -1879,11 +1852,6 @@ class MultiLoRATrainerAsync:
                     task=task_state,
                 )
 
-            # --------------------------------------------------------
-            # Pause rollout while updating weights.
-            # --------------------------------------------------------
-            # self.rollout.pause()
-
             actor_stats = None
 
             # --------------------------------------------------------
@@ -2079,8 +2047,6 @@ class MultiLoRATrainerAsync:
                     old_meta.path
                 )
                 
-            # self.rollout.resume()
-
             # --------------------------------------------------------
             # Determine whether this LoRA should stop.
             #
@@ -2091,14 +2057,11 @@ class MultiLoRATrainerAsync:
                 lora_name
             )
             
-            print(f"!!! line 2097 {stop_threshold=}")
-
             if stop_threshold is not None:
                 should_stop = (
                     mean_reward is not None
                     and mean_reward >= stop_threshold
                 )
-                print(f"!!! line 2102 {should_stop=}")
 
                 if should_stop:
                     print(
@@ -2118,8 +2081,6 @@ class MultiLoRATrainerAsync:
                     >= task_state.num_steps
                 )
                 
-                print(f"!!! line 2121 {should_stop=}")
-
                 if should_stop:
                     print(
                         f"[ASYNC][STOP] "
@@ -2130,9 +2091,7 @@ class MultiLoRATrainerAsync:
                         flush=True,
                     )
 
-            print(f"{task_state.global_step=} {task_state.num_steps=}")
             if task_state.global_step >= task_state.num_steps:
-                print("!!! line 2133 should_Stop = True")
                 should_stop = True
                 
             # --------------------------------------------------------

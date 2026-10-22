@@ -80,11 +80,11 @@ def is_clean_answer(pred):
     if "<" in pred or ">" in pred:
         return False
     
-    # No long sentences (heuristic)
-    if len(pred.split()) > 10:
+    # No long sentences
+    if len(pred.split()) > 50:
         return False
     
-    # No obvious placeholder patterns
+    # No obvious placeholder patterns; this was used for reward-hacking
     blacklist = ["final answer", "answer:", "solution", "unknown", "search()"]
     if any(b in pred.lower() for b in blacklist):
         return False

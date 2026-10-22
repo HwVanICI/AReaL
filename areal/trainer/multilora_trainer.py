@@ -1231,11 +1231,8 @@ class MultiLoRATrainer:
 
     def train(
         self,
-        workflow: WorkflowLike | None = None,
         eval_workflow: WorkflowLike | None = None,
-        workflow_kwargs: dict[str, Any] | None = None,
         eval_workflow_kwargs: dict[str, Any] | None = None,
-        dynamic_filter_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         total_epochs: int | None = None,
         reward_stop_thresholds: dict[str, float] | None = None,
     ):
@@ -1261,14 +1258,6 @@ class MultiLoRATrainer:
 
         if reward_stop_thresholds is None:
             reward_stop_thresholds = {}
-
-        print(
-            f"[SYNC][INIT] "
-            f"start_step={start_step} "
-            f"total_epochs={total_epochs} "
-            f"reward_stop_thresholds={reward_stop_thresholds}",
-            flush=True,
-        )
 
         # ============================================================
         # Initialize tasks and LoRA metadata

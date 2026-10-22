@@ -655,7 +655,6 @@ class FSDPEngine(TrainEngine):
         import time
         from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-        update_start_t = time.time()
         task_path = os.path.join(meta.path, f"{lora_name}_v{global_step}")
 
         # Only rank 0 loads LoRA weights
@@ -702,7 +701,7 @@ class FSDPEngine(TrainEngine):
             self.model.tie_weights()
 
         # Broadcast buffers (rotary embeddings etc.)
-        for name, buf in self.model.named_buffers():
+        for _, buf in self.model.named_buffers():
             dist.broadcast(buf, src=0)
 
         self._load_optimizer_state(task_path)
