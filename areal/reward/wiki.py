@@ -112,7 +112,7 @@ def wiki_reward_fn(prompt, completions, prompt_ids, completion_ids, answer, **kw
 
     with httpx.Client(timeout=30) as client:
         payload = {
-            "model": "qwen",
+            "model": "judge",
             "prompt": (
                 "You are a strict evaluator.\n\n"
 

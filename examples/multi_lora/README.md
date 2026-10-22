@@ -1,7 +1,5 @@
 # Setup for Multi-LoRA
 
-
-
 ## Environmental Settings
 `docker pull ghcr.io/hwvanici/areal_npu:v1.0.5-a3`
 
@@ -54,8 +52,6 @@ docker run \
   -e https_proxy="${HTTPS_PROXY:-}" \
   -e HTTP_PROXY="${HTTP_PROXY:-}" \
   -e HTTPS_PROXY="${HTTPS_PROXY:-}" \
-  -e no_proxy=7.150.15.38,7.150.8.68,127.0.0.1,localhost,7.150.10.228,7.150.15.242,7.150.14.236,7.150.10.22,7.150.12.254,7.150.8.112,7.150.11.220,7.150.8.255,7.150.9.97,7.150.10.28,7.150.15.115,7.150.12.40,7.150.13.70,7.150.11.40,7.150.11.163,7.150.14.151,7.150.8.125,7.150.10.104,7.150.9.235,7.150.13.255,mirrors.tools.huawei.com,mirrors.myhuaweicloud.com,.huawei.com \
-  -e NO_PROXY=7.150.15.38,7.150.8.68,127.0.0.1,localhost,7.150.10.228,7.150.15.242,7.150.14.236,7.150.10.22,7.150.12.254,7.150.8.112,7.150.11.220,7.150.8.255,7.150.9.97,7.150.10.28,7.150.15.115,7.150.12.40,7.150.13.70,7.150.11.40,7.150.11.163,7.150.14.151,7.150.8.125,7.150.10.104,7.150.9.235,7.150.13.255,mirrors.tools.huawei.com,mirrors.myhuaweicloud.com,.huawei.com \
   -e GIT_SSL_NO_VERIFY=1 \
   -u root \
   -itd "${IMAGE}" /bin/bash
@@ -66,49 +62,41 @@ AReaL Version: `v1.0.5`
 vLLM Version: `0.23.0`
 vLLM_Ascend Version: `0.23.0rc2.dev107+geaefc536d`
 
+## Datasets
+The data can be found here:
+- AMC12: https://huggingface.co/datasets/edev2000/amc12-full
+- GSM8k: https://huggingface.co/datasets/openai/gsm8k/tree/main
+- Wiki: For repeatability, we used the validation set in https://huggingface.co/datasets/hotpotqa/hotpot_qa/tree/main/fullwiki
+
 ## 2-gsm8k for Qwen3-0.6B
 **Async** run (each rollout -> train is asynchronous).
 
 ```bash
-python examples/multi_lora/multilora_2gsm8k_async.py \
-  --config examples/multi_lora/gsm8k_grpo_lora.yaml
+python examples/multi_lora/gsm8k.py \
+  --config examples/multi_lora/_large_experiment_gsm8k.yaml \
+  train_dataset.path=/path/to/dataset/here \
+  valid_dataset.path=/path/to/dataset/here \
+  actor.path=/path/to/model/here
 ```
 
-**Sync** run (all rollouts will continue before they do training sequentially).
+## 3-task (gsm8k, amc12, wiki)
+To run this example, you need to put the correct model and data paths into the following three files:
+- _large_experiment_amc12.yaml
+- _large_experiment_gsm8k.yaml
+- _large_experiment_wiki.yaml
+
+Then, you need to deploy the LLM-as-a-Judge service on another node
 
 ```bash
-python examples/multi_lora/multilora_2gsm8k_sync.py \
-  --config examples/multi_lora/gsm8k_grpo_lora.yaml
+nohup vllm serve $MODEL_PATH \
+  --host 0.0.0.0 \
+  --port 7101 \
+  --data-parallel-size $DP \
+  --tensor-parallel-size $TP \
+  --served-model-name judge
 ```
 
-Below is the reward curve (async training two 0.6B LoRAs on gsm8k):
-![alt text](imgs/image.png)
-
-## 2-gsm8k for Qwen3.8-27B
-Please note that 27B does not work with TP. We need to use PP.
+The URL for the judge (i.e., http://$IP_ADDRESS:7101/v1/completions) should be created and then passed as an environment variable when launching this example:
 ```bash
-python examples/multi_lora/multilora_2gsm8k_async_27B.py \
-  --config examples/multi_lora/gsm8k_grpo_lora.yaml \
-  scheduler.type=local \
-  gconfig.max_new_tokens=4096 \
-  gconfig.max_tokens=8192 \
-  cluster.n_nodes=1 \
-  cluster.n_gpus_per_node=16 \
-  rollout.backend=vllm:d4p2t1 \
-  rollout.max_concurrent_rollouts=10000 \
-  rollout.max_head_offpolicyness=0 \
-  actor.backend=fsdp:d8p1t1 \
-  actor.path=/efs_rl/models/Qwen3.8-27B \
-  +actor.fsdp.memory_efficient_load=true \
-  actor.mb_spec.max_tokens_per_mb=10000 \
-  ref.mb_spec.max_tokens_per_mb=10000 \
-  actor.optimizer.lr=7e-5 \
-  vllm.max_model_len=10000 \
-  vllm.gpu_memory_utilization=0.97 \
-  vllm.enforce_eager=true \
-  train_dataset.batch_size=16 \
-  train_dataset.path=/efs_rl/simar/datasets/gsm8k \
-  valid_dataset.batch_size=16 \
-  valid_dataset.path=/efs_rl/simar/datasets/gsm8k \
-  2>&1 | tee out.log
+WIKI_JUDGE_URL=$JUDGE_URL python examples/multi_lora/total_exp_marlaas.py 
 ```

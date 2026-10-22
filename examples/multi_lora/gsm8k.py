@@ -93,7 +93,7 @@ def main(args):
     parser = argparse.ArgumentParser(add_help=False)
     custom_args, hydra_args = parser.parse_known_args(args)
 
-    n_tasks = 1
+    n_tasks = 2
 
     config, multi_task_manager = load_gsm8k(
         n_tasks=n_tasks,
