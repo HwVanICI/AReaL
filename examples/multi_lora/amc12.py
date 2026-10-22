@@ -12,9 +12,8 @@ from copy import deepcopy
 def load_amc12(n_tasks: int, args=None, multi_task_manager=None, num_registered=0, num_steps=100):
     
     if args is None:
-        args = ['--config', '/home/tim/AReaL_0923_working_llama/examples/multi_lora/_large_experiment_amc12_llama.yaml']  # <-- update this
-
-            
+        args = ['--config', './examples/multi_lora/_large_experiment_amc12.yaml']  # <-- update this
+     
     config, _ = load_expr_config(args, GRPOConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
 
@@ -114,4 +113,4 @@ def main(args):
             reward_stop_thresholds=reward_stop_thresholds,
         )
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main(sys.argv[1:])

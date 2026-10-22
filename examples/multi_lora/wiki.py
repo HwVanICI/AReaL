@@ -1,5 +1,6 @@
 import argparse
 import sys
+import os
 
 from areal import MultiLoRATrainerAsync
 from areal.api.cli_args import GRPOConfig, load_expr_config
@@ -12,11 +13,15 @@ from copy import deepcopy
 def load_search(n_tasks: int, args=None, multi_task_manager=None, num_registered=0, num_steps=100):
     
     if args is None:
-        args = ['--config', '/home/tim/AReaL_external/examples/multi_lora/_large_experiment_wiki_qwen3.5-9B.yaml']  # <-- update this
-
-            
+        args = ['--config', './examples/multi_lora/_large_experiment_wiki']  # <-- update this
+ 
     config, _ = load_expr_config(args, GRPOConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
+
+    ## Verify URL is set
+    url = os.getenv("WIKI_JUDGE_URL")
+    if not url:
+        raise ValueError("WIKI_JUDGE_URL environment variable is not set")
 
     if multi_task_manager is None:
         multi_task_manager = MultiTaskManager()
@@ -112,4 +117,4 @@ def main(args):
         )
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main(sys.argv[1:])

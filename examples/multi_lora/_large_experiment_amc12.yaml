@@ -40,10 +40,10 @@ rollout:
 gconfig:
   n_samples: 4
   min_new_tokens: 0
-  max_new_tokens: 1024
+  max_new_tokens: 4096
   greedy: false
   temperature: 1.0
-  lora_name: "lora-wiki"
+  lora_name: "lora-amc12"
 
 actor:
   fsdp:
@@ -51,7 +51,7 @@ actor:
   backend: "fsdp:d8p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: /efs_rl/models/Qwen3.5-9B
+  path: /path/to/model
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -149,12 +149,12 @@ vllm:
   seed: ${seed}
   skip_tokenizer_init: false
   dtype: ${actor.dtype}
-  max_model_len: 8000
-  gpu_memory_utilization: 0.9
+  max_model_len: 32768
+  gpu_memory_utilization: 0.95
   # lora
   enable_lora: ${rollout.use_lora}
   max_lora_rank: ${actor.lora_rank}
-  max_num_seqs: 300
+  max_num_seqs: 1800
   enforce_eager: true
   max_loras: 5
 
@@ -164,9 +164,16 @@ train_dataset:
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: /home/tim/data/hotpotqa/validation-00000-of-00001.parquet
+  path: /path/to/data/amc12/
   type: rl
   max_length: 2048
+
+valid_dataset:
+  batch_size: 32
+  pin_memory: true
+  num_workers: 4
+  path: /path/to/data/amc12/
+  type: rl
 
 # Utilities
 saver:
@@ -200,11 +207,6 @@ stats_logger:
   fileroot: ${cluster.fileroot}
   wandb:
     mode: disabled
-  swanlab:
-    project: t00926703
-    name: qwen3.5_single_lora_onpolicy_wiki
-    mode: cloud
-    api_key: MHr2kFFcp5QZLSCPytEeE
 
 perf_tracer:
   experiment_name: ${experiment_name}

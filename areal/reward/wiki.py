@@ -2,6 +2,12 @@ import asyncio
 import httpx
 import re
 import os
+import httpx
+import json
+
+from areal.utils import logging
+
+logger = logging.getLogger("WIKIReward")
 
 # ===============================
 # Helpers
@@ -9,8 +15,6 @@ import os
 
 def normalize_text(text):
     return (text or "").lower().strip()
-
-import re
 
 _BOX = re.compile(r"\\boxed\s*\{")
 
@@ -51,53 +55,6 @@ def get_http_client():
     return _HTTP_CLIENT
 
 
-# # # ===============================
-# # # Judge
-# # # ===============================
-
-# # async def judge_answer(client, url, pred, gold):
-# #     prompt = (
-# #         "Compare the generated answer to the gold answer. "
-# #         "It doesn't have to exactly match text, "
-# #         "the answer may be expressed differently as long as the meaning is identical. "
-# #         "Respond only with 'correct' or 'incorrect'.\n\n"
-
-# #         f"Generated answer: {pred}\n"
-# #         f"Gold answer: {gold}\n"
-# #         "Your answer:"
-# #     )
-    
-# #     print(f"!!! sending prompt: {prompt=}")
-
-# #     try:
-# #         payload = {
-# #             "model": "qwen",
-# #             "prompt": prompt,
-# #             "temperature": 0,
-# #             "top_p": 1.0,
-# #             "max_tokens": 10,
-# #         }
-
-# #         r = await client.post(url, json=payload)
-
-# #         if r.status_code == 200:
-# #             resp = r.json()["choices"][0]["text"].lower().strip()
-
-# #             print(f"!!! received response: {resp=}")
-
-
-# #             if "incorrect" == resp:
-# #                 return 0.0
-# #             elif "correct" == resp:
-# #                 return 1.0
-
-
-# #         return 0.0
-
-# #     except Exception:
-# #         return 0.0
-
-
 # ===============================
 # Async runner
 # ===============================
@@ -117,15 +74,6 @@ def run_async(coro):
 # Reward function (ENTRYPOINT)
 # ===============================
 
-from areal.utils import logging
-
-logger = logging.getLogger("WIKIReward")
-
-
-
-import httpx
-
-import re
 
 def is_clean_answer(pred):
     # No XML / tags
@@ -147,17 +95,6 @@ def wiki_reward_fn(prompt, completions, prompt_ids, completion_ids, answer, **kw
     pred = clean_final_answer(str(completions))
     gold = clean_final_answer(str(answer))
     
-    import json
-
-    # output_path = "/home/tim/debug_wiki_outputs.jsonl"
-
-    # with open(output_path, "a") as f:
-    #     record = {
-    #         "pred": pred,
-    #         "gold": gold
-    #     }
-    #     f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        
     # Fast path: exact match
     if pred == gold:
         return 1.0
@@ -171,8 +108,7 @@ def wiki_reward_fn(prompt, completions, prompt_ids, completion_ids, answer, **kw
     if not pred:
         return 0.0
 
-
-    url = "http://7.150.11.220:7101/v1/completions"
+    url = os.getenv("WIKI_JUDGE_URL")
 
     with httpx.Client(timeout=30) as client:
         payload = {
@@ -226,9 +162,4 @@ def wiki_reward_fn(prompt, completions, prompt_ids, completion_ids, answer, **kw
         # Extract text inside <ANSWER> tags
         resp = resp.split("</answer>")[0].split("<answer>")[-1].strip()
 
-        # Logging
-        # logger.info(f"{pred=} {gold=} {resp=}")
-        # with open("/tmp/reward_debug.log", "a") as f:
-        #     f.write(f"Pred: {pred}, Gold: {gold}, Eval: {resp}\n")
-
-        return 1.0 if resp == "correct" else 0.0
+        return 1.0 if resp == "correct" else 0.0

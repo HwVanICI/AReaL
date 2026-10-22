@@ -1,7 +1,6 @@
 import argparse
 import sys
 
-
 from areal import MultiLoRATrainerAsync
 from areal.api.cli_args import GRPOConfig, load_expr_config
 from areal.dataset import get_custom_dataset
@@ -13,7 +12,7 @@ from copy import deepcopy
 def load_gsm8k(n_tasks: int, args=None, multi_task_manager=None, num_registered=0, num_steps=100):
     
     if args is None:
-        args=['--config', '/home/tim/AReaL_0923_working_llama/examples/multi_lora/_large_experiment_gsm8k_llama.yaml']
+        args=['--config', './examples/multi_lora/_large_experiment_gsm8k.yaml']
             
     config, _ = load_expr_config(args, GRPOConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
@@ -115,4 +114,4 @@ def main(args):
         )
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main(sys.argv[1:])
