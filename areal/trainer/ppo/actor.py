@@ -659,21 +659,26 @@ class PPOActorController(TrainController):
             )
 
         data = args[0]
-        multi_modal_payloads = [
-            {key: value for key, value in item.items() if is_multi_modal_key(key)}
+        bypassed_payloads = [
+            {
+                key: value
+                for key, value in item.items()
+                if is_multi_modal_key(key)
+                or key in ("routed_experts", "r3_routing_valid")
+            }
             for item in data
         ]
-        if not any(multi_modal_payloads):
+        if not any(bypassed_payloads):
             return self._custom_function_call(
                 "compute_advantages", *args, rpc_meta={"broadcast": True}, **kwargs
             )
 
-        # Advantage computation never consumes vision inputs. Keep the original
-        # RTensor references on the controller so the grouped image shards do
-        # not make an unnecessary worker round trip before ppo_update.
+        # Advantage computation consumes neither vision inputs nor MoE routing.
+        # Keep their original RTensor references on the controller to avoid an
+        # unnecessary worker round trip before ppo_update.
         rpc_data = [
-            {key: value for key, value in item.items() if not is_multi_modal_key(key)}
-            for item in data
+            {key: value for key, value in item.items() if key not in payload}
+            for item, payload in zip(data, bypassed_payloads, strict=True)
         ]
         results = self._custom_function_call(
             "compute_advantages",
@@ -682,14 +687,14 @@ class PPOActorController(TrainController):
             rpc_meta={"broadcast": True},
             **kwargs,
         )
-        if not isinstance(results, list) or len(results) != len(multi_modal_payloads):
+        if not isinstance(results, list) or len(results) != len(bypassed_payloads):
             raise RuntimeError(
                 "Megatron compute_advantages returned an invalid trajectory batch: "
-                f"expected {len(multi_modal_payloads)} items, got "
+                f"expected {len(bypassed_payloads)} items, got "
                 f"{type(results).__name__} of length "
                 f"{len(results) if isinstance(results, list) else 'unknown'}"
             )
-        for result, payload in zip(results, multi_modal_payloads, strict=True):
+        for result, payload in zip(results, bypassed_payloads, strict=True):
             if not isinstance(result, dict):
                 raise RuntimeError(
                     "Megatron compute_advantages returned a non-dict trajectory: "

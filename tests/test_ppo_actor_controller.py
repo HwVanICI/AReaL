@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from areal.api import ParallelStrategy
@@ -81,8 +82,18 @@ def test_non_megatron_compute_advantages_keeps_existing_payload(monkeypatch):
     assert captured["rpc_meta"] == {"broadcast": True}
 
 
-def test_megatron_advantages_reattach_images_after_balanced_dispatch(monkeypatch):
-    """Vision payloads follow original trajectory order after DP result merging."""
+@pytest.mark.parametrize(
+    "payload_keys",
+    [
+        ("multi_modal_input",),
+        ("routed_experts", "r3_routing_valid"),
+        ("multi_modal_input", "routed_experts", "r3_routing_valid"),
+    ],
+)
+def test_megatron_advantages_reattach_payloads_after_balanced_dispatch(
+    monkeypatch, payload_keys
+):
+    """Bypassed references follow original trajectory order after DP merging."""
     controller = _make_controller("megatron")
     controller.train_alloc.parallel = ParallelStrategy(data_parallel_size=2)
     controller.workers_is_dp_head = [True, False, True, False]
@@ -90,7 +101,7 @@ def test_megatron_advantages_reattach_images_after_balanced_dispatch(monkeypatch
         {
             "input_ids": torch.full((1, length), idx),
             "attention_mask": torch.ones(1, length, dtype=torch.bool),
-            "multi_modal_input": [{"pixel_values": torch.tensor([idx])}],
+            **{key: object() for key in payload_keys},
         }
         for idx, length in enumerate([2, 9, 4, 7])
     ]
@@ -100,7 +111,10 @@ def test_megatron_advantages_reattach_images_after_balanced_dispatch(monkeypatch
         assert [idx for group in indices for idx in group] != list(range(4))
         assert not kwargs
         assert all(
-            "multi_modal_input" not in item for group in args[0] for item in group
+            key not in item
+            for group in args[0]
+            for item in group
+            for key in payload_keys
         )
         worker_results = []
         for group in args[0]:
@@ -118,7 +132,8 @@ def test_megatron_advantages_reattach_images_after_balanced_dispatch(monkeypatch
     monkeypatch.setattr(controller, "_custom_function_call", dispatch)
     result = controller.compute_advantages(batch)
     for idx, item in enumerate(result):
-        assert item["multi_modal_input"] is batch[idx]["multi_modal_input"]
+        for key in payload_keys:
+            assert item[key] is batch[idx][key]
         torch.testing.assert_close(
             item["advantages"], batch[idx]["input_ids"].float(), rtol=0, atol=0
         )
