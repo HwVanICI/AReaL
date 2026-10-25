@@ -29,3 +29,4 @@ class NPUPlatform(Platform):
         self.synchronize()
         gc.collect()
         torch.npu.empty_cache()
+        torch.npu.memory.host_empty_cache()
