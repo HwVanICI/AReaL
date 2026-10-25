@@ -82,6 +82,8 @@ def _check_placeholder_count(req: ModelRequest) -> None:
 class VLLMBackend:
     """vLLM-specific backend implementation for remote inference."""
 
+    _sleep_level: int = 1
+
     @staticmethod
     def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
         _env = sanitize_tms_env_vars(env)
@@ -345,6 +347,10 @@ class VLLMBackend:
         self, meta: WeightUpdateMeta, engine_rank: int, num_engines: int
     ) -> HttpRequest:
         """Build vLLM Awex init request."""
+        if meta.enable_colocate_mode and not (
+            meta.weights_validation_steps > 0 and meta.comm_backend != "file"
+        ):
+            self._sleep_level = 2
         payload = {
             "meta_server_addr": meta.meta_server_addr,
             "engine_rank": engine_rank,
@@ -399,15 +405,18 @@ class VLLMBackend:
     def get_offload_request(self) -> HttpRequest:
         """Get vLLM offload request.
 
-        Uses vLLM's /sleep endpoint to offload model memory to CPU.
-        Default level is 1.
+        Uses vLLM's /sleep endpoint to release model device memory.
+        Default level is 1. Colocated Awex uses level 2 to discard weights
+        instead of backing them up to CPU, unless validation needs the old weights.
         """
-        return HttpRequest(endpoint="/sleep", payload={}, method="POST")
+        return HttpRequest(
+            endpoint=f"/sleep?level={self._sleep_level}", payload={}, method="POST"
+        )
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get vLLM onload request.
 
-        Uses vLLM's /wake_up endpoint to reload model memory from CPU.
+        Uses vLLM's /wake_up endpoint to restore model memory allocations.
         vLLM reads parameters from query string.
 
         Parameters
