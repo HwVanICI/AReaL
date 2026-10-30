@@ -17,6 +17,11 @@ on:
         description: Git ref to build
         required: true
         type: string
+    secrets:
+      SWR_USERNAME:
+        required: true
+      SWR_PASSWORD:
+        required: true
 
 permissions:
   actions: read
@@ -52,6 +57,7 @@ jobs:
       DOCKERFILE: Dockerfile.${{ matrix.accelerator }}
       IMAGE_CACHE: ghcr.io/hwvanici/areal_npu_buildcache:${{ matrix.accelerator }}
       IMAGE: ghcr.io/hwvanici/areal_npu:${{ matrix.accelerator }}-nightly
+      SWR_IMAGE: ${{ vars.SWR_IMAGE }}:${{ matrix.accelerator }}-nightly
 
     steps:
       - name: Checkout workflow helpers
@@ -96,6 +102,13 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             docker login ghcr.io --username "${{ github.actor }}" --password-stdin
 
+      - name: Log in to Huawei SWR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ vars.SWR_REGISTRY }}
+          username: ${{ secrets.SWR_USERNAME }}
+          password: ${{ secrets.SWR_PASSWORD }}
+
       - name: Restore previous nightly dependency inventory
         id: previous
         continue-on-error: true
@@ -133,6 +146,7 @@ jobs:
           SECONDS=0
           docker buildx bake \
             --file "${report_dir}/bake.json" \
+            --set "runtime.tags+=${SWR_IMAGE}" \
             --allow "fs.read=${GITHUB_WORKSPACE}" \
             --allow "fs.read=${report_dir}" \
             --allow "fs.write=${report_dir}" \

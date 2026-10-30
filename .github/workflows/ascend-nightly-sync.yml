@@ -103,5 +103,8 @@ jobs:
       contents: read
       packages: write
     uses: ./.github/workflows/ascend-image-build.yml
+    secrets:
+      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
+      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
     with:
       source_ref: ${{ needs.sync.outputs.source_sha }}
