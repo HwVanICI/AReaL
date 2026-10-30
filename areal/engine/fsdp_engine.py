@@ -266,6 +266,9 @@ class FSDPEngine(TrainEngine):
         self._per_layer_optim_wrapper: PerLayerOptimWrapper | None = None
         self.enable_tree_training: bool = self.config.enable_tree_training
 
+    def _get_policy_model_parts(self) -> list[torch.nn.Module]:
+        return [self.model]
+
     @classmethod
     def from_pretrained(
         cls,

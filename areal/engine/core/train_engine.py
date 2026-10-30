@@ -6,7 +6,7 @@ This module provides stateless utility functions that are shared across
 different training engine implementations (FSDP, Megatron, etc.).
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
@@ -25,6 +25,21 @@ __all__ = [
     "aggregate_eval_losses",
     "reorder_and_pad_outputs",
 ]
+
+
+def _iter_persistent_buffers(
+    module: torch.nn.Module,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield stable policy buffers, excluding non-persistent forward caches."""
+    seen: set[int] = set()
+    for prefix, child in module.named_modules():
+        for name, buffer in child.named_buffers(recurse=False, remove_duplicate=False):
+            if name in child._non_persistent_buffers_set:
+                continue
+            if id(buffer) in seen:
+                continue
+            seen.add(id(buffer))
+            yield f"{prefix}.{name}" if prefix else name, buffer
 
 
 def compute_total_loss_weight(

@@ -325,6 +325,46 @@ class _MegatronModelList(list):
 
 
 class MegatronEngine(TrainEngine):
+    @contextmanager
+    def _parameter_snapshot_sync_context(self):
+        """Drain parameter gathers before swapping live policy storage."""
+        assert self.model is not None
+        restore_chunks = []
+        try:
+            for module in self.model:
+                if not isinstance(module, DDP) or not module.use_forward_hook:
+                    continue
+                if module.remove_forward_pre_hook_handles:
+                    # Register before disabling: synchronization can fail after
+                    # hooks have already been removed.
+                    restore_chunks.append(module)
+                    module.disable_forward_pre_hook(param_sync=True)
+                else:
+                    module.start_param_sync(force_sync=True)
+            yield
+        finally:
+            for module in reversed(restore_chunks):
+                # Only touch DDP's own handles; cleanup must not dispatch
+                # another collective after a synchronization failure.
+                for handle in tuple(module.remove_forward_pre_hook_handles.values()):
+                    handle.remove()
+                module.remove_forward_pre_hook_handles.clear()
+                module.enable_forward_pre_hook()
+
+    def capture_parameter_snapshot(self) -> None:
+        with self._parameter_snapshot_sync_context():
+            super().capture_parameter_snapshot()
+
+    @contextmanager
+    def parameter_snapshot_context(self):
+        with self._parameter_snapshot_sync_context():
+            with super().parameter_snapshot_context():
+                yield
+
+    def _get_policy_model_parts(self) -> list[torch.nn.Module]:
+        assert self.model is not None
+        return self.model
+
     def __init__(self, config: TrainEngineConfig):
         self.config = config
         self.hf_config: PretrainedConfig

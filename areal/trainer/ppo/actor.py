@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -128,8 +129,19 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_logp", category="compute")
     @torch.no_grad()
-    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
-        return batched_call(self._compute_logp, data)
+    def compute_logp(
+        self,
+        data: list[dict[str, Any]],
+        *,
+        use_rollout_policy_snapshot: bool = False,
+    ) -> list[torch.Tensor] | None:
+        snapshot_context = (
+            self.engine.parameter_snapshot_context()
+            if use_rollout_policy_snapshot
+            else nullcontext()
+        )
+        with snapshot_context:
+            return batched_call(self._compute_logp, data)
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
@@ -250,10 +262,26 @@ class PPOActor:
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
-    def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        batched_call(self._ppo_update, data, unpack=False)
+    def ppo_update(
+        self,
+        data: list[dict[str, Any]],
+        n_minibatches: int | None = None,
+    ) -> None:
+        if n_minibatches is None:
+            n_minibatches = self.config.ppo_n_minibatches
+        if n_minibatches <= 0:
+            raise ValueError(f"n_minibatches must be positive, got {n_minibatches}")
+        batched_call(
+            functools.partial(self._ppo_update, n_minibatches=n_minibatches),
+            data,
+            unpack=False,
+        )
 
-    def _ppo_update(self, data: dict[str, Any]) -> None:
+    def _ppo_update(
+        self,
+        data: dict[str, Any],
+        n_minibatches: int,
+    ) -> None:
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
@@ -335,7 +363,7 @@ class PPOActor:
         self.engine.train()
         mb_inputs = split_padded_tensor_dict_into_mb_list(
             data,
-            mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
+            mb_spec=MicroBatchSpec(n_mbs=n_minibatches),
         )
 
         with stats_tracker.scope("update"):
@@ -371,6 +399,16 @@ class PPOActorController(TrainController):
             "compute_logp", *args, rpc_meta={"broadcast": True}, **kwargs
         )
 
+    def capture_rollout_policy_snapshot(self) -> None:
+        self._custom_function_call(
+            "capture_parameter_snapshot", rpc_meta={"broadcast": True}
+        )
+
+    def clear_rollout_policy_snapshot(self) -> None:
+        self._custom_function_call(
+            "clear_parameter_snapshot", rpc_meta={"broadcast": True}
+        )
+
     def compute_advantages(self, *args, **kwargs):
         return self._custom_function_call(
             "compute_advantages", *args, rpc_meta={"broadcast": True}, **kwargs
@@ -389,6 +427,12 @@ class PPOActorControllerV2(GatewayTrainController):
             "kwargs": serialize_value(kwargs),
         }
         return self._gateway_post_result("/ppo/actor/compute_logp", payload)
+
+    def capture_rollout_policy_snapshot(self) -> None:
+        self._gateway_post("/ppo/actor/capture_rollout_policy_snapshot", {})
+
+    def clear_rollout_policy_snapshot(self) -> None:
+        self._gateway_post("/ppo/actor/clear_rollout_policy_snapshot", {})
 
     def compute_advantages(self, *args, **kwargs):
         payload = {
