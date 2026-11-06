@@ -1,5 +1,5 @@
 diff --git a/vllm_ascend/quantization/methods/w8a8_mxfp8.py b/vllm_ascend/quantization/methods/w8a8_mxfp8.py
-index 09916f60..39b58426 100644
+index 09916f60..4221124e 100644
 --- a/vllm_ascend/quantization/methods/w8a8_mxfp8.py
 +++ b/vllm_ascend/quantization/methods/w8a8_mxfp8.py
 @@ -141,6 +141,24 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
@@ -42,3 +42,18 @@ index 09916f60..39b58426 100644
          # Restore weight: (input_size, output_size) -> (output_size, input_size)
          target_weight = layer.weight.data.transpose(0, 1).contiguous()
          layer.weight.data = layer.weight.data.transpose(0, 1)
+@@ -183,9 +209,11 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
+         # Restore weight_scale: (k_dim//2, n_dim, 2) -> (n_dim, k_dim)
+         # Current shape: (k_dim//2, n_dim, 2)
+         # Target shape: (n_dim, k_dim)
+-        target_scale = layer.weight_scale.data.transpose(0, 1).reshape(orig_scale_shape).contiguous()
+-        layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1).reshape(orig_scale_shape)
+-        layer.weight_scale.data.copy_(target_scale)
++        # Inference pairs scales, padding an odd number of 32-element groups.
++        # Remove that unused slot before returning to the logical loading shape.
++        n_dim, group_count = orig_scale_shape
++        logical_scale = layer.weight_scale.data.transpose(0, 1).reshape(n_dim, -1)
++        layer.weight_scale.data = logical_scale[:, :group_count].contiguous()
+
+         # Mark as not transformed (ready for weight loading)
+         layer._mxfp8_transformed = False

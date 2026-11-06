@@ -177,11 +177,23 @@ Ray 集群已按上述说明启动。
 
 ## 在线 Ascend MXFP8 Rollout
 
-在 AReaL 中，设置 `vllm.quantization: ascend` 目前仅表示启用在线 MXFP8
-rollout 量化。该路径要求 `vllm.load_format: dummy`、actor 使用 `xccl`
-权重更新，并且 actor 和 rollout 的 dtype 均为 BF16；该路径不支持 LoRA。AReaL
-会使用 dummy 权重初始化 rollout，并在每次 actor 权重更新时执行在线量化；此设置不用于从磁盘加载
-vLLM-Ascend 预量化 checkpoint。
-量化描述可以将归一化权重等非 MoE 权重保留为 `FLOAT`，但所有 `FusedMoE` 模块都必须使用
-`W8A8_MXFP8`。当前在线 rollout 路径尚未处理 `FLOAT` FusedMoE 的权重重载布局生命周期，
-因此不支持混用 `FLOAT` FusedMoE 权重。
+在 AReaL 中，设置 `vllm.quantization: ascend` 目前仅表示启用在线 MXFP8 rollout 量化。该路径要求
+`vllm.load_format: dummy`、actor 使用 `xccl` 或 `awex` 权重更新，并且 actor 和 rollout 的 dtype 均为
+BF16；该路径不支持 LoRA。AReaL 会使用 dummy 权重初始化 rollout，并在每次 actor 权重更新时执行在线量化；此设置不用于从磁盘加载
+vLLM-Ascend 预量化 checkpoint。 量化描述可以将归一化权重等非 MoE 权重保留为 `FLOAT`，但所有 `FusedMoE` 模块都必须使用
+`W8A8_MXFP8`。当前在线 rollout 路径尚未处理 `FLOAT` FusedMoE 的权重重载布局生命周期， 因此不支持混用 `FLOAT` FusedMoE
+权重。
+
+使用 `actor.weight_update_mode: awex` 时，当前在线 MXFP8 路径要求使用 Megatron actor。原有 AWEX converter
+先将 actor 的 BF16 参数转换为逻辑矩阵，训练侧再量化为 FP8 权重和 uint8 E8M0 scale。AWEX
+沿用原有的重分片、通信与共卡流程，直接写入推理模型的权重和 scale，接收完成后统一执行 post-load。FP8 权重通过 uint8
+字节视图传输，不进行整数数值转换；`FLOAT` 权重保留原 dtype。
+
+显存预算需考虑 FP8 推理模型与 AWEX IPC/通信缓存；共卡时还需考虑训练侧 BF16 权重、量化输出和临时空间。
+
+AWEX 在线 MXFP8 要求使用已接入发送端量化的 tensor 传输，不支持 `awex.comm_backend: file` 或 `astate`，并要求
+`awex.weights_validation_steps: 0`、`awex.dump_weights_list_for_validation` 为空。传输前根据实际
+AWEX metadata 检查量化矩阵的 K 及分片偏移是否按 32 对齐，以及 weight/scale 的形状、坐标和 dtype
+是否匹配，不按配置中的投影名称推算模型形状。 MoE 的 w13 本地 K（hidden size）和 w2 本地 K（本地 intermediate size）均需被 64
+整除，因为当前 vLLM-Ascend MoE scale 布局没有补齐奇数个 scale 的配对；这是加载布局限制，MXFP8 量化组大小仍为 32。需应用仓库携带的
+vLLM-Ascend FP8 补丁，其中也修复了 Dense 奇数个量化组的 scale 恢复。

@@ -14,11 +14,13 @@ ascend_mxfp8 = pytest.importorskip(
     reason="Ascend MXFP8 tests require torch_npu and vllm-ascend",
 )
 
-from areal.engine.vllm_ext import (
+from areal.engine.vllm_ext import (  # noqa: E402
     areal_vllm_server,
     vllm_worker_extension,
 )
-from areal.engine.vllm_remote import VLLMBackend
+from areal.engine.vllm_remote import VLLMBackend  # noqa: E402
+
+torch_npu = pytest.importorskip("torch_npu")
 
 
 def _run_with_generation_paused(coro):
@@ -318,12 +320,12 @@ def test_load_mxfp8_weights_maps_packed_linear_weight_and_scale(monkeypatch):
         )
 
     monkeypatch.setattr(
-        ascend_mxfp8.torch_npu,
+        torch_npu,
         "npu_dynamic_mx_quant",
         _npu_dynamic_mx_quant,
     )
     monkeypatch.setattr(
-        ascend_mxfp8.torch_npu, "float8_e4m3fn", torch.float8_e4m3fn
+        torch_npu, "float8_e4m3fn", torch.float8_e4m3fn
     )
     monkeypatch.setattr(ascend_mxfp8, "LinearBase", _Linear)
     monkeypatch.setattr(ascend_mxfp8, "FusedMoE", ())
@@ -364,12 +366,12 @@ def test_load_mxfp8_weights_quantizes_moe_weights_and_scales(monkeypatch):
         return tensor.to(dst_type), torch.ones(scale_shape, dtype=torch.uint8)
 
     monkeypatch.setattr(
-        ascend_mxfp8.torch_npu,
+        torch_npu,
         "npu_dynamic_mx_quant",
         _npu_dynamic_mx_quant,
     )
     monkeypatch.setattr(
-        ascend_mxfp8.torch_npu, "float8_e4m3fn", torch.float8_e4m3fn
+        torch_npu, "float8_e4m3fn", torch.float8_e4m3fn
     )
     monkeypatch.setattr(ascend_mxfp8, "LinearBase", _Linear)
     monkeypatch.setattr(ascend_mxfp8, "FusedMoE", _MoE)

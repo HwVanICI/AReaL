@@ -133,3 +133,56 @@ Optional:
 - Set `AREAL_AWEX_DEVICE_BACKEND=npu`.
 - Prefer `AREAL_AWEX_COMM_BACKEND=hccl` for integration path.
 - Awex NPU path typically uses `weights_exchange_ipc_backend=cpu`.
+
+Online Ascend MXFP8 requires a Megatron actor and a local BF16 checkpoint with a
+`W8A8_MXFP8` `quant_model_description.json`. The actor's original AWEX converter
+produces logical matrices, which are quantized on the actor. AWEX transfers FP8 weight
+bytes and uint8 E8M0 scales directly to the inference parameters; FLOAT parameters
+retain their original dtype. There is no full BF16 receive cache.
+
+Before weight transfer, actual AWEX metadata is checked for complete 32-element K
+groups, aligned K offsets, and matching weight/scale shapes, coordinates, and dtypes.
+Model shapes are not inferred from projection names in the configuration. The current
+vllm-ascend MoE layout additionally requires local K to be divisible by 64. This FP8
+path does not support `file` or `astate` transport and has no partial-group BF16
+fallback. Run the four integration cases with:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 \
+AREAL_AWEX_DEVICE_BACKEND=npu \
+AREAL_AWEX_COMM_BACKEND=hccl \
+AREAL_AWEX_DENSE_MODEL_PATH=/path/to/model \
+pytest tests/experimental/awex/test_awex_megatron_vllm_integration.py \
+  -k ascend-mxfp8 -v -s
+```
+
+The cases cover separate devices and shared devices, each in eager and ACL Graph mode.
+Shared-device cases put vLLM on the training devices and enable both AWEX colocation and
+vLLM sleep mode. Every inference device must have a corresponding training device; the
+defaults use one training rank and one inference worker.
+
+Each case performs at least three updates with different controlled matrix values,
+checks the actual local FP8 weights and scales through a test-only worker RPC, and runs
+inference after every update. Checks also verify inference parameter addresses across
+sleep/wake and assert that the receive lifecycle completed. The test enables
+`VLLM_SERVER_DEV_MODE` only in its server processes to expose the existing RPC endpoint.
+It also disables weight NZ format and optimized model substitutions for the RL
+reload/sleep lifecycle. Output includes update duration and each worker's peak allocated
+and reserved NPU memory, read before allocating reference tensors for assertions. These
+allocator peaks do not include all driver or communication-library allocations; use
+device-level monitoring as well when sizing a colocation deployment.
+
+The model fixtures cover Qwen3 and Qwen3 MoE. Direct FP8 transfer uses the existing AWEX
+converters and does not impose a model-type whitelist. This path targets
+`awex-ascend==0.8.2`; run the CPU metadata/lifecycle tests with:
+
+```bash
+pytest tests/test_awex_ascend_mxfp8.py -v
+```
+
+Native quantization tests skip without an NPU; converter and transfer-plan tests skip if
+AWEX is unavailable. To exercise TP/ETP resharding in the integration cases, set
+`AREAL_AWEX_TRAIN_TP_SIZE`, `AREAL_AWEX_TRAIN_ETP_SIZE`, `AREAL_AWEX_TRAIN_EP_SIZE`, and
+`AREAL_AWEX_VLLM_TP_SIZE` for the available devices. Multi-card sleep/wake, ACL Graph,
+and update memory peaks still require an actual Ascend run; CPU checks cannot establish
+those hardware properties.

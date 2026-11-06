@@ -18,8 +18,6 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from tests.utils import get_model_path
-
 from areal.api.alloc_mode import ParallelStrategy
 from areal.api.cli_args import (
     InferenceEngineConfig,
@@ -28,14 +26,13 @@ from areal.api.cli_args import (
     vLLMConfig,
 )
 from areal.api.io_struct import FinetuneSpec, WeightUpdateMeta
-from areal.engine.megatron_engine import MegatronEngine
 from areal.engine.vllm_remote import RemotevLLMEngine
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils import network
 from areal.utils.pkg_version import is_available
 
 IS_VLLM_INSTALLED = is_available("vllm")
-IS_AWEX_INSTALLED = is_available("awex")
+IS_AWEX_INSTALLED = is_available("awex") or is_available("awex-ascend")
 
 DENSE_HF_ID = "Qwen/Qwen3-0.6B"
 DENSE_LOCAL_PATH = "/home/model/Qwen3-0.6B/"
@@ -117,7 +114,8 @@ REQUESTS_PER_UPDATE = _env_int("AREAL_AWEX_REQUESTS_PER_UPDATE", 0)
 REQUEST_TIMEOUT_S = _env_int("AREAL_AWEX_REQUEST_TIMEOUT_S", 30)
 REQUEST_RETRIES = _env_int("AREAL_AWEX_REQUEST_RETRIES", 3)
 STRICT_REQUEST_TRAFFIC = _env_bool("AREAL_AWEX_STRICT_REQUEST_TRAFFIC", False)
-ENGINE_REQUEST_TIMEOUT_S = _env_int("AREAL_AWEX_ENGINE_REQUEST_TIMEOUT_S", 60)
+# The update RPC includes AWEX's full BF16 consistency check.
+ENGINE_REQUEST_TIMEOUT_S = _env_int("AREAL_AWEX_ENGINE_REQUEST_TIMEOUT_S", 360)
 ENGINE_SETUP_TIMEOUT_S = _env_int("AREAL_AWEX_ENGINE_SETUP_TIMEOUT_S", 360)
 VLLM_GPU_MEMORY_UTILIZATION = _env_float("AREAL_AWEX_VLLM_GPU_MEMORY_UTILIZATION", 0.6)
 VLLM_MAX_NUM_SEQS = _env_int("AREAL_AWEX_VLLM_MAX_NUM_SEQS", 1)
@@ -195,6 +193,7 @@ def _select_devices(
     vllm_world_size: int,
     device_backend: str = "cuda",
     vllm_device_ids: list[int] | None = None,
+    colocate_mode: bool = False,
 ):
     visible_env = os.environ.get(_visible_env_name(device_backend), "").strip()
     if visible_env:
@@ -210,16 +209,23 @@ def _select_devices(
                     f"Visible devices: {visible_devices}"
                 )
         vllm_devices = vllm_device_ids
-        train_devices = [d for d in visible_devices if d not in vllm_devices][
-            :train_world_size
-        ]
+        train_devices = (
+            visible_devices[:train_world_size]
+            if colocate_mode
+            else [d for d in visible_devices if d not in vllm_devices][
+                :train_world_size
+            ]
+        )
     else:
         train_devices = visible_devices[:train_world_size]
-        vllm_devices = visible_devices[
-            train_world_size : train_world_size + vllm_world_size
-        ]
+        offset = 0 if colocate_mode else train_world_size
+        vllm_devices = visible_devices[offset : offset + vllm_world_size]
 
-    need = train_world_size + vllm_world_size
+    need = (
+        max(train_world_size, vllm_world_size)
+        if colocate_mode
+        else train_world_size + vllm_world_size
+    )
     if (
         len(visible_devices) < need
         or len(train_devices) < train_world_size
@@ -228,6 +234,11 @@ def _select_devices(
         pytest.skip(
             f"Need at least {need} devices (train={train_world_size}, vLLM={vllm_world_size}). "
             f"Found {len(visible_devices)}."
+        )
+
+    if colocate_mode and not set(vllm_devices) <= set(train_devices):
+        pytest.skip(
+            "Colocation tests require all vLLM devices to be shared with training"
         )
 
     return train_devices, vllm_devices
@@ -451,7 +462,33 @@ def _drive_completion_traffic(
                 return
 
 
-def _run_awex_integration(result_queue, model_path: str):
+def _check_mxfp8_workers(server_addrs, **task_kwargs):
+    results = []
+    for server_addr in server_addrs:
+        response = _http_post_json(
+            f"http://{server_addr}/collective_rpc",
+            payload={
+                "method": "awex_execute",
+                "kwargs": {
+                    "task_module": "tests.experimental.awex.mxfp8_checks",
+                    "task_qualname": "check_mxfp8_update",
+                    "task_kwargs": task_kwargs,
+                },
+            },
+            timeout_s=ENGINE_REQUEST_TIMEOUT_S,
+        )
+        assert response.get("results"), "No worker returned an MXFP8 check result"
+        results.extend(response["results"])
+    return results
+
+
+def _run_awex_integration(
+    result_queue,
+    model_path: str,
+    online_mxfp8: bool = False,
+    colocate_mode: bool = False,
+    use_aclgraph: bool = False,
+):
     def _safe_destroy(fn, name: str, timeout: int = 10) -> None:
         done = threading.Event()
 
@@ -469,7 +506,16 @@ def _run_awex_integration(result_queue, model_path: str):
     rank = 0
     world_size = 1
     try:
+        # Import after sys.argv is cleared so MindSpeed cannot parse pytest flags.
+        from areal.engine.megatron_engine import MegatronEngine
+
         device_backend = _detect_device_backend()
+        visible_env_name = _visible_env_name(device_backend)
+        if colocate_mode and not os.environ.get(visible_env_name, "").strip():
+            # AWEX needs an explicit mask to match colocated physical devices.
+            os.environ[visible_env_name] = ",".join(
+                map(str, range(_device_count(device_backend)))
+            )
         os.environ.setdefault("AWEX_DEVICE_TYPE", device_backend)
         if device_backend == "npu":
             os.environ.setdefault("AWEX_USE_MINDSPEED", "1")
@@ -509,6 +555,7 @@ def _run_awex_integration(result_queue, model_path: str):
                 vllm_world_size=len(flat_vllm_devices),
                 device_backend=device_backend,
                 vllm_device_ids=flat_vllm_devices,
+                colocate_mode=colocate_mode,
             )
         else:
             train_devices, flat_vllm_devices = _select_devices(
@@ -516,12 +563,18 @@ def _run_awex_integration(result_queue, model_path: str):
                 vllm_world_size=vllm_world_size,
                 device_backend=device_backend,
                 vllm_device_ids=None,
+                colocate_mode=colocate_mode,
             )
             offset = 0
             for inst in vllm_instances:
                 size = inst["world_size"]
                 inst["devices"] = flat_vllm_devices[offset : offset + size]
                 offset += size
+
+        if colocate_mode:
+            assert set(flat_vllm_devices) <= set(train_devices), (
+                "The colocation test must share physical devices with training"
+            )
 
         train_device = train_devices[local_rank]
 
@@ -530,9 +583,14 @@ def _run_awex_integration(result_queue, model_path: str):
 
         meta_server_addr = None
 
-        # Launch vLLM server with Awex plugin enabled (real weights + validation).
-        enable_validation = True
+        # MXFP8 checks actual inference weights/scales instead of a BF16 checksum.
+        enable_validation = not online_mxfp8
+        num_updates = max(3 if online_mxfp8 else 1, NUM_UPDATES)
         comm_backend = os.environ.get("AREAL_AWEX_COMM_BACKEND", "nccl").lower()
+        if online_mxfp8 and (device_backend != "npu" or comm_backend == "file"):
+            raise ValueError(
+                "Online Ascend MXFP8 requires NPU and an AWEX tensor transport"
+            )
 
         vllm_config = vLLMConfig(
             skip_tokenizer_init=False,
@@ -540,13 +598,21 @@ def _run_awex_integration(result_queue, model_path: str):
             gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
             max_num_seqs=VLLM_MAX_NUM_SEQS,
             max_model_len=VLLM_MAX_MODEL_LEN,
-            enforce_eager=True,
-            # load_format="auto",
+            enforce_eager=not use_aclgraph,
+            enable_sleep_mode=colocate_mode,
+            load_format="dummy" if online_mxfp8 else "auto",
+            quantization="ascend" if online_mxfp8 else None,
         )
 
         vllm_env_base = {
             "AWEX_DEVICE_TYPE": device_backend,
         }
+        if online_mxfp8:
+            # The test uses vLLM's existing dev RPC to inspect every worker.
+            vllm_env_base["VLLM_SERVER_DEV_MODE"] = "1"
+            # vLLM-Ascend sleep/wake rejects NZ weights in RL reload scenarios.
+            vllm_env_base["VLLM_ASCEND_ENABLE_NZ"] = "0"
+            vllm_env_base["USE_OPTIMIZED_MODEL"] = "0"
 
         inf_engine = None
         train_engine = None
@@ -558,6 +624,8 @@ def _run_awex_integration(result_queue, model_path: str):
                 trial_name="trial_0",
                 setup_timeout=ENGINE_SETUP_TIMEOUT_S,
                 request_timeout=ENGINE_REQUEST_TIMEOUT_S,
+                # Retrying an update can replay receives after its sender has finished.
+                request_retries=1,
             )
             inf_engine = RemotevLLMEngine(temp_config)
 
@@ -604,7 +672,9 @@ def _run_awex_integration(result_queue, model_path: str):
                 total_train_epochs=1, dataset_size=128, train_batch_size=2
             )
             train_engine.initialize(addr=None, ft_spec=ft_spec)
-            train_engine.set_version(1)
+            train_engine.set_version(0 if online_mxfp8 else 1)
+            if colocate_mode:
+                train_engine.release_memory_occupation(tags=["weights"])
             if TRAIN_CLUSTER_ID:
                 os.environ["AWEX_CLUSTER_ID"] = TRAIN_CLUSTER_ID
 
@@ -679,7 +749,7 @@ def _run_awex_integration(result_queue, model_path: str):
                 addr=server_addrs,
                 train_data_parallel_size=len(server_addrs),
             )
-            inf_engine.set_version(1)
+            inf_engine.set_version(0 if online_mxfp8 else 1)
 
             if enable_validation:
                 # This integration test should validate every configured update by default.
@@ -712,10 +782,13 @@ def _run_awex_integration(result_queue, model_path: str):
                 weights_validation_steps=validation_steps,
                 validate_weights_every_n_steps=validate_every_n_steps,
                 enable_debug_mode=enable_validation,
+                enable_colocate_mode=colocate_mode,
                 debug_mode_config=(
                     {"raise_on_validation_fail": True} if enable_validation else {}
                 ),
             )
+            if online_mxfp8:
+                update_meta.online_quantization = "ascend"
             if device_backend == "npu":
                 update_meta.weights_exchange_ipc_backend = "cpu"
             if comm_backend == "file":
@@ -728,22 +801,63 @@ def _run_awex_integration(result_queue, model_path: str):
                     update_meta.path = obj_list[0]
 
             train_engine.connect_engine(inf_engine, update_meta)
-            for step in range(1, max(1, NUM_UPDATES) + 1):
-                train_engine.set_version(step)
-                inf_engine.set_version(step)
+            for step in range(1, num_updates + 1):
+                if online_mxfp8:
+                    if rank == 0:
+                        _check_mxfp8_workers(
+                            server_addrs, prepare=True, check_graph=use_aclgraph
+                        )
+                        if colocate_mode:
+                            inf_engine.offload()
+                    if dist.is_initialized():
+                        dist.barrier()
+                    if colocate_mode:
+                        train_engine.resume_memory_occupation(tags=["weights"])
+                    # Changing sign and magnitude exercises both FP8 values and scales.
+                    value = (0.125, -0.5, 1.0)[(step - 1) % 3]
+                    with torch.no_grad():
+                        for parameter in train_engine.model.parameters():
+                            if parameter.ndim >= 2 and parameter.is_floating_point():
+                                parameter.fill_(value)
+                version = step - 1 if online_mxfp8 else step
+                if not online_mxfp8:
+                    train_engine.set_version(version)
+                    inf_engine.set_version(version)
                 if dist.is_initialized():
                     dist.barrier()
-                train_engine.update_weights(update_meta)
+                started = time.perf_counter()
+                # Match the trainer: initial sync v0, then commit each target
+                # version only after its weight update has completed.
+                train_engine.update_weights(
+                    update_meta.with_version(version) if online_mxfp8 else update_meta
+                )
+                elapsed = time.perf_counter() - started
+                if online_mxfp8:
+                    train_engine.set_version(version)
+                    inf_engine.set_version(version)
                 if dist.is_initialized():
                     dist.barrier()
-                if rank == 0 and REQUESTS_PER_UPDATE > 0 and step < max(1, NUM_UPDATES):
+                if online_mxfp8 and rank == 0:
+                    checks = _check_mxfp8_workers(
+                        server_addrs, expected_value=value, check_graph=use_aclgraph
+                    )
+                    assert sum(item["checked_weights"] for item in checks) > 0
+                    print(
+                        f"[awex-test] step={step} version={version} "
+                        f"update_seconds={elapsed:.3f} "
+                        f"worker_checks={checks}",
+                        flush=True,
+                    )
+                if rank == 0 and (
+                    online_mxfp8 or (REQUESTS_PER_UPDATE > 0 and step < num_updates)
+                ):
                     _drive_completion_traffic(
                         server_addrs=server_addrs,
                         fallback_model=model_path,
-                        requests_per_update=REQUESTS_PER_UPDATE,
+                        requests_per_update=max(1, REQUESTS_PER_UPDATE),
                         timeout_s=max(1, REQUEST_TIMEOUT_S),
                         retries=max(1, REQUEST_RETRIES),
-                        strict=STRICT_REQUEST_TRAFFIC,
+                        strict=online_mxfp8 or STRICT_REQUEST_TRAFFIC,
                     )
 
             if result_queue is not None and rank == 0:
@@ -798,7 +912,12 @@ def _resolve_dense_model_path() -> str:
     if os.path.exists(DENSE_LOCAL_PATH):
         return DENSE_LOCAL_PATH
     if os.environ.get("AREAL_AWEX_ALLOW_HF_DOWNLOAD") == "1":
-        return get_model_path(DENSE_LOCAL_PATH, DENSE_HF_ID)
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(
+            repo_id=DENSE_HF_ID,
+            ignore_patterns=["*.gguf", "*.ggml", "consolidated*"],
+        )
     pytest.skip(
         "Dense model not found locally. Set AREAL_AWEX_DENSE_MODEL_PATH or "
         "AREAL_AWEX_ALLOW_HF_DOWNLOAD=1 to download."
@@ -807,11 +926,26 @@ def _resolve_dense_model_path() -> str:
 
 @pytest.mark.slow
 @pytest.mark.multi_gpu
-def test_awex_megatron_to_vllm_nccl(tmp_path_factory):
+@pytest.mark.parametrize(
+    "online_mxfp8,colocate_mode,use_aclgraph",
+    [
+        pytest.param(False, False, False, id="bf16"),
+        pytest.param(True, False, False, id="ascend-mxfp8-separate-eager"),
+        pytest.param(True, False, True, id="ascend-mxfp8-separate-aclgraph"),
+        pytest.param(True, True, False, id="ascend-mxfp8-colocate-eager"),
+        pytest.param(True, True, True, id="ascend-mxfp8-colocate-aclgraph"),
+    ],
+)
+def test_awex_megatron_to_vllm_nccl(
+    tmp_path_factory, online_mxfp8, colocate_mode, use_aclgraph
+):
+    """Check changing weights, graph addresses, and colocation over three updates."""
     if not IS_VLLM_INSTALLED:
         pytest.skip("vLLM is not installed")
     if not IS_AWEX_INSTALLED:
-        pytest.skip("awex is not installed")
+        pytest.skip("Neither awex nor awex-ascend is installed")
+    if online_mxfp8 and _detect_device_backend() != "npu":
+        pytest.skip("Online Ascend MXFP8 integration requires Ascend NPU")
 
     timeout_seconds = int(os.environ.get("AREAL_AWEX_TEST_TIMEOUT_S", "600"))
     model_kind = os.environ.get("AREAL_AWEX_MODEL", "dense").lower()
@@ -823,15 +957,23 @@ def test_awex_megatron_to_vllm_nccl(tmp_path_factory):
         raise ValueError(
             f"Unknown AREAL_AWEX_MODEL value: {model_kind}. Use 'dense' or 'moe'."
         )
+    if online_mxfp8 and not os.path.isfile(
+        os.path.join(model_path, "quant_model_description.json")
+    ):
+        pytest.skip(
+            "Online MXFP8 model needs a W8A8_MXFP8 quant_model_description.json"
+        )
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        _run_awex_integration(None, model_path)
+        _run_awex_integration(
+            None, model_path, online_mxfp8, colocate_mode, use_aclgraph
+        )
         return
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
     proc = ctx.Process(
         target=_run_awex_integration,
-        args=(result_queue, model_path),
+        args=(result_queue, model_path, online_mxfp8, colocate_mode, use_aclgraph),
     )
     proc.start()
     proc.join(timeout_seconds)

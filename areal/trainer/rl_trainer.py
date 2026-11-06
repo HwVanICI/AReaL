@@ -1541,10 +1541,21 @@ class PPOTrainer:
                 raise ValueError(
                     "Online Ascend FP8 rollout does not support an Archon actor"
                 )
-            if self.config.actor.weight_update_mode != "xccl":
+            if self.config.actor.weight_update_mode not in {"xccl", "awex"}:
                 raise ValueError(
-                    "Online Ascend FP8 rollout requires actor.weight_update_mode=xccl"
+                    "Online Ascend FP8 rollout requires actor.weight_update_mode=xccl or awex"
                 )
+            if self.config.actor.weight_update_mode == "awex":
+                if actor_backend != "megatron":
+                    raise ValueError(
+                        "Online Ascend FP8 rollout with AWEX currently requires "
+                        "a Megatron actor; the FSDP engine does not implement AWEX updates"
+                    )
+                from areal.engine.vllm_ext.awex_ascend_mxfp8 import (
+                    validate_awex_ascend_mxfp8_config,
+                )
+
+                validate_awex_ascend_mxfp8_config(self.config.awex)
             if self.config.vllm.load_format != "dummy":
                 raise ValueError(
                     "Online Ascend FP8 rollout requires vllm.load_format=dummy"

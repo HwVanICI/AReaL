@@ -3,17 +3,17 @@
 from collections.abc import Iterable, Iterator
 
 import torch
-import torch_npu
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.models.utils import is_pp_missing_parameter
-from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
 from vllm_ascend.quantization.methods.w8a8_mxfp8 import (
     AscendW8A8MXFP8DynamicFusedMoEMethod,
     AscendW8A8MXFP8DynamicLinearMethod,
 )
+from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
 
 from areal.infra.platforms import current_platform
+from areal.utils.mxfp8 import quantize_mxfp8_tensor
 
 
 def is_ascend_mxfp8(model_runner) -> bool:
@@ -170,34 +170,37 @@ def _validate_target_tensor(
         )
 
 
-def restore_mxfp8_weights_for_loading(model) -> None:
-    for module in model.modules():
+def iter_mxfp8_modules(
+    model: torch.nn.Module,
+) -> Iterator[
+    tuple[
+        str,
+        torch.nn.Module,
+        AscendW8A8MXFP8DynamicLinearMethod | AscendW8A8MXFP8DynamicFusedMoEMethod,
+    ]
+]:
+    """Yield local modules using the supported Ascend MXFP8 schemes."""
+    for name, module in model.named_modules():
         wrapper = getattr(module, "quant_method", None)
         scheme = getattr(wrapper, "quant_method", None)
-        if not isinstance(
+        if isinstance(
             scheme,
             (
                 AscendW8A8MXFP8DynamicLinearMethod,
                 AscendW8A8MXFP8DynamicFusedMoEMethod,
             ),
         ):
-            continue
+            yield name, module, scheme
+
+
+def restore_mxfp8_weights_for_loading(model) -> None:
+    for _, module, scheme in iter_mxfp8_modules(model):
         scheme.restore_weights_for_rl_loading(module)
 
 
 def process_mxfp8_weights_after_loading(model) -> None:
-    for module in model.modules():
-        wrapper = getattr(module, "quant_method", None)
-        scheme = getattr(wrapper, "quant_method", None)
-        if not isinstance(
-            scheme,
-            (
-                AscendW8A8MXFP8DynamicLinearMethod,
-                AscendW8A8MXFP8DynamicFusedMoEMethod,
-            ),
-        ):
-            continue
-        wrapper.process_weights_after_loading(module)
+    for _, module, _ in iter_mxfp8_modules(model):
+        module.quant_method.process_weights_after_loading(module)
 
 
 def _quantize_weights(
@@ -223,15 +226,7 @@ def _quantize_weights(
                 f"Online Ascend MXFP8 weight {name} must have a last dimension "
                 f"divisible by {group_size}, got shape {tuple(tensor.shape)}"
             )
-        fp8_weight, weight_scale = torch_npu.npu_dynamic_mx_quant(
-            tensor,
-            axis=-1,
-            dst_type=torch_npu.float8_e4m3fn,
-        )
-        if fp8_weight.dtype != torch.float8_e4m3fn:
-            raise RuntimeError(f"MXFP8 quantization returned invalid dtype for {name}")
-        if weight_scale.dtype != torch.uint8:
-            raise RuntimeError(f"MXFP8 quantization returned invalid scale for {name}")
+        fp8_weight, weight_scale = quantize_mxfp8_tensor(tensor, name)
 
         target_weight, target_scale, target_kind = target_parameters
         scale_name = f"{name}_scale"
