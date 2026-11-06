@@ -81,6 +81,22 @@ def _patch_colocate_reader():
         device_phy_ids = [str(i) for i in range(16)]
         visible_env_key = "ASCEND_RT_VISIBLE_DEVICES"
 
+    original_shake_hands = (
+        awex.reader.nccl_reader.NCCLWorkerWeightsReader._shake_hands_with_writer
+    )
+
+    def _shake_hands_with_writer(self):
+        if (
+            device_util.get_device_type() == "npu"
+            and self.enable_colocate_mode
+            and self.world_size == 1
+        ):
+            # The colocated group contains inference workers only. AWEX 0.8.2
+            # would receive from itself before reaching the matching send.
+            logger.info("Skip AWEX readiness handshake for single-rank NPU colocation")
+            return
+        return original_shake_hands(self)
+
     def _init_reader_in_colocate_mode(self):
         def _get_current_phy_id():
             device_phy_id = os.getenv(visible_env_key)
@@ -218,6 +234,11 @@ def _patch_colocate_reader():
             self.parameters,
             step_id=step_id,
         )
+        from areal.engine.vllm_ext.awex_ascend_mxfp8 import (
+            finish_awex_ascend_mxfp8_receive,
+        )
+
+        finish_awex_ascend_mxfp8_receive(self)
         print_current_gpu_status(
             f"after weights update using NCCL for rank {self.rank_coordinate}"
         )
@@ -253,6 +274,9 @@ def _patch_colocate_reader():
             f"Finished updating weights in colocate mode for rank {self.transfer_rank}"
         )
 
+    awex.reader.nccl_reader.NCCLWorkerWeightsReader._shake_hands_with_writer = (
+        _shake_hands_with_writer
+    )
     awex.reader.nccl_reader.NCCLWorkerWeightsReader._init_reader_in_colocate_mode = (
         _init_reader_in_colocate_mode
     )
@@ -482,6 +506,10 @@ def _patch_gpu_sub_command():
 
 
 def patch_awex():
+    from areal.engine.vllm_ext.awex_ascend_mxfp8 import (
+        install_awex_ascend_mxfp8_hooks,
+    )
+
     _registry_models()
     _patch_vllm_adapter()
     _patch_nccl_comm()
@@ -489,3 +517,4 @@ def patch_awex():
     _patch_colocate_writer()
     _patch_meta_resolver_for_vlm()
     _patch_gpu_sub_command()
+    install_awex_ascend_mxfp8_hooks()

@@ -31,6 +31,9 @@ training, so both are load-bearing for the current NPU RL images.
   the patch preserves the inference weight storage and scale buffer captured by ACL
   Graph, then copies the reloaded scale back into that stable buffer before inference
   resumes.
+  Dense scale restoration also removes the unused paired scale slot when the logical
+  number of 32-element groups is odd (for example, K=96 has three scales), so repeated
+  weight reloads can restore the original loading shape.
 - **MindSpeed FP8 compatibility** — keeps MindSpeed's FP8 recipe enum compatible with
   Megatron-Core 0.16.x and derives grouped-matmul quantization groups from the local
   expert list used by each operation.

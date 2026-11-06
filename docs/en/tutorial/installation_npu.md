@@ -193,11 +193,34 @@ vLLM-Ascend plugin); SGLang is not available. Both the `fsdp` and `megatron` (th
 ## Online Ascend MXFP8 Rollout
 
 In AReaL, setting `vllm.quantization: ascend` currently enables only online MXFP8
-rollout quantization. It requires `vllm.load_format: dummy`, an `xccl` actor weight
-update, and BF16 actor and rollout dtypes. LoRA is not supported on this path. AReaL
-initializes the rollout with dummy weights and quantizes each actor weight update
-online; this setting does not load a pre-quantized vLLM-Ascend checkpoint from disk.
-The quantization description may keep non-MoE weights such as normalization weights
-in `FLOAT`, but every `FusedMoE` module must use `W8A8_MXFP8`. Mixed online rollout
-with `FLOAT` FusedMoE weights is not supported because their reload layout lifecycle
-is not handled by this path.
+rollout quantization. It requires `vllm.load_format: dummy`, an `xccl` or `awex` actor
+weight update, and BF16 actor and rollout dtypes. LoRA is not supported on this path.
+AReaL initializes the rollout with dummy weights and quantizes each actor weight update
+online; this setting does not load a pre-quantized vLLM-Ascend checkpoint from disk. The
+quantization description may keep non-MoE weights such as normalization weights in
+`FLOAT`, but every `FusedMoE` module must use `W8A8_MXFP8`. Mixed online rollout with
+`FLOAT` FusedMoE weights is not supported because their reload layout lifecycle is not
+handled by this path.
+
+With `actor.weight_update_mode: awex`, the current online MXFP8 path requires a Megatron
+actor. The original AWEX converter produces logical matrices from the actor's BF16
+parameters, then the training side quantizes them into FP8 weights and uint8 E8M0
+scales. AWEX reuses its existing resharding, transport, and colocation flow to write
+directly into inference weights and scales, followed by one post-load pass after
+reception completes. FP8 weights travel as uint8 byte views without numeric conversion
+to integers; FLOAT weights retain their original dtype.
+
+Budget memory for the FP8 inference model and AWEX IPC/transport buffers. Colocation
+also requires memory for the actor's BF16 weights, quantized outputs, and temporary
+allocations.
+
+AWEX online MXFP8 requires a tensor transport wired to sender-side quantization;
+`awex.comm_backend: file` and `astate` are not supported. Set
+`awex.weights_validation_steps: 0` and keep `awex.dump_weights_list_for_validation`
+empty. Before transfer, actual AWEX metadata is checked for 32-aligned K dimensions and
+shard offsets, and matching weight/scale shapes, coordinates, and dtypes. Model shapes
+are not inferred from projection names in the configuration. For MoE, both w13's local K
+(hidden size) and w2's local K (local intermediate size) must be divisible by 64 because
+the current vLLM-Ascend MoE scale layout does not pad odd scale pairs. This is a loader
+layout restriction; the MXFP8 group size remains 32. Use the carried vLLM-Ascend FP8
+patch, which also fixes Dense scale restoration when the number of groups is odd.

@@ -2808,7 +2808,8 @@ class MegatronEngine(TrainEngine):
         if self.awex_writer is None:
             raise RuntimeError("Awex writer is not initialized. Call connect_engine().")
 
-        step_id = self.get_version()
+        # The trainer commits the actor version only after this update completes.
+        step_id = meta.version if meta.version is not None else self.get_version()
         self.awex_writer.set_global_step(step_id)
 
         if dist.get_rank() == 0:
