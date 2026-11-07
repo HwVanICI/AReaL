@@ -1,0 +1,3775 @@
+Subject: [PATCH] fork rollout
+---
+Index: areal/api/cli_args.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/api/cli_args.py b/areal/api/cli_args.py
+--- a/areal/api/cli_args.py	(revision 5f8f2fbf1dde5b4283b359e288bf078e64d1bfee)
++++ b/areal/api/cli_args.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -2432,6 +2432,21 @@
+             "Currently only used by the RolloutController."
+         },
+     )
++    enable_actor_gpu_rollout: bool = field(
++        default=False,
++        metadata={
++            "help": "Step-0 only (separation deployment, single-controller): after the actor is "
++            "scheduled, offload actor GPU memory and fork vLLM rollout engines onto the actor "
++            "GPUs so they also serve inference during the first rollout. In-flight requests on "
++            "fork engines are aborted and redispatched (async) to surviving engines before "
++            "teardown. Megatron actor + vLLM rollout + Ray only. Each fork instance mirrors one "
++            "rollout vLLM server (the launch command's data_parallel_size x "
++            "tensor_parallel_size x pipeline_parallel_size GPUs; in the inference EP scenario "
++            "EP size = data_parallel_size x tensor_parallel_size == one instance). The number of "
++            "fork instances is actor_world_size // instance_gpus. Auto-disabled if that division "
++            "is not exact."
++        },
++    )
+     use_lora: bool = field(
+         default=False,
+         metadata={"help": "Whether to use LoRA. Should be same as actors LORA option."},
+Index: areal/engine/vllm_remote.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/engine/vllm_remote.py b/areal/engine/vllm_remote.py
+--- a/areal/engine/vllm_remote.py	(revision 5f8f2fbf1dde5b4283b359e288bf078e64d1bfee)
++++ b/areal/engine/vllm_remote.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -617,6 +617,11 @@
+     def continue_generation(self):
+         return self._engine.continue_generation()
+ 
++    def evict(self):
++        # Step-0 fork-teardown eviction: delegate to the wrapped RemoteInfEngine,
++        # which sets the eviction flag and aborts in-flight vLLM requests.
++        return self._engine.evict()
++
+     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
+         return self._engine.launch_server(server_args)
+ 
+Index: areal/infra/controller/fork_coordinator.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/infra/controller/fork_coordinator.py b/areal/infra/controller/fork_coordinator.py
+new file mode 100644
+--- /dev/null	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
++++ b/areal/infra/controller/fork_coordinator.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -0,0 +1,286 @@
++"""Fork-teardown SALVAGE state + logic, extracted from RolloutController.
++
++The step-0 actor-GPU fork feature's salvage path (deposit an evicted partial,
++park the already-complete half, re-merge with the continuation, localize fork
++trajectories before teardown) was inlined in the controller's per-task callback,
++polluting the hot path. This module owns that salvage state + logic so the
++callback stays a thin delegator.
++
++The fork LIFECYCLE (start engines / reclaim-and-teardown / collective RPC)
++remains on ``RolloutController``; ``ForkCoordinator`` holds only the per-task
++continuation/re-merge state shared between the callback and reclaim, accessed
++via a ``host`` reference (the controller) for shared maps/locks.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any
++
++from areal.infra.rpc.rtensor import RTensor
++from areal.utils import logging
++from areal.utils.data import concat_padded_tensors
++from areal.utils.fork_constants import (
++    FORK_COMPLETE_KEY,
++    FORK_CONTINUATION_KEY,
++    FORK_MERGE_KEY,
++)
++
++if TYPE_CHECKING:
++    from areal.infra.controller.rollout_controller import RolloutController
++
++logger = logging.getLogger("ForkCoordinator")
++
++
++class ForkCoordinator:
++    """Owns fork-teardown salvage state + the per-task salvage methods.
++
++    State
++    -----
++    _fork_continuations : dict[int, dict]
++        task_id -> fork-eviction continuation descriptor (group), deposited by
++        the callback when a fork engine returns a partial; reclaim re-submits
++        each as a continuation on a surviving engine.
++    _fork_complete_groups : dict[int, dict]
++        fork task_id -> localized already-complete rollouts of a partially-
++        evicted group (the samples that finished before eviction). Parked at the
++        deposit (while the fork worker is alive) and re-merged with the
++        continuation result when that task completes, so each prompt yields one
++        full n_samples group. NOT cleared at reclaim: continuations complete
++        after reclaim returns (priority-bypass, step-0 training window); cleared
++        on consume (pop) and defensively in ``clear_complete_groups``.
++    _fork_completed_task_ids : dict[int, int]
++        fork task id -> number of rollouts accepted as a normal trajectory
++        (path A: the group fully completed on the fork engine before eviction
++        took effect). Recorded by ``localize_if_fork`` so reclaim can report
++        ROLLOUT-level accounting (not just task counts) and distinguish
++        "completed normally, no continuation needed" from "yielded nothing at
++        all (lost)" for its pre-evict in-flight snapshot. Popped by reclaim and
++        cleared defensively in ``clear_completed_task_ids``.
++    """
++
++    def __init__(self, host: RolloutController) -> None:
++        self.host = host
++        self._fork_continuations: dict[int, dict[str, Any]] = {}
++        self._fork_complete_groups: dict[int, dict[str, Any]] = {}
++        self._fork_completed_task_ids: dict[int, int] = {}
++
++    # -- classification ---------------------------------------------------
++
++    @staticmethod
++    def is_evict_descriptor(traj: Any) -> bool:
++        """True if ``traj`` is a fork-eviction continuation descriptor (not a
++        training trajectory)."""
++        return (
++            traj is not None
++            and isinstance(traj, dict)
++            and FORK_CONTINUATION_KEY in traj
++        )
++
++    def is_fork_worker(self, worker_id: str) -> bool:
++        return worker_id in self.host._fork_worker_ids
++
++    # -- callback salvage (deposit / re-merge / localize) -----------------
++
++    def on_task_evicted(self, task_id: int, worker: Any, traj: dict[str, Any]) -> None:
++        """Deposit a fork-evicted partial (descriptor + parked complete-group)
++        for reclaim to re-submit as a continuation.
++
++        Localizes the already-complete part NOW (while the fork worker is alive
++        so the lazy RTensor shards can be fetched). Pops the task from the
++        worker/input maps (under the host lock, BEFORE returning) so reclaim's
++        settle sees it done -- the settle loop waits for fork tasks to leave
++        ``_task_worker_map`` before destroying fork workers (no race).
++        """
++        complete_group = traj.get(FORK_COMPLETE_KEY)
++        if complete_group is not None:
++            complete_group = RTensor.localize(complete_group)
++        with self.host._task_worker_map_lock:
++            self._fork_continuations[task_id] = traj
++            if complete_group is not None:
++                self._fork_complete_groups[task_id] = complete_group
++            self.host._task_worker_map.pop(task_id, None)
++            self.host._task_input_map.pop(task_id, None)
++        n_samples = len(traj.get(FORK_CONTINUATION_KEY, []))
++        rids = [c.get("rid") for c in traj.get(FORK_CONTINUATION_KEY, [])]
++        n_complete = (
++            complete_group["input_ids"].shape[0] if complete_group is not None else 0
++        )
++        logger.info(
++            f"[step0-fork] task_id={task_id} on worker={worker.id}: "
++            f"deposited fork-evicted partial ({n_samples} in-flight, "
++            f"{n_complete} completed parked for re-merge, "
++            f"rids={rids}) for continuation re-submit"
++        )
++
++    def try_remerge(self, pending_task: Any, traj: dict[str, Any]) -> dict[str, Any]:
++        """Re-merge a continuation result with its parked already-complete half.
++
++        If ``pending_task.data`` carries ``FORK_MERGE_KEY`` (injected by reclaim
++        when re-submitting a continuation), look up the complete-group parked at
++        eviction and concat it with the continued result into one full
++        n_samples group. The continued result is a lazy RTensor on the surviving
++        worker; localize before concat (``concat_padded_tensors`` does not handle
++        RTensor). Downstream reward normalization groups positionally by
++        n_samples, so each prompt must be one contiguous block.
++
++        No-op (returns ``traj`` unchanged) for normal tasks and for the
++        all-in-flight case (no complete half parked -> ``traj`` is already a full
++        group).
++        """
++        merge_key = pending_task.data.get(FORK_MERGE_KEY)
++        if merge_key is None:
++            return traj
++        complete_group = self._fork_complete_groups.pop(merge_key, None)
++        if complete_group is None:
++            # All-in-flight case: the continued result is already a full
++            # n_samples group; accept as-is (stays lazy RTensor on the surviving
++            # worker, fetched later by compute_advantages).
++            return traj
++        continued = RTensor.localize(traj)
++        n_complete = complete_group["input_ids"].shape[0]
++        n_cont = continued["input_ids"].shape[0]
++        merged = concat_padded_tensors([complete_group, continued])
++        logger.info(
++            f"[step0-fork] task_id={pending_task.task_id}: re-merged "
++            f"continuation ({n_complete} completed + {n_cont} continued = "
++            f"{merged['input_ids'].shape[0]} rollouts)"
++        )
++        return merged
++
++    def localize_if_fork(
++        self, worker: Any, task_id: int, traj: dict[str, Any]
++    ) -> dict[str, Any]:
++        """Localize fork-generated trajectories (lazy RTensor shards on the fork
++        worker's /data/* endpoints) before the upcoming fork teardown, and log
++        path A (fork self-completed prompt). No-op for surviving workers.
++
++        Path A: a fork task that finished fully (n_samples/n_samples) before
++        eviction is accepted as a normal trajectory. Logged so fork
++        self-completed prompts are grep-able; evicted prompts are tracked via
++        the deposit + re-merge logs, and continuations run on surviving workers
++        (this does not fire for them). The task id and its accepted rollout
++        count are recorded so reclaim can report task- and rollout-level
++        accounting for the in-flight snapshot (see ``pop_completed_task_ids``).
++        """
++        if worker.id not in self.host._fork_worker_ids:
++            return traj
++        traj = RTensor.localize(traj)
++        n_rollouts = traj["input_ids"].shape[0]
++        # Recorded AFTER localize: a failed shard fetch means the trajectory
++        # could not be accepted, so it is not "completed normally".
++        with self.host._task_worker_map_lock:
++            self._fork_completed_task_ids[task_id] = n_rollouts
++        logger.info(
++            f"[step0-fork] task_id={task_id} on worker={worker.id}: "
++            f"fully completed on fork ({n_rollouts} rollouts), accepted"
++        )
++        return traj
++
++    def post_process_result(
++        self, pending_task: Any, worker: Any, task_id: int, traj: Any
++    ) -> Any:
++        """Per-task fork salvage hook (called from the controller callback for
++        EVERY rollout, fork or not).
++
++        Combines the three salvage steps into one call so the controller
++        callback is a single-line delegator. Returns the trajectory to accept,
++        or None to reject:
++
++        * evicted descriptor -> on_task_evicted (deposit + park, which pops the
++          task maps under the host lock) then None; reclaim re-submits a
++          continuation. The controller's reject-path map pop is idempotent.
++        * None result -> None (reject).
++        * normal/continued trajectory -> try_remerge + localize_if_fork, then
++          the (possibly re-merged) trajectory.
++
++        No-op for normal surviving-engine tasks: no FORK_MERGE_KEY -> try_remerge
++        returns traj unchanged; worker not in _fork_worker_ids -> localize_if_fork
++        returns traj unchanged. See :class:`NoOpForkCoordinator` for the
++        disabled-feature (zero-overhead) case.
++        """
++        if self.is_evict_descriptor(traj):
++            self.on_task_evicted(task_id, worker, traj)
++            return None
++        if traj is None:
++            return None
++        traj = self.try_remerge(pending_task, traj)
++        traj = self.localize_if_fork(worker, task_id, traj)
++        return traj
++
++    # -- reclaim / destroy accessors --------------------------------------
++
++    def pop_continuation(self, task_id: int) -> dict[str, Any] | None:
++        """Pop a deposited continuation descriptor (reclaim collects these to
++        re-submit). None if the task yielded no descriptor (fully completed or
++        lost)."""
++        return self._fork_continuations.pop(task_id, None)
++
++    def pop_completed_task_ids(self) -> dict[int, int]:
++        """Pop ``{task_id: accepted_rollout_count}`` for path-A completions.
++
++        Reclaim uses this to split its pre-evict in-flight snapshot into three
++        disjoint groups: yielded a continuation descriptor, completed normally
++        (no continuation needed), or yielded nothing at all (truly lost) -- and
++        to report each bucket in ROLLOUTS (``group_size`` per task), not just
++        task counts. Pops (rather than reads) so the window's accounting is
++        consumed exactly once.
++        """
++        with self.host._task_worker_map_lock:
++            completed = self._fork_completed_task_ids
++            self._fork_completed_task_ids = {}
++        return completed
++
++    def clear_continuations(self) -> None:
++        """Clear deposited descriptors (reclaim end, after re-submitting)."""
++        self._fork_continuations.clear()
++
++    def clear_completed_task_ids(self) -> None:
++        """Defensive: drop the path-A accepted-task record if reclaim never
++        consumed it (e.g. crash mid-step-0). Called from reclaim/destroy."""
++        with self.host._task_worker_map_lock:
++            self._fork_completed_task_ids.clear()
++
++    def clear_complete_groups(self) -> None:
++        """Defensive: drop any parked complete-groups whose continuation never
++        ran (e.g. crash mid-step-0). Called from destroy()."""
++        self._fork_complete_groups.clear()
++
++
++class NoOpForkCoordinator:
++    """Disabled-feature fork strategy (used when ``enable_actor_gpu_rollout``
++    is off).
++
++    Every method is inert so the controller's per-task callback hot path carries
++    zero fork overhead when the feature is disabled: ``post_process_result`` is
++    identity (no descriptor check, no salvage calls). The fork lifecycle
++    (start/reclaim) is never invoked by the trainer when the feature is off, so
++    this class only needs the surface the controller touches unconditionally --
++    ``post_process_result`` (hot path) and ``clear_complete_groups`` (destroy).
++    ``pop_continuation`` / ``clear_continuations`` / ``pop_completed_task_ids``
++    / ``clear_completed_task_ids`` / ``is_fork_worker`` are included for
++    interface parity with :class:`ForkCoordinator`.
++    """
++
++    def post_process_result(
++        self, pending_task: Any, worker: Any, task_id: int, traj: Any
++    ) -> Any:
++        """Identity: accept the trajectory unchanged (no fork salvage)."""
++        return traj
++
++    def pop_continuation(self, task_id: int) -> dict[str, Any] | None:
++        return None
++
++    def pop_completed_task_ids(self) -> dict[int, int]:
++        return {}
++
++    def clear_continuations(self) -> None:
++        pass
++
++    def clear_completed_task_ids(self) -> None:
++        pass
++
++    def clear_complete_groups(self) -> None:
++        pass
++
++    def is_fork_worker(self, worker_id: str) -> bool:
++        return False
+Index: areal/infra/controller/rollout_controller.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/infra/controller/rollout_controller.py b/areal/infra/controller/rollout_controller.py
+--- a/areal/infra/controller/rollout_controller.py	(revision 5f8f2fbf1dde5b4283b359e288bf078e64d1bfee)
++++ b/areal/infra/controller/rollout_controller.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -5,6 +5,7 @@
+ import asyncio
+ import shutil
+ import threading
++import time
+ import traceback
+ from collections import defaultdict
+ from collections.abc import Callable
+@@ -41,14 +42,28 @@
+ from areal.utils import logging, perf_tracer
+ from areal.utils.data import cycle_dataloader
+ from areal.utils.dynamic_import import import_from_string
++from areal.utils.fork_constants import (
++    FORK_COMPLETE_KEY,
++    FORK_CONTINUATION_KEY,
++    FORK_CONTINUE_FIELD,
++    FORK_MERGE_KEY,
++)
+ from areal.utils.network import find_free_ports, format_hostport, gethostip
+ from areal.utils.perf_tracer import trace_perf
+ 
+ from ..staleness_manager import StalenessManager
+ from ..workflow_executor import BatchTaskDispatcher, TaskIdGenerator
++from .fork_coordinator import ForkCoordinator, NoOpForkCoordinator
+ 
+ logger = logging.getLogger("RolloutController")
+ 
++# Resolved into a task future by reclaim when a fork task misses the settle
++# timeout. The task coroutine sees it and rejects without fetching a result;
++# reclaim replays the original input as a full restart. The future is a
++# one-shot ownership channel: whoever resolves it (engine callback vs reclaim)
++# decides who owns the task, so no shared state or locking is needed.
++_FORK_TASK_ABANDONED = object()
++
+ 
+ # NOTE: remote task input has a slightly different
+ # type annotation, which disallows workflow object or types
+@@ -62,6 +77,11 @@
+     is_eval: bool = False
+     group_size: int = 1
+     proxy_addr: str | None = None
++    # Priority tasks bypass the staleness capacity gate in the dispatcher
++    # (still respect pause + runner queue size). Used for step-0 fork-evicted
++    # continuation re-submits so they are pulled and run at version 0 during the
++    # step-0 training window instead of being starved by overlap saturation.
++    priority: bool = False
+ 
+ 
+ @dataclass
+@@ -132,6 +152,49 @@
+         self._proxy_gateway_port: int | None = None
+         self._proxy_gateway_host: str | None = None
+ 
++        # Actor-GPU fork engines (step-0 utilization feature): fork state +
++        # strategy (Fork/NoOp) live in _init_fork_state.
++        self._init_fork_state()
++
++        # task_id -> worker.id, to locate which in-flight tasks sit on fork
++        # engines during reclaim (so they can be aborted and redispatched).
++        self._task_worker_map: dict[int, str] = {}
++        # task_id -> original _RemoteRolloutTaskInput, so reclaim can replay
++        # the exact input on a surviving engine (not an empty placeholder).
++        self._task_input_map: dict[int, _RemoteRolloutTaskInput] = {}
++        # worker.id -> engine_name. Surviving engines are named
++        # "<role>/<rank>" but fork engines are named "<fork_role>/<rank>";
++        # round-robin dispatch over the combined self.workers list must use the
++        # engine name that matches the chosen worker (not a rollout-prefixed
++        # index), or submit RPCs 404 on fork workers.
++        self._worker_engine_names: dict[str, str] = {}
++        self._task_worker_map_lock = threading.Lock()
++
++    def _init_fork_state(self) -> None:
++        """Init actor-GPU fork engines state + the fork strategy.
++
++        Forked vLLM engines run on actor GPUs during the first rollout, are
++        appended to ``self.workers`` so round-robin dispatch serves them, and
++        are reclaimed (aborted + redispatched) before teardown so the actor can
++        resume training. The fork state (``fork_workers`` / ``_fork_started`` /
++        ``_fork_role`` / ``_fork_worker_ids``) is always initialized (harmless
++        empty defaults when the feature is off); the per-task salvage strategy
++        is :class:`ForkCoordinator` when ``enable_actor_gpu_rollout`` is on,
++        else :class:`NoOpForkCoordinator` (identity) so the callback hot path
++        carries zero fork overhead when the feature is disabled. The fork
++        LIFECYCLE (start/reclaim/teardown) stays on this controller; the
++        coordinator holds only the continuation/re-merge state + salvage logic.
++        """
++        self.fork_workers: list[Worker] = []
++        self._fork_started: bool = False
++        self._fork_role: str = "actor-fork"
++        self._fork_worker_ids: set[str] = set()
++        self._fork = (
++            ForkCoordinator(host=self)
++            if self.config.enable_actor_gpu_rollout
++            else NoOpForkCoordinator()
++        )
++
+     @property
+     def _proxy_role(self) -> str:
+         """Generate a unique proxy role name based on the worker role.
+@@ -260,6 +323,11 @@
+         await asyncio.gather(*tasks)
+         logger.info("Engine created on all workers!")
+ 
++        # Map each surviving worker to its engine name so round-robin dispatch
++        # (which may later include fork workers) resolves the right engine.
++        for rank, worker in enumerate(self.workers):
++            self._worker_engine_names[worker.id] = self._engine_name(rank)
++
+         logger.info("Calling engine initialization...")
+         # Workers are controller-managed: the controller handles staleness
+         # globally, so workers must NOT apply their own dp-scaled staleness
+@@ -333,6 +401,31 @@
+             except Exception:
+                 logger.error(f"Error deleting workers: {traceback.format_exc()}")
+ 
++        # Delete actor-GPU fork workers if still alive (defensive: handles a
++        # crash mid-step-0 before reclaim_and_teardown_actor_fork ran).
++        if getattr(self, "_fork_started", False):
++            try:
++                self._fork_collective_rpc("destroy", http_timeout=60.0)
++            except Exception:
++                logger.error(f"Error destroying fork engines: {traceback.format_exc()}")
++            try:
++                self.scheduler.delete_workers(role=self._fork_role)
++                self.fork_workers.clear()
++                for wid in self._fork_worker_ids:
++                    self._worker_engine_names.pop(wid, None)
++                self._fork_worker_ids.clear()
++                self._fork_started = False
++                logger.info("Fork workers deleted")
++            except Exception:
++                logger.error(f"Error deleting fork workers: {traceback.format_exc()}")
++
++        # Defensive: drop any parked fork complete-groups whose continuation
++        # never ran (e.g. a crash mid-step-0). Normally consumed by the
++        # continuation accept branch (pop).
++        if hasattr(self, "_fork"):
++            self._fork.clear_complete_groups()
++            self._fork.clear_completed_task_ids()
++
+         # Delete proxy workers if initialized
+         if self._proxy_started:
+             try:
+@@ -422,6 +515,511 @@
+ 
+         logger.info(f"Proxy servers initialized. Addresses: {self.proxy_addrs}")
+ 
++    # ------------------------------------------------------------------
++    # Actor-GPU fork engines (step-0 utilization feature)
++    # ------------------------------------------------------------------
++
++    def _fork_engine_name(self, rank: int) -> str:
++        """Engine name for a forked worker rank, e.g. 'actor-fork/0'."""
++        return f"{self._fork_role}/{rank}"
++
++    def start_actor_fork_engines(
++        self,
++        actor_role: str,
++        fork_instance_gpus: int,
++        fork_replicas: int,
++        server_args: dict[str, Any],
++    ) -> None:
++        """Fork vLLM rollout engines onto the actor GPUs and register them.
++
++        Mirrors ``start_proxy`` but with a **GPU** fork (one vLLM server per
++        group of ``fork_instance_gpus`` actor workers), plus ``launch_server``
++        and engine ``initialize`` (proxy forks only attach to existing
++        servers). Forked workers are appended to ``self.workers`` so
++        round-robin dispatch serves them automatically.
++
++        ``fork_instance_gpus`` is the GPU footprint of one surviving rollout
++        vLLM server = data_parallel_size x tensor_parallel_size x
++        pipeline_parallel_size (matches the launch command; in the inference
++        EP scenario EP size = data_parallel_size x tensor_parallel_size ==
++        one instance). RayScheduler's grouped GPU fork requires
++        fork_instance_gpus == actor_world_size // fork_replicas, which holds
++        by construction when fork_replicas = actor_world_size // fork_instance_gpus.
++        """
++        if self._fork_started:
++            logger.warning("Actor-GPU fork engines already started; skipping.")
++            return
++        run_async_task(
++            self._async_start_actor_fork_engines,
++            actor_role,
++            fork_instance_gpus,
++            fork_replicas,
++            server_args,
++        )
++        self._fork_started = True
++
++    async def _async_start_actor_fork_engines(
++        self,
++        actor_role: str,
++        fork_instance_gpus: int,
++        fork_replicas: int,
++        server_args: dict[str, Any],
++    ) -> None:
++        # Reuse the rollout worker scheduling_spec (cmd/env) for the forked
++        # workers, but force GPU == fork_instance_gpus (one vLLM server per
++        # group), scaling cpu/mem to match the per-instance GPU count.
++        fork_spec = SchedulingSpec(**asdict(self.config.scheduling_spec[0]))
++        fork_spec.cpu *= fork_instance_gpus
++        fork_spec.mem *= fork_instance_gpus
++        fork_spec.gpu = fork_instance_gpus
++
++        job = Job(
++            replicas=fork_replicas,
++            tasks=[fork_spec for _ in range(fork_replicas)],
++            scheduling_strategy=SchedulingStrategy(
++                type="colocation",
++                target=actor_role,
++                fork=True,
++            ),
++            role=self._fork_role,
++        )
++
++        logger.info(
++            f"[step0-fork] forking {fork_replicas} vLLM engine(s) "
++            f"({fork_instance_gpus} GPUs each) onto actor role={actor_role}"
++        )
++        fork_start = time.perf_counter()
++        worker_ids = self.scheduler.fork_workers(job)
++        logger.info(f"[step0-fork] fork workers created: {worker_ids}")
++
++        self.fork_workers = self.scheduler.get_workers(role=self._fork_role)
++        logger.info(
++            f"[step0-fork] fork workers ready: {[w.id for w in self.fork_workers]}"
++        )
++
++        engine_class = self.inf_engine
++        create_tasks = [
++            self.scheduler.create_engine(
++                worker_id=worker.id,
++                engine=f"{engine_class.__module__}.{engine_class.__name__}",
++                engine_name=self._fork_engine_name(rank),
++                config=self.config,
++            )
++            for rank, worker in enumerate(self.fork_workers)
++        ]
++        await asyncio.gather(*create_tasks)
++        logger.info("Fork engines created.")
++
++        # Launch the vLLM servers on the forked workers (same path as the
++        # surviving engines in _async_initialize).
++        await self._fork_collective_rpc_async("launch_server", server_args=server_args)
++        logger.info("[step0-fork] vLLM servers launched on fork workers.")
++
++        init_tasks = [
++            self.scheduler.async_call_engine(
++                worker_id=worker.id,
++                method="initialize",
++                engine_name=self._fork_engine_name(rank),
++                engine_id=str(rank),
++                engine_rank=rank,
++                num_engines=len(self.fork_workers),
++                # Controller-managed: workers must not apply their own
++                # dp-scaled staleness constraints (mirrors _async_initialize).
++                train_data_parallel_size=1,
++            )
++            for rank, worker in enumerate(self.fork_workers)
++        ]
++        await asyncio.gather(*init_tasks)
++        logger.info("[step0-fork] fork engines initialized.")
++
++        # Keep fork engines in lockstep with the controller version (step-0 = 0).
++        await self._fork_collective_rpc_async(
++            "set_version", version=self.get_version(), http_timeout=60.0
++        )
++
++        # Register forked workers into the dispatch pool. Round-robin
++        # (_choose_worker) now distributes traffic to surviving + fork engines.
++        self._fork_worker_ids = {w.id for w in self.fork_workers}
++        # Map fork workers to their (differently-named) engines so dispatch
++        # resolves engine_name="actor-fork/<rank>" instead of "rollout/<idx>".
++        for rank, worker in enumerate(self.fork_workers):
++            self._worker_engine_names[worker.id] = self._fork_engine_name(rank)
++        surviving_n = len(self.workers)
++        self.workers.extend(self.fork_workers)
++        logger.info(
++            f"[step0-fork] fork engines registered (surviving={surviving_n} "
++            f"+ fork={len(self.fork_workers)} = {len(self.workers)} dispatch "
++            f"workers, version={self.get_version()}) in "
++            f"{time.perf_counter() - fork_start:.1f}s"
++        )
++
++    async def _fork_collective_rpc_async(
++        self, method: str, *args, **kwargs
++    ) -> list[Any]:
++        """Collective RPC scoped to fork engines only (never surviving engines)."""
++        return await self._generic_collective_rpc_async(
++            method, self.fork_workers, self._fork_engine_name, *args, **kwargs
++        )
++
++    def _fork_collective_rpc(self, method: str, *args, **kwargs) -> list[Any]:
++        return run_async_task(self._fork_collective_rpc_async, method, *args, **kwargs)
++
++    def reclaim_and_teardown_actor_fork(self) -> None:
++        """Reclaim in-flight requests from fork engines and tear them down.
++
++        Step-0 reclamation state machine (called after ``prepare_batch``
++        returns a full batch, before the actor is onloaded back):
++
++        1. ``dispatcher.pause()`` — stop the producer from pulling new tasks.
++        2. Snapshot in-flight fork tasks (task_id + original input) before
++           evict, so continuations can be re-submitted with the original data.
++        3. Fork-only ``evict`` — sets the eviction flag and aborts in-flight
++           vLLM requests (``pause_generation``). Each in-flight ``agenerate``
++           loop breaks and returns its partial tokens; the workflow surfaces
++           them as a continuation descriptor, which the per-task coroutine
++           deposits into ``ForkCoordinator`` (``self._fork``).
++        4. Wait for fork task coroutines to settle (descriptors deposited).
++           Tasks that never settle are abandoned: their future is resolved with
++           a sentinel, so their coroutine rejects instead of accepting a late
++           result, and step 7 replays the original input.
++        5. Collect deposited descriptors; remove fork workers from the pool.
++           Snapshot tasks are classified into continuation / completed /
++           restart; only tasks reclaim itself abandoned at the settle timeout
++           are restarted (that coroutine can no longer accept a result).
++        6. ``destroy`` fork engines + ``scheduler.delete_workers``.
++        7. Re-submit each continuation to a surviving engine (rid-pinned: all
++           samples of one input land on the same surviving vLLM), then re-submit
++           each lost task's original input as a full restart (new task_id,
++           priority, same group_size).
++        8. ``dispatcher.resume()`` — surviving engines drain continuations and
++           restarts.
++        """
++        if not self._fork_started:
++            return
++        cleanup_error: Exception | None = None
++
++        # 1. Stop dispatching new tasks.
++        self.dispatcher.pause()
++        reclaim_start = time.perf_counter()
++
++        # 2. Snapshot in-flight fork tasks before evict.
++        with self._task_worker_map_lock:
++            fork_snapshot: list[tuple[int, _RemoteRolloutTaskInput]] = [
++                (tid, self._task_input_map[tid])
++                for tid, wid in self._task_worker_map.items()
++                if wid in self._fork_worker_ids and tid in self._task_input_map
++            ]
++        logger.info(
++            f"[step0-fork] reclaim: snapshotted {len(fork_snapshot)} in-flight "
++            f"fork task(s): {[tid for tid, _ in fork_snapshot]}"
++        )
++
++        # 3. Evict fork engines: set flag + abort in-flight. In-flight
++        # agenerate loops break and return partial descriptors, which the
++        # per-task coroutines deposit into ForkCoordinator (self._fork).
++        logger.info(
++            f"[step0-fork] reclaim: evicting {len(self.fork_workers)} fork engine(s) "
++            "(set flag + abort in-flight)"
++        )
++        try:
++            self._fork_collective_rpc("evict", http_timeout=self.config.request_timeout)
++        except Exception as exc:  # noqa: BLE001
++            cleanup_error = exc
++            logger.error(f"[step0-fork] reclaim: evict on fork engines failed: {exc}")
++
++        # 4. Wait for fork task coroutines to settle. Bound the wait so a
++        # stuck fork task cannot deadlock training. Tasks still pending at the
++        # deadline are abandoned here and replayed in step 7.
++        abandoned_tids: set[int] = set()
++        settle_timeout = max(30.0, (self.config.pause_grace_period or 0.0) + 30.0)
++        deadline = time.perf_counter() + settle_timeout
++        while True:
++            with self._task_worker_map_lock:
++                pending_fork_tasks = [
++                    tid
++                    for tid, wid in self._task_worker_map.items()
++                    if wid in self._fork_worker_ids
++                ]
++            if not pending_fork_tasks:
++                logger.info(
++                    f"[step0-fork] reclaim: all fork task(s) settled in "
++                    f"{time.perf_counter() - reclaim_start:.1f}s"
++                )
++                break
++            if time.perf_counter() >= deadline:
++                logger.warning(
++                    f"[step0-fork] reclaim: {len(pending_fork_tasks)} fork task(s) "
++                    f"did not settle within {settle_timeout}s; abandoning them "
++                    f"(full restart) and forcing teardown "
++                    f"(pending={pending_fork_tasks})."
++                )
++                # Resolve the stuck futures with the ABANDONED sentinel: the
++                # coroutine stops waiting (no request_timeout hang) and rejects
++                # without fetching a result, so the full restart below cannot
++                # duplicate it. A future the engine callback already resolved is
++                # not popped here -- that task stays owned by its coroutine and
++                # is not restarted.
++                with self._futures_lock:
++                    for tid in pending_fork_tasks:
++                        fut = self._pending_futures.pop(tid, None)
++                        if fut is not None and not fut.done():
++                            abandoned_tids.add(tid)
++                            try:
++                                fut.get_loop().call_soon_threadsafe(
++                                    fut.set_result, _FORK_TASK_ABANDONED
++                                )
++                            except Exception:  # noqa: BLE001
++                                pass
++                break
++            time.sleep(0.2)
++
++        # 5. Collect deposited continuation descriptors; remove fork workers
++        # from the dispatch pool so re-submitted continuations route to
++        # surviving engines via round-robin (_choose_worker).
++        #
++        # Split the pre-evict snapshot three ways so the "lost" count is exact:
++        #   (a) yielded a descriptor            -> re-submit a continuation
++        #   (b) completed normally on the fork  -> already accepted (path A),
++        #       engine before evict took effect    no continuation needed
++        #   (c) yielded nothing at all          -> re-submit a FULL RESTART of
++        #       (settle timeout / workflow failure)  the original input (new
++        #       task_id, priority, same group_size), instead of dropping it
++        # (b) is recorded by ForkCoordinator.localize_if_fork when the normal
++        # trajectory is accepted (task_id -> accepted rollout count). The
++        # previous `snapshot - descriptors` count misreported (b) as lost: e.g.
++        # a sample that hit max_tokens exactly before the abort lands returns a
++        # normal "length" trajectory, not a descriptor (remaining == 0).
++        #
++        # A "task" is one prompt submission = ``group_size`` (n_samples)
++        # rollouts. Accounting is reported per task AND aggregated in rollouts:
++        # within a descriptor task the samples split into interrupted (partial
++        # -> continuation) + parked (completed before evict, re-merged later) +
++        # lost (returned None). A (c) task has no partial and no trajectory at
++        # all, so the whole group is re-run -- nothing it produced is reused and
++        # nothing already accepted is recomputed.
++        fork_continuations: list[
++            tuple[int, _RemoteRolloutTaskInput, dict[str, Any]]
++        ] = []
++        with self._task_worker_map_lock:
++            for tid, task_input in fork_snapshot:
++                desc = self._fork.pop_continuation(tid)
++                if desc is not None:
++                    fork_continuations.append((tid, task_input, desc))
++        descriptor_by_tid = {tid: desc for tid, _, desc in fork_continuations}
++        completed_by_tid = self._fork.pop_completed_task_ids()
++        # Tasks reclaim abandoned at the settle timeout (their future was
++        # resolved with _FORK_TASK_ABANDONED) are replayed in step 7 with their
++        # original input as brand-new n_samples groups.
++        restart_tasks = [
++            (tid, task_input)
++            for tid, task_input in fork_snapshot
++            if tid in abandoned_tids
++        ]
++        lost_tids: list[int] = []
++
++        total_rollouts = interrupted_rollouts = parked_rollouts = 0
++        completed_rollouts = lost_rollouts = 0
++        for tid, task_input in fork_snapshot:
++            n_rollouts = task_input.group_size
++            total_rollouts += n_rollouts
++            desc = descriptor_by_tid.get(tid)
++            if desc is not None:
++                interrupted = len(desc.get(FORK_CONTINUATION_KEY) or [])
++                parked_group = desc.get(FORK_COMPLETE_KEY)
++                parked = (
++                    parked_group["input_ids"].shape[0]
++                    if parked_group is not None
++                    else 0
++                )
++                lost = max(n_rollouts - interrupted - parked, 0)
++                interrupted_rollouts += interrupted
++                parked_rollouts += parked
++                lost_rollouts += lost
++                logger.info(
++                    f"[step0-fork] reclaim: task_id={tid} "
++                    f"rollouts={n_rollouts}: {interrupted} interrupted "
++                    "(partial -> continuation), "
++                    f"{parked} completed on fork (parked for re-merge), "
++                    f"{lost} lost"
++                )
++            elif tid in completed_by_tid:
++                accepted = completed_by_tid[tid]
++                lost = max(n_rollouts - accepted, 0)
++                completed_rollouts += accepted
++                lost_rollouts += lost
++                logger.info(
++                    f"[step0-fork] reclaim: task_id={tid} "
++                    f"rollouts={n_rollouts}: {accepted} completed on fork "
++                    "(accepted, no continuation needed)"
++                )
++            else:
++                lost_tids.append(tid)
++                lost_rollouts += n_rollouts
++                suffix = (
++                    " -> re-submitting as a full restart"
++                    if tid in abandoned_tids
++                    else ""
++                )
++                logger.info(
++                    f"[step0-fork] reclaim: task_id={tid} "
++                    f"rollouts={n_rollouts}: {n_rollouts} lost "
++                    f"(no descriptor, no trajectory){suffix}"
++                )
++        if lost_tids:
++            logger.warning(
++                f"[step0-fork] reclaim: {len(lost_tids)}/{len(fork_snapshot)} "
++                "fork task(s) yielded neither a continuation descriptor nor an "
++                "accepted trajectory (settle timeout / workflow failure): "
++                f"{lost_tids}"
++            )
++        self.workers = [w for w in self.workers if w.id not in self._fork_worker_ids]
++        if self.workers:
++            self._current_worker_idx %= len(self.workers)
++        logger.info(
++            f"[step0-fork] reclaim: rollout accounting across "
++            f"{len(fork_snapshot)} fork task(s) ({total_rollouts} rollouts): "
++            f"{completed_rollouts} completed (accepted) + "
++            f"{parked_rollouts} parked for re-merge + "
++            f"{interrupted_rollouts} interrupted (re-submitted as "
++            f"continuations) + {lost_rollouts} lost"
++            + (
++                f" ({len(restart_tasks)} re-submitted as full restarts)"
++                if restart_tasks
++                else ""
++            )
++            + f"; collected {len(fork_continuations)} continuation descriptor(s); "
++            f"dispatch pool now {len(self.workers)} surviving worker(s)"
++        )
++
++        # 6. Destroy fork engines and delete fork worker processes.
++        try:
++            self._fork_collective_rpc("destroy", http_timeout=60.0)
++        except Exception as exc:  # noqa: BLE001
++            if cleanup_error is None:
++                cleanup_error = exc
++            logger.error(f"destroy on fork engines failed: {exc}")
++        try:
++            self.scheduler.delete_workers(role=self._fork_role)
++        except Exception:
++            logger.error(f"Error deleting fork workers: {traceback.format_exc()}")
++        self.fork_workers.clear()
++        for wid in self._fork_worker_ids:
++            self._worker_engine_names.pop(wid, None)
++        self._fork_worker_ids.clear()
++        with self._task_worker_map_lock:
++            self._task_worker_map.clear()
++            self._task_input_map.clear()
++            self._fork.clear_continuations()
++        # Late callbacks (settle-timeout race) may still record path-A
++        # completions after step 5 popped the set; clear defensively.
++        self._fork.clear_completed_task_ids()
++        self._fork_started = False
++
++        # 7. Re-submit continuations to surviving engines with PRIORITY so the
++        # dispatcher pulls them immediately (bypassing the staleness capacity
++        # gate that the step-0 overlap saturates). This makes them run at
++        # version 0 during the step-0 training window (surviving engines idle)
++        # instead of being starved and going off-policy by step 2-3.
++        resubmitted = 0
++        manifest: list[dict[str, Any]] = []
++        for tid, task_input, descriptor in fork_continuations:
++            cont_list = descriptor.get(FORK_CONTINUATION_KEY)
++            if not cont_list:
++                logger.warning(
++                    "[step0-fork] reclaim: descriptor missing continuation list; "
++                    "skipping re-submit"
++                )
++                continue
++            cont_data = dict(task_input.data)
++            cont_data[FORK_CONTINUE_FIELD] = cont_list
++            # Tag the continuation with its originating fork task_id so the
++            # accept branch can find the parked already-complete rollouts (if
++            # any) and re-merge into one full n_samples group.
++            cont_data[FORK_MERGE_KEY] = tid
++            new_id = self._task_id_generator.next()
++            rids = [c.get("rid") for c in cont_list]
++            logger.info(
++                f"[step0-fork] reclaim: re-submitting continuation task_id={new_id} "
++                f"group_size={len(cont_list)} rids={rids} to surviving engine (priority)"
++            )
++            try:
++                self.submit(
++                    data=cont_data,
++                    workflow=task_input.workflow,
++                    workflow_kwargs=task_input.workflow_kwargs,
++                    should_accept_fn=task_input.should_accept_fn,
++                    task_id=new_id,
++                    is_eval=task_input.is_eval,
++                    group_size=len(cont_list),
++                    proxy_addr=task_input.proxy_addr,
++                    priority=True,
++                )
++                resubmitted += 1
++                manifest.append(
++                    {"cont_task_id": new_id, "rids": rids, "status": "re-submitted"}
++                )
++            except Exception as exc:  # noqa: BLE001
++                logger.error(
++                    f"[step0-fork] reclaim: failed to re-submit continuation "
++                    f"task_id={new_id}: {exc}"
++                )
++        # Full restarts for tasks that yielded neither a descriptor nor a
++        # trajectory. Same priority-bypass rationale as continuations: run them
++        # during the step-0 training window on the (otherwise idle) surviving
++        # engines instead of letting the saturated overlap starve them. A fresh
++        # task_id is used and the original input is replayed untouched (no
++        # FORK_CONTINUE_FIELD / FORK_MERGE_KEY): this is a brand-new n_samples
++        # group, so it can never be confused with (or merged into) the abandoned
++        # task's (nonexistent) result.
++        restarted = 0
++        for old_tid, task_input in restart_tasks:
++            new_id = self._task_id_generator.next()
++            try:
++                self.submit(
++                    data=dict(task_input.data),
++                    workflow=task_input.workflow,
++                    workflow_kwargs=task_input.workflow_kwargs,
++                    should_accept_fn=task_input.should_accept_fn,
++                    task_id=new_id,
++                    is_eval=task_input.is_eval,
++                    group_size=task_input.group_size,
++                    proxy_addr=task_input.proxy_addr,
++                    priority=True,
++                )
++                restarted += 1
++                logger.info(
++                    f"[step0-fork] reclaim: re-submitted lost task_id={old_tid} "
++                    f"as full restart task_id={new_id} "
++                    f"group_size={task_input.group_size} (priority)"
++                )
++            except Exception as exc:  # noqa: BLE001
++                logger.error(
++                    f"[step0-fork] reclaim: failed to re-submit lost "
++                    f"task_id={old_tid} as a full restart: {exc}"
++                )
++        # Fork-sample manifest: one structured line listing every re-submitted
++        # continuation / restart (grep `fork-manifest` to trace each fork
++        # sample's fate).
++        logger.info(
++            f"[step0-fork] fork-manifest: re-submitted {resubmitted} continuation "
++            f"task(s) with priority: {manifest}"
++        )
++        logger.info(
++            f"[step0-fork] reclaim: re-submitted {resubmitted} continuation + "
++            f"{restarted} restart task(s) to surviving engines."
++        )
++
++        # 8. Resume dispatching to surviving engines.
++        self.dispatcher.resume()
++
++        if cleanup_error is not None:
++            logger.error(
++                f"[step0-fork] reclaim: teardown completed with errors: {cleanup_error}"
++            )
++        logger.info(
++            f"[step0-fork] reclaim: done in {time.perf_counter() - reclaim_start:.1f}s"
++        )
++
+     def get_proxy_addr(self, rank: int) -> str:
+         """Get the proxy server address for a given rollout worker rank.
+
+@@ -727,20 +1325,28 @@
+         ]
+         return await asyncio.gather(*tasks)
+ 
+-    def _choose_worker(self) -> tuple[Worker, int]:
++    def _choose_worker(self) -> tuple[Worker, str]:
+         """Choose a worker for the next request using round-robin scheduling.
+ 
+         Returns
+         -------
+-        tuple[Worker, int]
+-            The chosen worker object and its rank
++        tuple[Worker, str]
++            The chosen worker object and the engine name registered on it.
++            Engine name is looked up from ``_worker_engine_names`` so it matches
++            the worker whether it is a surviving ("rollout/<rank>") or a fork
++            ("actor-fork/<rank>") engine.
+         """
+         if not self.workers:
+             raise RuntimeError("No workers available to choose from.")
+         worker = self.workers[self._current_worker_idx]
+-        rank = self._current_worker_idx
+         self._current_worker_idx = (self._current_worker_idx + 1) % len(self.workers)
+-        return worker, rank
++        engine_name = self._worker_engine_names.get(worker.id)
++        if engine_name is None:
++            raise RuntimeError(
++                f"Chosen worker {worker.id} has no registered engine name "
++                f"(known: {self._worker_engine_names})"
++            )
++        return worker, engine_name
+ 
+     def _resolve_workflow_str(self, workflow: WorkflowLike | None) -> str | None:
+         """Resolve workflow to a string import path.
+@@ -799,15 +1405,22 @@
+ 
+     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
+         async def _submit_then_wait() -> _RemoteRolloutResult | None:
+-            # Choose worker via round-robin
+-            worker, rank = self._choose_worker()
+-            engine_name = self._engine_name(rank)
++            # Choose worker via round-robin. engine_name is looked up per-worker
++            # so it matches fork engines ("actor-fork/<rank>") as well as
++            # surviving ones ("rollout/<rank>").
++            worker, engine_name = self._choose_worker()
+ 
+             # NOTE: No need to call `on_rollout_submitted` here.
+             # This function will be passed to `BatchTaskDispather` where
+             # `on_rollout_submitted` will be called upon dispatching
+             task_id = pending_task.task_id
+ 
++            # Record which worker this task landed on, so reclaim can locate
++            # in-flight tasks on actor-GPU fork engines (abort + redispatch).
++            with self._task_worker_map_lock:
++                self._task_worker_map[task_id] = worker.id
++                self._task_input_map[task_id] = pending_task
++
+             manager = self.staleness_manager
+ 
+             try:
+@@ -818,7 +1431,13 @@
+ 
+                 proxy_addr = pending_task.proxy_addr
+                 if self._proxy_started and proxy_addr is None:
+-                    proxy_addr = self.get_proxy_addr(rank)
++                    # Proxy workers are 1:1 with surviving rollout workers and
++                    # indexed by their rollout rank. engine_name is
++                    # "rollout/<rank>" for surviving workers. (Fork and proxy do
++                    # not co-occur: fork is separation-deployment standard
++                    # rollout, proxy is AgentWorkflow online mode.)
++                    _rollout_rank = int(engine_name.rsplit("/", 1)[-1])
++                    proxy_addr = self.get_proxy_addr(_rollout_rank)
+                 engine_task_id = await self.scheduler.async_call_engine(
+                     worker.id,
+                     "submit",
+@@ -837,8 +1456,19 @@
+ 
+                 assert task_id == engine_task_id, (task_id, engine_task_id)
+ 
+-                # Wait for callback to resolve the future
+-                await asyncio.wait_for(future, timeout=self.config.request_timeout)
++                # Wait for callback to resolve the future. Reclaim's settle
++                # timeout resolves it with _FORK_TASK_ABANDONED instead: it owns
++                # the task and re-submits the original input as a full restart,
++                # so reject here without fetching (no duplicate prompt group).
++                signal = await asyncio.wait_for(
++                    future, timeout=self.config.request_timeout
++                )
++                if signal is _FORK_TASK_ABANDONED:
++                    manager.on_rollout_rejected()
++                    with self._task_worker_map_lock:
++                        self._task_worker_map.pop(task_id, None)
++                        self._task_input_map.pop(task_id, None)
++                    return None
+ 
+                 # Fetch the result
+                 result = await self.scheduler.async_call_engine(
+@@ -851,24 +1481,42 @@
+                     http_timeout=self.config.request_timeout,
+                 )
+ 
+-                traj = result
++                # Fork salvage (deposit evicted partial + re-merge + localize +
++                # path A log) is a single hook on the fork strategy. Identity
++                # (NoOpForkCoordinator) when the feature is off, so this hot
++                # path carries zero fork overhead in the normal case. Returns
++                # the trajectory to accept, or None to reject (descriptor / None
++                # result); the map pop below is idempotent for the descriptor
++                # case (on_task_evicted already popped under the lock).
++                traj = self._fork.post_process_result(
++                    pending_task, worker, task_id, result
++                )
+                 if traj is not None:
+                     manager.on_rollout_accepted()
+                     if self.config.enable_rollout_tracing:
+                         logger.info(
+                             f"Finish and accept rollout. {self._rollout_stats()}"
+                         )
++                    with self._task_worker_map_lock:
++                        self._task_worker_map.pop(task_id, None)
++                        self._task_input_map.pop(task_id, None)
+                     return _RemoteRolloutResult(task_id=task_id, trajectory=traj)
+ 
+                 manager.on_rollout_rejected()
+                 if self.config.enable_rollout_tracing:
+                     logger.info(f"Finish but reject rollout. {self._rollout_stats()}")
++                with self._task_worker_map_lock:
++                    self._task_worker_map.pop(task_id, None)
++                    self._task_input_map.pop(task_id, None)
+                 return None
+ 
+             except TimeoutError:
+                 if task_id is not None:
+                     with self._futures_lock:
+                         self._pending_futures.pop(task_id, None)
++                    with self._task_worker_map_lock:
++                        self._task_worker_map.pop(task_id, None)
++                        self._task_input_map.pop(task_id, None)
+                 manager.on_rollout_rejected()
+                 logger.error(f"Rollout timed out after {self.config.request_timeout}s")
+                 return None
+@@ -876,6 +1524,9 @@
+                 if task_id is not None:
+                     with self._futures_lock:
+                         self._pending_futures.pop(task_id, None)
++                    with self._task_worker_map_lock:
++                        self._task_worker_map.pop(task_id, None)
++                        self._task_input_map.pop(task_id, None)
+                 manager.on_rollout_rejected()
+                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
+                 return None
+@@ -895,6 +1546,7 @@
+         is_eval: bool = False,
+         group_size: int = 1,
+         proxy_addr: str | None = None,
++        priority: bool = False,
+     ) -> int:
+         workflow_str = self._resolve_workflow_str(workflow)
+         should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+@@ -915,6 +1567,7 @@
+             is_eval=is_eval,
+             group_size=group_size,
+             proxy_addr=proxy_addr,
++            priority=priority,
+         )
+ 
+         # Delegate to dispatcher
+@@ -1071,14 +1724,15 @@
+         ModelResponse
+             The generated response from the model
+         """
+-        # Choose worker and delegate
+-        worker, rank = self._choose_worker()
++        # Choose worker and delegate. engine_name is looked up per-worker so it
++        # matches fork engines as well as surviving ones.
++        worker, engine_name = self._choose_worker()
+ 
+         # Call agenerate on engine via scheduler
+         return await self.scheduler.async_call_engine(
+             worker_id=worker.id,
+             method="agenerate",
+-            engine_name=self._engine_name(rank),
++            engine_name=engine_name,
+             req=req,
+         )
+ 
+Index: areal/infra/controller/train_controller.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/infra/controller/train_controller.py b/areal/infra/controller/train_controller.py
+--- a/areal/infra/controller/train_controller.py	(revision 5f8f2fbf1dde5b4283b359e288bf078e64d1bfee)
++++ b/areal/infra/controller/train_controller.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -251,6 +251,15 @@
+     def cpu_group(self):
+         return None
+ 
++    @property
++    def worker_role(self) -> str:
++        """The role name this controller's workers were created under.
++
++        Exposed so the trainer can fork engines onto these workers (e.g.
++        the step-0 actor-GPU inference fork targets the actor role).
++        """
++        return self._worker_role
++
+     def initialize(
+         self,
+         role: str,
+Index: areal/infra/remote_inf_engine.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/infra/remote_inf_engine.py b/areal/infra/remote_inf_engine.py
+--- a/areal/infra/remote_inf_engine.py	(revision 5f8f2fbf1dde5b4283b359e288bf078e64d1bfee)
++++ b/areal/infra/remote_inf_engine.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -48,6 +48,8 @@
+ from areal.utils import logging, name_resolve, names
+ from areal.utils.data import concat_padded_tensors
+ from areal.utils.dynamic_import import import_from_string
++from areal.utils.fork_constants import FORK_CONTINUE_FIELD
++from areal.utils.fork_continuation import ForkContinuationWorkflow
+ from areal.utils.network import (
+     find_free_ports,
+     format_hostport,
+@@ -84,9 +86,40 @@
+     ) -> dict[str, Any] | None:
+         from areal.experimental.openai import InteractionWithTokenLogpReward
+ 
+-        results = await asyncio.gather(
+-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
++        # Fork-continuation re-entry: the controller injects FORK_CONTINUE_FIELD
++        # as a list of per-sample partials. Distribute the i-th partial to the
++        # i-th sample so all samples of one input resume on the same surviving
++        # engine (rid affinity is preserved per-sample inside the workflow).
++        # Isolated in ForkContinuationWorkflow; this branch is inert for normal
++        # tasks (no FORK_CONTINUE_FIELD in data).
++        cont_list = data.get(FORK_CONTINUE_FIELD) if isinstance(data, dict) else None
++        if cont_list is not None:
++            results = await asyncio.gather(
++                *[
++                    ForkContinuationWorkflow.arun_one_with_continue(
++                        self.workflow, engine, data, cont_list[i]
++                    )
++                    for i in range(self.group_size)
++                ]
++            )
++        else:
++            results = await asyncio.gather(
++                *[
++                    self.workflow.arun_episode(engine, data)
++                    for _ in range(self.group_size)
++                ]
++            )
++
++        # Fork-teardown eviction: if any sample returned a continuation
++        # descriptor (evicted mid-generation), surface the group's descriptors +
++        # already-complete rollouts for the controller to re-merge into one full
++        # n_samples group. Isolated in ForkContinuationWorkflow; returns None
++        # when no descriptors, so the normal merge below runs.
++        surfaced = ForkContinuationWorkflow.surface_group_descriptor(
++            results, self.logger
+         )
++        if surfaced is not None:
++            return surfaced
+ 
+         valid_results = [r for r in results if r is not None]
+ 
+@@ -380,6 +413,12 @@
+ 
+         self._version = 0
+ 
++        # Fork-teardown eviction flag (step-0 actor-GPU fork only). When set,
++        # in-flight agenerate loops break out and return their accumulated
++        # partial tokens (stop_reason="abort") so the controller can resume
++        # generation on a surviving engine instead of losing the partial work.
++        self._evicting = False
++
+         self.lock = Lock()
+         # Serialize Awex init so concurrent updates do not double-init the remote engine.
+         self._awex_lock = Lock()
+@@ -1042,8 +1081,20 @@
+                 len(req.input_ids),
+             )
+ 
++            # Fork-teardown eviction: stop continuing on this (doomed) server.
++            # Return the accumulated partial tokens so the controller can resume
++            # generation on a surviving engine (reusing this same prefix). Under
++            # normal operation _evicting is always False, so this is inert.
++            if self._evicting:
++                self.logger.info(
++                    f"[step0-fork] rid={req.rid}: evicted mid-generation, "
++                    f"returning partial tokens={len(accumulated_output_tokens)} "
++                    f"remaining={ori_max_new_tokens - len(accumulated_output_tokens)}"
++                )
++                break
++
+         # Final abort handling
+-        if stop_reason == "abort":
++        if stop_reason == "abort" and not self._evicting:
+             # If stop_reason is "abort", the only reason we exit the loop is
+             # len(accumulated_output_tokens) >= gconfig.max_new_tokens
+             # so the actual reason is length
+@@ -1456,6 +1507,24 @@
+         """Resume request submission for async rollout."""
+         return self.workflow_executor.resume()
+ 
++    def evict(self):
++        """Evict in-flight generation on a fork engine (step-0 teardown).
++
++        Sets the eviction flag and aborts in-flight vLLM requests
++        (``pause_generation``). Each in-flight ``agenerate`` loop, once it
++        receives the abort response and accumulates the partial tokens, breaks
++        out and returns a ``ModelResponse`` with ``stop_reason="abort"`` plus
++        the partial output. The controller then resumes those partials on a
++        surviving engine. Inert on non-fork engines (``_evicting`` is only set
++        here, which is only called on actor-GPU fork engines).
++        """
++        self._evicting = True
++        self.logger.info(
++            "[step0-fork] fork engine evict: flag set, aborting in-flight vLLM "
++            "requests (partial tokens will be returned for continuation)"
++        )
++        self.pause_generation()
++
+     def offload(self) -> None:
+         """Offload model memory on all servers."""
+         offload_req = self.backend.get_offload_request()
+Index: areal/infra/workflow_executor.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/infra/workflow_executor.py b/areal/infra/workflow_executor.py
+--- a/areal/infra/workflow_executor.py	(revision 5f8f2fbf1dde5b4283b359e288bf078e64d1bfee)
++++ b/areal/infra/workflow_executor.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -38,6 +38,7 @@
+ from areal.utils import logging, perf_tracer, stats_tracker
+ from areal.infra.utils.concurrent import get_executor
+ from areal.utils.data import cycle_dataloader
++from areal.utils.fork_constants import FORK_CONTINUATION_KEY
+ from areal.utils.perf_tracer import trace_perf, trace_session_event
+ from logging import Logger
+ 
+@@ -291,6 +292,9 @@
+ 
+         # Unbounded deques for producer/consumer pattern
+         self._pending_inputs: deque[TInput] = deque()
++        # Priority queue: tasks here bypass the staleness capacity gate (still
++        # respect pause + runner queue size). Pulled before _pending_inputs.
++        self._pending_priority_inputs: deque[TInput] = deque()
+         self._pending_results: dict[int, TimedResult[TResult]] = {}
+         self._active_task_ids: set[int] = set()
+ 
+@@ -376,11 +380,22 @@
+                         self.logger.info(f"Submit rollout. {self._rollout_stats()}")
+                 except TaskQueueFullError:
+                     with self._input_cv:
+-                        self._pending_inputs.appendleft(task_input)
++                        # Preserve priority on push-back so a priority task
++                        # does not get demoted behind normal inputs.
++                        if getattr(task_input, "priority", False):
++                            self._pending_priority_inputs.appendleft(task_input)
++                        else:
++                            self._pending_inputs.appendleft(task_input)
+                         self._input_cv.wait_for(
+                             lambda: (
+                                 self._shutdown_event.is_set()
+                                 or self._has_runner_capacity()
++                                or (
++                                    getattr(task_input, "priority", False)
++                                    and not self.runner.paused.is_set()
++                                    and self.runner.get_input_queue_size()
++                                    < self.runner.max_queue_size
++                                )
+                             )
+                         )
+                     # Allow other threads to make progress before retrying
+@@ -438,7 +453,17 @@
+         with self._input_cv:
+             while not self._shutdown_event.is_set():
+                 self._check_thread_exception()
+-                # There is capacity and pending inputs
++                # Priority tasks first: bypass the staleness capacity gate
++                # (still respect pause + runner input queue size so the runner
++                # is not overfed). Used for step-0 fork continuation re-submits
++                # so they run at version 0 instead of being starved by overlap.
++                if (
++                    self._pending_priority_inputs
++                    and not self.runner.paused.is_set()
++                    and self.runner.get_input_queue_size() < self.runner.max_queue_size
++                ):
++                    return self._pending_priority_inputs.popleft()
++                # Normal path: staleness capacity + pending inputs
+                 if (
+                     not self.runner.paused.is_set()
+                     and self.staleness_manager.get_capacity() > 0
+@@ -532,11 +557,16 @@
+         Parameters
+         ----------
+         task_input : TInput
+-            Task input to be processed.
++            Task input to be processed. If it has a truthy ``priority``
++            attribute, it is enqueued to the priority deque and bypasses the
++            staleness capacity gate.
+         """
+         self._check_thread_exception()
+         with self._input_cv:
+-            self._pending_inputs.append(task_input)
++            if getattr(task_input, "priority", False):
++                self._pending_priority_inputs.append(task_input)
++            else:
++                self._pending_inputs.append(task_input)
+             self.staleness_manager.on_rollout_enqueued()
+             if self.enable_tracing:
+                 self.logger.info(f"Enqueue rollout. {self._rollout_stats()}")
+@@ -1152,6 +1182,27 @@
+                     self.inference_engine, pending_task.data
+                 )
+ 
++                # Fork-eviction continuation descriptor: not a training trajectory.
++                # Bypass format check + should_accept_fn + dump (which would reject
++                # or raise on the non-trajectory shape, silently losing the partial).
++                # Pass through as-is; the controller's post_process_result routes it
++                # to on_task_evicted (deposit) for reclaim to re-submit as a
++                # continuation. Engine-side staleness is weakened in controller-managed
++                # mode; the controller re-accounts it as rejected via on_task_evicted.
++                if (
++                    traj is not None
++                    and isinstance(traj, dict)
++                    and FORK_CONTINUATION_KEY in traj
++                ):
++                    manager.on_rollout_accepted()
++                    stats_tracker.get("rollout").scalar(accepted=1)
++                    trace_session_event(
++                        "mark_finalized",
++                        task_id=task_id,
++                        status="accepted",
++                    )
++                    return _RolloutResult(task_id=task_id, trajectory=traj)
++
+                 # Trajectory format checking
+                 if self.config.check_trajectory_format and traj is not None:
+                     check_trajectory_format(
+Index: areal/trainer/rl_trainer.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/trainer/rl_trainer.py b/areal/trainer/rl_trainer.py
+--- a/areal/trainer/rl_trainer.py	(revision 5f8f2fbf1dde5b4283b359e288bf078e64d1bfee)
++++ b/areal/trainer/rl_trainer.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -150,6 +150,10 @@
+         teacher_configs = config.teacher.teachers if config.teacher is not None else []
+         self._should_offload_teacher = any(t.offload for t in teacher_configs)
+ 
++        # Step-0 actor-GPU inference fork (separation-deployment utilization):
++        # resolve topology + preconditions in one place (see _init_actor_gpu_fork).
++        self._init_actor_gpu_fork()
++
+         # Validate config before proceeding with weight initialization
+         self._validate_cfg()
+ 
+@@ -497,6 +501,180 @@
+         self._config_perf_tracer()
+         self._apply_initial_offload_policy()
+ 
++    def _init_actor_gpu_fork(self) -> None:
++        """Resolve step-0 actor-GPU fork topology + preconditions.
++
++        Only fires on the first step of a fresh run, in single-controller
++        separation mode with a Megatron actor + vLLM rollout + Ray scheduler.
++        Each fork instance mirrors ONE surviving rollout vLLM server =
++        ``vllm.data_parallel_size * tp * pp`` GPUs (in the inference EP scenario,
++        EP size = data_parallel_size * tp == one instance). The number of fork
++        instances is ``actor_world_size // instance_gpus``; auto-disabled (with a
++        warning) if that division is not exact (RayScheduler grouped GPU fork
++        constraint) or any other precondition fails.
++
++        Sets ``_actor_gpu_fork_step0`` (False if disabled). When enabled also
++        sets ``_actor_fork_instance_gpus`` / ``_actor_fork_replicas`` /
++        ``_rollout_server_args`` (the latter is filled later in ``_init_rollout``).
++        """
++        config = self.config
++        self._actor_gpu_fork_step0 = bool(config.rollout.enable_actor_gpu_rollout)
++        if not self._actor_gpu_fork_step0:
++            return
++
++        # Resolve the exact per-instance GPU count the surviving vLLM servers
++        # use (mirror build_args: vllm-config tp/pp override the allocation).
++        _vllm_cfg = config.vllm
++        _fork_tp = _vllm_cfg.tensor_parallel_size or self.rollout_alloc.parallel.tp_size
++        _fork_pp = (
++            _vllm_cfg.pipeline_parallel_size or self.rollout_alloc.parallel.pp_size
++        )
++        self._actor_fork_instance_gpus = (
++            _vllm_cfg.data_parallel_size * _fork_tp * _fork_pp
++        )
++        self._actor_fork_replicas: int = 0
++        self._rollout_server_args: dict[str, Any] | None = None
++
++        actor_world_size = self.actor_alloc.parallel.world_size
++        preconditions_ok = (
++            is_single_controller()
++            and self.actor_alloc.backend == "megatron"
++            and self.rollout_alloc.backend == "vllm"
++            and config.scheduler.type == "ray"
++            and not self._should_offload_rollout  # separation, not colocate
++            and actor_world_size % self._actor_fork_instance_gpus == 0
++        )
++        if not preconditions_ok:
++            logger.warning(
++                "enable_actor_gpu_rollout conditions not met"
++                "(single-controller + megatron actor + vllm rollout + ray "
++                "scheduler + separation + actor world_size divisible by rollout "
++                f"instance size={self._actor_fork_instance_gpus}, "
++                f"actor_world_size={actor_world_size}); disabling step0 fork."
++            )
++            self._actor_gpu_fork_step0 = False
++            return
++
++        self._actor_fork_replicas = actor_world_size // self._actor_fork_instance_gpus
++        logger.info(
++            "Step-0 actor-GPU fork enabled: instance_gpus="
++            f"{self._actor_fork_instance_gpus}, "
++            f"replicas={self._actor_fork_replicas}"
++        )
++
++    @staticmethod
++    def _workflow_supports_fork(workflow: WorkflowLike | None) -> bool:
++        """Whether the rollout workflow supports the step-0 actor-GPU fork.
++
++        Fork requires a single-turn tensor-dict workflow with
++        ``_arun_episode_continue`` (e.g. :class:`RLVRWorkflow`): the salvage
++        (``concat_padded_tensors``) assumes tensor-dict trajectories, the
++        continuation is single-turn, and on evict ``arun_episode`` returns (so
++        the fork engine can be torn down before the actor resumes training).
++        Agent / multi-turn workflows (:class:`OpenAIProxyWorkflow`,
++        :class:`AgentWorkflow`, online mode) are incompatible -- they produce
++        ``InteractionWithTokenLogpReward`` trajectories, run a multi-turn
++        ``agent.run`` that does NOT return on evict (so the fork engine cannot
++        be torn down while the actor needs the GPU), and have no
++        ``_arun_episode_continue``.
++        """
++        if workflow is None:
++            return False  # online agent mode (workflow resolved from agent config)
++        resolved = workflow
++        if isinstance(workflow, str):
++            from areal.utils.dynamic_import import import_from_string
++
++            try:
++                resolved = import_from_string(workflow)
++            except (ValueError, ImportError, AttributeError):
++                return False  # cannot resolve -> fail-safe: don't risk fork
++        return hasattr(resolved, "_arun_episode_continue")
++
++    def _should_use_step0_fork(
++        self,
++        global_step: int,
++        start_step: int,
++        streaming_batch_count: int,
++        workflow: WorkflowLike | None,
++    ) -> bool:
++        """Whether this step should serve its rollout from the step-0 fork.
++
++        The fork is a one-shot optimization for the first rollout of a fresh
++        run, so every guard below disables it rather than degrading it:
++
++        * ``start_step == 0`` -- a resumed run starts mid-training, where the
++          actor GPUs are not idle for a full rollout window;
++        * ``streaming_batch_count == 1`` -- the fork engines are torn down
++          right after the first ``prepare_batch``; a multi-chunk streaming step
++          would leave the remaining chunks running on a torn-down fork;
++        * ``max_head_offpolicyness > 0`` -- evicted/abandoned fork tasks are
++          re-submitted at the current (step-0) version while training advances;
++          with zero off-policy tolerance those results could never be consumed;
++        * the workflow must support fork (single-turn tensor-dict with
++          ``_arun_episode_continue``) -- see :meth:`_workflow_supports_fork`.
++        """
++        if not self._actor_gpu_fork_step0:
++            return False
++        if global_step != start_step or start_step != 0:
++            return False
++        if streaming_batch_count != 1:
++            logger.warning(
++                "[step0-fork] disabling step-0 fork: streaming rollout "
++                f"(streaming_batch_count={streaming_batch_count}) is not supported."
++            )
++            return False
++        if self.config.rollout.max_head_offpolicyness <= 0:
++            logger.warning(
++                "[step0-fork] disabling step-0 fork: rollout.max_head_offpolicyness "
++                "must be > 0 (fork salvage is re-submitted while training advances)."
++            )
++            return False
++        if not self._workflow_supports_fork(workflow):
++            logger.warning(
++                "[step0-fork] disabling step-0 fork: workflow does not support "
++                "fork (requires single-turn tensor-dict workflow with "
++                "_arun_episode_continue, e.g. RLVRWorkflow). Agent/multi-turn "
++                "workflows are incompatible."
++            )
++            return False
++        return True
++
++    def _start_step0_fork(self, global_step: int) -> None:
++        """Offload the actor and fork vLLM engines onto its now-free GPUs."""
++        logger.info(
++            f"[step0-fork] global_step={global_step}: offloading actor "
++            f"(role={self.actor.worker_role}) to free GPUs for fork engines"
++        )
++        self._offload_model(self.actor, role="actor")
++        logger.info(
++            "[step0-fork] starting fork vLLM engines on actor GPUs "
++            f"(instance_gpus={self._actor_fork_instance_gpus}, "
++            f"replicas={self._actor_fork_replicas})"
++        )
++        self.rollout.start_actor_fork_engines(
++            actor_role=self.actor.worker_role,
++            fork_instance_gpus=self._actor_fork_instance_gpus,
++            fork_replicas=self._actor_fork_replicas,
++            server_args=self._rollout_server_args,
++        )
++
++    def _reclaim_step0_fork(self, rollout_batch: list[dict[str, Any]]) -> None:
++        """Reclaim fork-engine requests and onload the actor before training.
++
++        Fork-generated trajectories were already materialized at fetch time in
++        ``RolloutController._create_submit_callback`` (localize before popping
++        ``_task_worker_map``), so their lazy RTensor shards no longer reference
++        the fork workers -- safe to tear down now.
++        """
++        logger.info(
++            f"[step0-fork] prepare_batch collected {len(rollout_batch)} "
++            "trajectories; reclaiming fork engines"
++        )
++        self.rollout.reclaim_and_teardown_actor_fork()
++        logger.info("[step0-fork] onloading actor back for training")
++        self._onload_model(self.actor, role="actor")
++        logger.info("[step0-fork] actor onloaded; resuming normal training")
++
+     @staticmethod
+     def _is_colocation(strategy: SchedulingStrategy | None) -> bool:
+         if strategy is None:
+@@ -788,6 +966,16 @@
+                 break
+             epoch = global_step // steps_per_epoch
+             step = global_step % steps_per_epoch
++            # Step-0 only: offload the actor (releases optimizer+weights to
++            # CPU via release_memory_occupation when TMS is off) and fork vLLM
++            # engines onto the actor GPUs so they also serve the first rollout.
++            # Teardown happens right after prepare_batch collects the batch.
++            # See _should_use_step0_fork for the guards.
++            is_step0_fork = self._should_use_step0_fork(
++                global_step, start_step, streaming_batch_count, workflow
++            )
++            if is_step0_fork:
++                self._start_step0_fork(global_step)
+ 
+             # Keep every chunk for the full-batch critic update and cleanup.
+             accumulated_rollout_batch: list[dict[str, Any]] = []
+@@ -813,6 +1001,12 @@
+                         group_size=config.gconfig.n_samples,
+                         dynamic_bs=self.config.dynamic_bs,
+                     )
++                # Reclaim in-flight requests from the fork engines (abort +
++                # redispatch to surviving engines), tear them down, and onload
++                # the actor back before training needs it (compute_logp below).
++                if is_step0_fork:
++                    self._reclaim_step0_fork(rollout_batch)
++
+                 if self._should_offload_rollout:
+                     self._offload_rollout()
+ 
+@@ -1321,6 +1515,13 @@
+             )
+             return engine
+ 
++        # Cache server_args so the step-0 actor-GPU fork can reuse the same
++        # vLLM launch configuration (model path, parallelism, mem util, ...).
++        # Only the (non-eval) rollout call; eval-rollout reuses the same vllm
++        # config but we keep the canonical one.
++        if not is_eval:
++            self._rollout_server_args = server_args
++
+         # Single-controller mode - no engine instantiation needed
+         if config._version == "v2":
+             controller = RolloutControllerV2(
+Index: areal/utils/fork_constants.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/utils/fork_constants.py b/areal/utils/fork_constants.py
+new file mode 100644
+--- /dev/null	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
++++ b/areal/utils/fork_constants.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -0,0 +1,34 @@
++"""Shared constants for the step-0 actor-GPU fork feature.
++
++These literals form the protocol between the controller
++(:mod:`areal.infra.controller.rollout_controller`), the grouped workflow
++(:class:`areal.infra.remote_inf_engine.GroupedRolloutWorkflow`), and the
++rollout workflow (:class:`areal.workflow.rlvr.RLVRWorkflow`).
++
++Centralized here -- in :mod:`areal.utils`, a leaf layer already imported by all
++three -- rather than duplicated across modules, to avoid any
++``areal.infra`` <-> ``areal.workflow`` import edge.
++"""
++
++# Reserved trajectory key marking a fork-teardown "continuation descriptor"
++# (not a training trajectory). When an actor-GPU fork engine is evicted
++# mid-generation, the workflow returns this descriptor carrying the partial
++# tokens/logprobs/rid so the controller can resume generation on a surviving
++# engine. Absent from normal trajectories -> the existing merge path is inert.
++FORK_CONTINUATION_KEY = "__fork_continuation__"
++
++# Per-sample continuation state injected into ``data`` by the controller when it
++# re-submits a partial to a surviving engine. Value: dict with prompt_ids,
++# partial_ids, partial_logprobs, partial_versions, rid.
++FORK_CONTINUE_FIELD = "__continue__"
++
++# Carries a partially-evicted group's already-complete rollouts (merged into one
++# group) alongside FORK_CONTINUATION_KEY, so the controller can re-merge them
++# with the continued rollouts into one full n_samples group. None when the
++# whole group was in-flight at eviction.
++FORK_COMPLETE_KEY = "__fork_complete__"
++
++# Tags a continuation re-submit's ``data`` with its originating fork task_id, so
++# the controller's accept branch can look up the parked already-complete half
++# and re-merge.
++FORK_MERGE_KEY = "__fork_merge__"
+Index: areal/utils/fork_continuation.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/utils/fork_continuation.py b/areal/utils/fork_continuation.py
+new file mode 100644
+--- /dev/null	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
++++ b/areal/utils/fork_continuation.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -0,0 +1,136 @@
++"""Fork-teardown continuation orchestration, isolated from the generic workflows.
++
++The step-0 actor-GPU fork feature's continuation logic -- route a re-submitted
++partial to the resume path, package an evicted partial as a descriptor,
++distribute per-sample continuations across a group, surface a group's
++descriptors plus its already-complete rollouts -- was inlined in the generic
++``RLVRWorkflow`` / ``GroupedRolloutWorkflow``. This module isolates that
++orchestration so the generic workflows keep only thin delegate calls.
++
++Lives in :mod:`areal.utils` (a leaf layer imported by both ``areal.workflow``
++and ``areal.infra``) to avoid any ``areal.infra`` <-> ``areal.workflow`` import
++edge. The continuation GENERATION (``RLVRWorkflow._arun_episode_continue``)
++stays on ``RLVRWorkflow`` because it needs ``areal.workflow.reward_metrics``
++(which imports ``areal.infra``); this module orchestrates and calls back into
++``base._arun_episode_continue``.
++
++All methods are static: they take the base workflow / logger as parameters
++rather than holding state, so there is no instantiation or injection -- the
++generic workflows call them directly (data-driven, inert for non-fork tasks).
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++from areal.utils import logging
++from areal.utils.data import concat_padded_tensors
++from areal.utils.fork_constants import (
++    FORK_COMPLETE_KEY,
++    FORK_CONTINUE_FIELD,
++    FORK_CONTINUATION_KEY,
++)
++
++logger = logging.getLogger("ForkContinuationWorkflow")
++
++
++class ForkContinuationWorkflow:
++    """Stateless helpers for fork-teardown continuation orchestration.
++
++    Used by ``RLVRWorkflow`` (per-sample) and ``GroupedRolloutWorkflow`` (group)
++    via thin delegates; the bulk fork logic lives here.
++    """
++
++    @staticmethod
++    async def route_continuation(
++        base: Any, engine: Any, data: dict[str, Any]
++    ) -> tuple[bool, Any]:
++        """If ``data`` carries ``FORK_CONTINUE_FIELD`` (the controller re-submitting
++        a partial to a surviving engine), route to the base workflow's
++        continuation generation.
++
++        Handles the ``group_size == 1`` case where the controller's per-sample
++        list arrives unwrapped at the base workflow (``GroupedRolloutWorkflow``
++        only wraps for ``group_size > 1``): take the sole element so the
++        continuation generation receives a dict, not a list.
++
++        Returns ``(handled, result)``. When not handled (no continuation field),
++        the caller proceeds with normal generation.
++        """
++        cont = data.get(FORK_CONTINUE_FIELD)
++        if isinstance(cont, list):
++            cont = cont[0] if cont else None
++        if cont is not None:
++            return True, await base._arun_episode_continue(engine, data, cont)
++        return False, None
++
++    @staticmethod
++    def build_continuation_descriptor(req: Any, resp: Any) -> dict[str, Any]:
++        """Wrap a fork-evicted partial as a continuation descriptor (not a
++        training trajectory). ``req`` is a ``ModelRequest``, ``resp`` a
++        ``ModelResponse`` with ``stop_reason="abort"`` + partial tokens.
++        """
++        return {
++            FORK_CONTINUATION_KEY: {
++                "prompt_ids": list(resp.input_tokens),
++                "partial_ids": list(resp.output_tokens),
++                "partial_logprobs": list(resp.output_logprobs),
++                "partial_versions": list(resp.output_versions),
++                "rid": req.rid,
++            }
++        }
++
++    @staticmethod
++    async def arun_one_with_continue(
++        base: Any, engine: Any, data: dict[str, Any], cont: dict[str, Any]
++    ) -> Any:
++        """Run one sample of a group with its per-sample continuation partial
++        injected, delegating generation to ``base.arun_episode``.
++        """
++        d = dict(data)
++        d[FORK_CONTINUE_FIELD] = cont
++        return await base.arun_episode(engine, d)
++
++    @staticmethod
++    def surface_group_descriptor(
++        results: list[Any], logger: Any
++    ) -> dict[str, Any] | None:
++        """Surface a partially-evicted group's in-flight descriptors AND its
++        already-complete rollouts (merged into one group) so the controller can
++        re-merge them with the continuations into one full n_samples group.
++
++        Returns the ``{FORK_CONTINUATION_KEY, FORK_COMPLETE_KEY}`` descriptor if
++        any result is a continuation descriptor, else ``None`` (caller proceeds
++        with the normal merge). Fork co-occurs only with tensor-dict workflows
++        (rlvr), not online agent mode (InteractionWithTokenLogpReward), so
++        ``concat_padded_tensors`` on the complete half is safe.
++        """
++        descriptor_results = [
++            r
++            for r in results
++            if r is not None and isinstance(r, dict) and FORK_CONTINUATION_KEY in r
++        ]
++        if not descriptor_results:
++            return None
++        complete_results = [
++            r
++            for r in results
++            if r is not None
++            and isinstance(r, dict)
++            and FORK_CONTINUATION_KEY not in r
++        ]
++        complete_group = (
++            concat_padded_tensors(complete_results) if complete_results else None
++        )
++        logger.info(
++            f"[step0-fork] grouped workflow: surfacing "
++            f"{len(descriptor_results)}/{len(results)} evicted sample(s) "
++            "as a group continuation descriptor; "
++            f"preserving {len(complete_results)} completed for re-merge"
++        )
++        return {
++            FORK_CONTINUATION_KEY: [
++                r[FORK_CONTINUATION_KEY] for r in descriptor_results
++            ],
++            FORK_COMPLETE_KEY: complete_group,
++        }
+Index: areal/workflow/rlvr.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/areal/workflow/rlvr.py b/areal/workflow/rlvr.py
+--- a/areal/workflow/rlvr.py	(revision 5f8f2fbf1dde5b4283b359e288bf078e64d1bfee)
++++ b/areal/workflow/rlvr.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -17,6 +17,7 @@
+ from areal.api.cli_args import GenerationHyperparameters
+ from areal.utils import logging
+ from areal.utils.dynamic_import import import_from_string
++from areal.utils.fork_continuation import ForkContinuationWorkflow
+ from areal.utils.hf_utils import apply_chat_template
+ from areal.utils.perf_tracer import (
+     atrace_session_phase,
+@@ -130,6 +131,17 @@
+         async with atrace_session_phase("generate"):
+             resp = await engine.agenerate(req)
+ 
++        # Fork-teardown eviction: the engine returned a partial (stop_reason
++        # "abort" only happens on eviction; normal aborts are converted to
++        # "length" inside agenerate). Skip reward and surface the partial.
++        if resp.stop_reason == "abort" and getattr(engine, "_evicting", False):
++            logger.info(
++                f"[step0-fork] rid={req.rid}: workflow surfacing fork-evicted "
++                f"partial (prompt={resp.input_len} partial={resp.output_len} "
++                "tokens) as continuation descriptor"
++            )
++            return resp, None
++
+         reward = await self._compute_rewards(resp, prompt_str, task_data)
+ 
+         log_reward_metrics(reward, task_data)
+@@ -144,6 +156,16 @@
+             self.reward_fn = import_from_string(self.reward_fn)
+             self.async_reward_fn = AsyncRewardWrapper(self.reward_fn)
+ 
++        # Fork-continuation re-entry: if the controller injected FORK_CONTINUE_FIELD
++        # (re-submitting a partial to a surviving engine), route to the resume
++        # path. Isolated in ForkContinuationWorkflow (handles the group_size == 1
++        # unwrapped-list case); no-op for normal generation.
++        handled, result = await ForkContinuationWorkflow.route_continuation(
++            self, engine, data
++        )
++        if handled:
++            return result
++
+         input_ids = self.get_input_ids_fn(
+             self.data_extract_prompt_fn(data),
+             self.tokenizer,
+@@ -161,7 +183,86 @@
+         # Generate single response and compute reward
+         resp, reward = await self._collect_samples(engine, req, prompt_str, data)
+ 
+-        # Build result tensor dict with batch dim 1
++        # Fork-teardown eviction: surface the partial as a continuation
++        # descriptor (resp.stop_reason == "abort" only happens on eviction;
++        # normal aborts are converted to "length" inside agenerate). Packaging
++        # isolated in ForkContinuationWorkflow.
++        if resp.stop_reason == "abort":
++            return ForkContinuationWorkflow.build_continuation_descriptor(req, resp)
++
++        return self._build_trajectory(resp, reward)
++
++    async def _arun_episode_continue(
++        self,
++        engine: InferenceEngine,
++        data: dict[str, Any],
++        cont: dict[str, Any],
++    ) -> dict[str, torch.Tensor]:
++        """Resume a partial generation on a surviving engine.
++
++        Re-enters the single-turn flow with prompt + partial as the prefix,
++        generates the remaining tokens (reusing agenerate's prefix-continuation
++        loop), then stitches partial + new into a full trajectory with reward
++        computed on the complete output. The rid is preserved so the surviving
++        engine's rid->server affinity keeps all samples of one input on the
++        same vLLM (KV reuse). At step 0 fork and surviving engines share the
++        same (version-0) weights, so stitching partial + new logprobs is
++        on-policy correct.
++        """
++        prompt_ids: list[int] = list(cont["prompt_ids"])
++        partial_ids: list[int] = list(cont["partial_ids"])
++        partial_logprobs: list[float] = list(cont["partial_logprobs"])
++        partial_versions: list[int] = list(cont["partial_versions"])
++        rid: str = cont["rid"]
++
++        input_ids = prompt_ids + partial_ids
++        remaining = min(
++            self.gconfig.max_tokens - len(input_ids),
++            self.gconfig.max_new_tokens - len(partial_ids),
++        )
++        req = ModelRequest(
++            rid=rid,
++            input_ids=input_ids,
++            gconfig=self.gconfig.new(n_samples=1),
++            tokenizer=self.tokenizer,
++        )
++        # agenerate re-validates max_new_tokens internally.
++        req.gconfig.max_new_tokens = max(remaining, 0)
++
++        prompt_str = self.tokenizer.decode(prompt_ids)
++        logger.info(
++            f"[step0-fork] rid={rid}: resuming continuation on surviving engine "
++            f"(prompt={len(prompt_ids)} partial={len(partial_ids)} "
++            f"remaining={remaining} tokens)"
++        )
++
++        async with atrace_session_phase("generate"):
++            resp = await engine.agenerate(req)
++
++        # Stitch partial + newly generated tokens into a full response.
++        full_resp = ModelResponse(
++            input_tokens=prompt_ids,
++            output_tokens=partial_ids + list(resp.output_tokens),
++            output_logprobs=partial_logprobs + list(resp.output_logprobs),
++            output_versions=partial_versions + list(resp.output_versions),
++            stop_reason=resp.stop_reason,
++            tokenizer=self.tokenizer,
++        )
++        logger.info(
++            f"[step0-fork] rid={rid}: continuation done "
++            f"(new={resp.output_len} full_output={full_resp.output_len} "
++            f"stop_reason={resp.stop_reason}); computing reward"
++        )
++
++        reward = await self._compute_rewards(full_resp, prompt_str, data)
++        log_reward_metrics(reward, data)
++        return self._build_trajectory(full_resp, reward)
++
++    @staticmethod
++    def _build_trajectory(
++        resp: ModelResponse, reward: float
++    ) -> dict[str, torch.Tensor]:
++        """Build the result tensor dict with batch dim 1 from a response."""
+         seq = resp.input_tokens + resp.output_tokens
+         logprobs = [0.0] * resp.input_len + resp.output_logprobs
+         loss_mask = [0] * resp.input_len + [1] * resp.output_len
+Index: examples/math/math17k_grpo.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/examples/math/math17k_grpo.py b/examples/math/math17k_grpo.py
+new file mode 100644
+--- /dev/null	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
++++ b/examples/math/math17k_grpo.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -0,0 +1,243 @@
++"""GRPO on DAPO-Math-17k with AReaL's math_verify reward.
++
++Mirrors ``examples/math/boba_grpo.py``: a custom dataset loader + a rule-based
++``reward_fn`` + ``areal.workflow.rlvr.RLVRWorkflow``. The dataset and reward
++conventions follow the DAPO-Math-17k recipes in
++``D:\\workplace\\tdt_verl`` (verl, parquet ``{prompt, extra_info,
++reward_model.ground_truth}``) and ``D:\\workspace_latest2\\vime`` (jsonl
++``{prompt, label}``), but the grader is AReaL's ``get_math_verify_worker`` --
++the general counterpart of vime's ``math`` rm-type (``grade_answer_verl``) and,
++unlike vime's ``deepscaler`` rm-type, it does NOT depend on a
++triple-quote separator, so it works for plain chat/Qwen3 thinking outputs that only emit
++``\\boxed{}``.
++
++The algorithm is plain GRPO (group reward-norm + batch adv-norm, single
++``eps_clip``), NOT DAPO -- there is no overlong penalty or decoupled clip.
++
++Run::
++
++    python3 examples/math/math17k_grpo.py --config examples/math/math17k_grpo_npu.yaml
++"""
++
++import os
++import sys
++
++from datasets import load_dataset
++from math_verify import parse, verify
++
++from areal import PPOTrainer
++from areal.api.cli_args import GRPOConfig, load_expr_config
++from areal.utils import logging
++from areal.utils.hf_utils import load_hf_tokenizer
++
++logger = logging.getLogger("Math17kGRPO")
++
++
++def get_math17k_dataset(path: str, tokenizer, max_length: int | None = None):
++    """Load DAPO-Math-17k into AReaL RL format.
++
++    Accepts either a HuggingFace repo id (e.g. ``BytedTsinghua-SIA/DAPO-Math-17k``
++    -- verl's source) or a local ``.jsonl`` file (vime's
++    ``zhuzilin/dapo-math-17k`` mirror layout with ``prompt``/``label`` keys).
++
++    Each returned sample carries ``messages`` (a single user turn) and ``label``
++    (the ground-truth answer string). The boxed-answer instruction is appended
++    to the prompt when not already present. Compatible with both verl-style
++    samples (ground truth under ``reward_model.ground_truth``) and vime-style
++    samples (top-level ``label``).
++    """
++    if path.endswith(".jsonl") or (os.path.exists(path) and os.path.isfile(path)):
++        dataset = load_dataset("json", split="train", data_files=path)
++    else:
++        dataset = load_dataset(path, split="train")
++
++    def process(sample):
++        prompt = sample["prompt"]
++        # prompt may be a plain string or a list of chat messages
++        if isinstance(prompt, list):
++            content = ""
++            for msg in prompt:
++                if isinstance(msg, dict) and msg.get("role") == "user":
++                    content = msg.get("content", "")
++        else:
++            content = str(prompt)
++
++        if "\\boxed" not in content and "final answer" not in content.lower():
++            content = content + "\nPlease put your final answer within \\boxed{}."
++
++        reward_model = sample.get("reward_model")
++        if isinstance(reward_model, dict) and "ground_truth" in reward_model:
++            label = reward_model["ground_truth"]
++        else:
++            label = sample.get("label", sample.get("answer", ""))
++
++        return {
++            "messages": [{"role": "user", "content": content}],
++            "label": str(label),
++        }
++
++    keep = {"messages", "label"}
++    dataset = dataset.map(process).remove_columns(
++        [c for c in dataset.column_names if c not in keep]
++    )
++
++    if max_length is not None:
++        dataset = dataset.filter(
++            lambda x: len(tokenizer.encode(x["messages"][0]["content"])) <= max_length
++        )
++    return dataset
++
++
++# Fast-path answer extraction adapted from verl/utils/reward_score/math_dapo.py
++# (strict-box path). Pure string + brace matching, no sympy: cannot trigger the
++# _eval_power pathological path that caused the rollout-worker OOM. Used as a
++# fast path before falling back to math_verify (sympy) for symbolic equivalence.
++
++
++def _last_boxed_only_string(string: str) -> str | None:
++    """Extract the last ``\\boxed{...}`` expression via brace matching."""
++    idx = string.rfind("\\boxed{")
++    if idx < 0:
++        return None
++    i = idx
++    num_left_braces_open = 0
++    while i < len(string):
++        if string[i] == "{":
++            num_left_braces_open += 1
++        if string[i] == "}":
++            num_left_braces_open -= 1
++            if num_left_braces_open == 0:
++                return string[idx : i + 1]
++        i += 1
++    return None
++
++
++def _remove_boxed(s: str) -> str | None:
++    """Strip the ``\\boxed{...}`` wrapper and return the inner content."""
++    left = "\\boxed{"
++    if not s.startswith(left) or not s.endswith("}"):
++        return None
++    return s[len(left) : -1]
++
++
++def _strict_box_correct(pred: str, gt: str) -> bool:
++    """verl math_dapo strict-box: extract the last boxed from ``pred[-100:]``
++    and compare to ``gt`` by string equality (``gt`` is NOT normalized)."""
++    boxed = _last_boxed_only_string(pred[-100:])
++    extracted = _remove_boxed(boxed) if boxed is not None else None
++    return extracted is not None and extracted == gt
++
++
++def math17k_reward_fn(
++    prompts, completions, prompt_ids, completion_ids, label, **kwargs
++) -> float:
++    """Rule-based math reward: verl ``math_dapo`` strict-box fast-path + ``math_verify`` fallback.
++
++    Fast-path (pure string, no sympy): extract the last ``\\boxed{}`` from the
++    completion tail and compare to ``label`` by string equality. Hits when the
++    model emits the same LaTeX rendering as the ground truth (the common case)
++    and never touches sympy, so it cannot trigger the ``_eval_power`` pathological
++    path that caused the rollout-worker OOM.
++
++    Fallback (sympy via ``math_verify``): when the string comparison misses,
++    take the LAST ``\\boxed{}`` in the completion and compare it to ``label``
++    with ``math_verify`` for symbolic equivalence (e.g. ``\\frac{1}{2}`` vs
++    ``0.5``). Only a ``\\boxed{}`` is ever accepted as the answer -- the raw
++    completion is never ``parse()``d, because math_verify's extraction would
++    harvest bare numbers / inline latex from the reasoning chain and match the
++    gt by accident (scoring 1.0 for a response truncated before its final
++    answer); verl's strict-box path has the same tail-only property. Uses
++    math_verify's default ``signal.alarm`` timeout, valid in the
++    ``ProcessPoolExecutor`` worker's main thread.
++
++    Returns 1.0 on a match, -1.0 otherwise (including parse/timeout failure).
++    """
++    completion = str(completions)
++    gt = str(label)
++
++    # Fast path: verl math_dapo strict-box string comparison (no sympy).
++    try:
++        if _strict_box_correct(completion, gt):
++            return 1.0
++    except Exception:
++        pass
++
++    # Fallback: take the LAST \boxed{} in the completion (not just the tail)
++    # and compare with math_verify symbolic equivalence. We do NOT parse() the
++    # raw completion: math_verify's extraction (try_extract_without_anchor /
++    # LatexExtractionConfig) harvests bare numbers and inline latex ($113$)
++    # from the reasoning chain, which can equal the gt by chance and score 1.0
++    # for a response that never emitted a final answer (e.g. truncated mid-CoT
++    # by max_tokens). verl avoids this by only looking at the tail "Answer:" or
++    # \boxed{}; we mirror that by only ever accepting a \boxed{} as the answer.
++    try:
++        boxed = _last_boxed_only_string(completion)
++        if boxed:
++            extracted = _remove_boxed(boxed)
++            if extracted is not None:
++                ans = parse("\\boxed{" + extracted + "}")
++                gold = parse("\\boxed{" + gt + "}")
++                if ans and gold and verify(gold, ans):
++                    return 1.0
++    except Exception:
++        pass
++
++    return -1.0
++
++
++def main(args):
++    config, _ = load_expr_config(args, GRPOConfig)
++    tokenizer = load_hf_tokenizer(config.tokenizer_path)
++
++    train_dataset = get_math17k_dataset(
++        config.train_dataset.path,
++        tokenizer,
++        getattr(config.train_dataset, "max_length", None),
++    )
++
++    # Eval on AIME-2024 if configured; degrade gracefully if unavailable.
++    valid_dataset = None
++    eval_workflow = None
++    eval_workflow_kwargs = None
++    vcfg = getattr(config, "valid_dataset", None)
++    if vcfg is not None and getattr(vcfg, "path", None):
++        try:
++            valid_dataset = get_math17k_dataset(
++                vcfg.path, tokenizer, getattr(vcfg, "max_length", None)
++            )
++            eval_workflow = "areal.workflow.rlvr.RLVRWorkflow"
++            eval_workflow_kwargs = dict(
++                reward_fn="examples.math.math17k_grpo.math17k_reward_fn",
++                gconfig=config.gconfig,
++                tokenizer=config.tokenizer_path,
++                enable_thinking=True,
++            )
++        except Exception as e:
++            logger.warning(
++                f"Failed to load valid_dataset from {vcfg.path!r}: {e}. "
++                "Evaluation will be skipped."
++            )
++            valid_dataset = None
++
++    workflow_kwargs = dict(
++        reward_fn="examples.math.math17k_grpo.math17k_reward_fn",
++        gconfig=config.gconfig,
++        tokenizer=config.tokenizer_path,
++        enable_thinking=True,
++    )
++
++    with PPOTrainer(
++        config,
++        train_dataset=train_dataset,
++        valid_dataset=valid_dataset,
++    ) as trainer:
++        trainer.train(
++            workflow="areal.workflow.rlvr.RLVRWorkflow",
++            workflow_kwargs=workflow_kwargs,
++            eval_workflow=eval_workflow,
++            eval_workflow_kwargs=eval_workflow_kwargs,
++        )
++
++
++if __name__ == "__main__":
++    main(sys.argv[1:])
+Index: examples/math/math17k_grpo_npu.yaml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/examples/math/math17k_grpo_npu.yaml b/examples/math/math17k_grpo_npu.yaml
+new file mode 100644
+--- /dev/null	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
++++ b/examples/math/math17k_grpo_npu.yaml	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -0,0 +1,272 @@
++experiment_name: gsm8k-grpo
++trial_name: trial0
++
++seed: 1
++enable_offload: false
++total_train_epochs: 10
++tokenizer_path: ${actor.path}
++
++cluster:
++  n_nodes: 1
++  n_gpus_per_node: 8
++  fileroot: /tmp/areal/experiments
++  name_resolve:
++    type: nfs
++    nfs_record_root: /tmp/areal/name_resolve
++
++
++scheduler:
++  type: null
++
++rollout:
++  backend: "vllm:d4p1t1"
++  experiment_name: ${experiment_name}
++  trial_name: ${trial_name}
++  max_concurrent_rollouts: 32
++  queue_size: null
++  consumer_batch_size: 16
++  max_head_offpolicyness: 0
++  enable_rollout_tracing: false
++  scheduling_spec:
++    - task_type: worker
++      port_count: 2
++      gpu: 1
++      mem: 32
++      cmd: python3 -m areal.infra.rpc.rpc_server
++      env_vars:
++        VLLM_USE_V1: "1"
++        VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
++        TASK_QUEUE_ENABLE: "1"
++        HCCL_EXEC_TIMEOUT: "14400"
++        ACL_DEVICE_SYNC_TIMEOUT: "14400"
++        HCCL_EVENT_TIMEOUT: "14500"
++        HCCL_ASYNC_ERROR_HANDLING: "0"
++        ACL_STREAM_TIMEOUT: "14500000"
++        HCCL_CONNECT_TIMEOUT: "7200"
++        PYTORCH_NPU_ALLOC_CONF: "expandable_segments:False"
++        HCCL_NPU_SOCKET_PORT_RANGE: "62000-62350"
++        TORCH_COMPILE_DISABLE: "0"
++        OMP_PROC_BIND: "false"
++        OMP_NUM_THREADS: "10"
++        VLLM_ASCEND_ENABLE_FLASHCOMM1: "0"
++        VLLM_ASCEND_ENABLE_FUSED_MC2: "0"
++        VLLM_ASCEND_ENABLE_NZ: "0"
++        VLLM_WORKER_MULTIPROC_METHOD: "spawn"
++        AREAL_ALLOW_DEFAULT_ADMIN_KEY: "1"
++        TMS_INIT_ENABLE: "0"
++        VLLM_SERVER_DEV_MODE: "1"
++
++  fileroot: ${cluster.fileroot}
++  tokenizer_path: ${tokenizer_path}
++  dump_to_file: true
++  setup_timeout: 600
++  agent:
++    mode: inline
++    export_style: individual
++    turn_discount: 1.0
++
++gconfig:
++  n_samples: 4
++  min_new_tokens: 0
++  max_new_tokens: 1024
++  greedy: false
++  max_tokens: 32768
++  temperature: 1.0
++
++actor:
++  backend: "megatron:(attn:d2p2t4c1|ffn:d1p2t1e8)"
++  experiment_name: ${experiment_name}
++  trial_name: ${trial_name}
++  path: Qwen/Qwen2.5-1.5B-Instruct
++  init_from_scratch: false
++  disable_dropout: true
++  gradient_checkpointing: true
++  dtype: bfloat16
++  mb_spec:
++    max_tokens_per_mb: 4096
++  optimizer:
++    type: adam
++    lr: 1e-6
++    weight_decay: 0.01
++    beta1: 0.9
++    beta2: 0.999
++    eps: 1e-8
++    lr_scheduler_type: constant
++    gradient_clipping: 1.0
++    warmup_steps_proportion: 0.0
++  weight_update_mode: awex
++  megatron:
++    bridge_type: megatron-bridge
++    enable_mtp: false
++    freeze_vision_model: true
++    freeze_vision_projection: true
++  mindspeed:
++    swap_optimizer: true
++    use_fused_rotary_pos_emb: true
++    use_fused_swiglu: true
++    position_embedding_type: "rope"
++  eps_clip: 0.2
++  temperature: ${gconfig.temperature}
++  reward_scaling: 10.0
++  reward_bias: -0.5
++  kl_ctl: 0.0
++  ppo_n_minibatches: 1
++  recompute_logprob: true
++  use_decoupled_loss: true
++  rejection_sampling:
++    level: token
++    action: mask
++    metric: ratio
++    upper: 5.0
++  reward_norm:
++    mean_level: group
++    std_level: group
++    group_size: ${gconfig.n_samples}
++  adv_norm:
++    mean_level: batch
++    std_level: batch
++  max_new_tokens: ${gconfig.max_new_tokens}
++  scheduling_spec:
++    - task_type: worker
++      port_count: 2
++      gpu: 1
++      mem: 32
++      cmd: python3 -m areal.infra.rpc.rpc_server
++      env_vars:
++        VLLM_USE_V1: "1"
++        VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
++        TASK_QUEUE_ENABLE: "2"
++        HCCL_EXEC_TIMEOUT: "14400"
++        ACL_DEVICE_SYNC_TIMEOUT: "14400"
++        HCCL_EVENT_TIMEOUT: "14500"
++        HCCL_ASYNC_ERROR_HANDLING: "0"
++        ACL_STREAM_TIMEOUT: "14500000"
++        HCCL_CONNECT_TIMEOUT: "7200"
++        PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
++        HCCL_NPU_SOCKET_PORT_RANGE: "62360-62460"
++        OMP_PROC_BIND: "false"
++        OMP_NUM_THREADS: "10"
++        VLLM_ASCEND_ENABLE_FLASHCOMM1: "0"
++        VLLM_ASCEND_ENABLE_FUSED_MC2: "0"
++        VLLM_ASCEND_ENABLE_NZ: "0"
++        VLLM_WORKER_MULTIPROC_METHOD: "spawn"
++        AREAL_ALLOW_DEFAULT_ADMIN_KEY: "1"
++        TORCH_COMPILE_DISABLE: "1"
++        TMS_INIT_ENABLE: "0"
++
++ref:
++  backend: ${actor.backend}
++  experiment_name: ${experiment_name}
++  trial_name: ${trial_name}
++  path: ${actor.path}
++  init_from_scratch: false
++  disable_dropout: true
++  dtype: ${actor.dtype}
++  mb_spec:
++    max_tokens_per_mb: 10240
++  optimizer: null
++  scheduling_strategy:
++    type: colocation
++    target: actor
++  scheduling_spec: ${actor.scheduling_spec}
++
++awex:
++  enable_colocate_mode: true
++  device_backend: npu
++  use_mindspeed: true
++  comm_backend: hccl
++  weights_exchange_ipc_backend: cpu
++  enable_debug_mode: false
++  meta_server_addr: auto
++  weights_comm_nccl_group_size: 1
++  weights_validation_steps: 0
++  validate_weights_every_n_steps: 1
++
++# SGLang
++sglang:
++  model_path: ${actor.path}
++  random_seed: ${seed}
++  skip_tokenizer_init: true
++  dtype: ${actor.dtype}
++  max_running_requests: null
++  context_length: 32768
++  mem_fraction_static: 0.8
++
++# vLLM
++vllm:
++  model: ${actor.path}
++  seed: ${seed}
++  skip_tokenizer_init: false
++  dtype: ${actor.dtype}
++  max_model_len: 32768
++  gpu_memory_utilization: 0.7
++  enforce_eager: false
++  disable_sliding_window: false
++  gdn_prefill_backend: triton
++  additional_config:
++    enable_cpu_binding: true
++  compilation_config:
++    cudagraph_mode: FULL_DECODE_ONLY
++
++# datasets
++train_dataset:
++  batch_size: 32
++  shuffle: true
++  pin_memory: true
++  num_workers: 4
++  path: openai/gsm8k
++  type: rl
++  max_length: 1024
++
++valid_dataset:
++  batch_size: 32
++  pin_memory: true
++  num_workers: 4
++  path: openai/gsm8k
++  type: rl
++
++# Utilities
++saver:
++  experiment_name: ${experiment_name}
++  trial_name: ${trial_name}
++  fileroot: ${cluster.fileroot}
++  freq_epochs: 1
++  freq_steps: null
++  freq_secs: null
++
++recover:
++  mode: disabled
++  experiment_name: ${experiment_name}
++  trial_name: ${trial_name}
++  fileroot: ${cluster.fileroot}
++  freq_epochs: 1
++  freq_steps: null
++  freq_secs: 3600
++
++evaluator:
++  experiment_name: ${experiment_name}
++  trial_name: ${trial_name}
++  fileroot: ${cluster.fileroot}
++  freq_epochs: 1
++  freq_steps: null
++  freq_secs: null
++
++stats_logger:
++  experiment_name: ${experiment_name}
++  trial_name: ${trial_name}
++  fileroot: ${cluster.fileroot}
++  wandb:
++    mode: disabled
++  swanlab:
++    project: rl-baseline
++    name: areal_qwen3.6_test
++    mode: cloud
++    api_key: gWL49WX6d0Ajog6k6yHVP
++
++perf_tracer:
++  experiment_name: ${experiment_name}
++  trial_name: ${trial_name}
++  fileroot: ${cluster.fileroot}
++  enabled: false
++  session_tracer:
++    enabled: false
+\ No newline at end of file
+Index: tests/test_rollout_controller_actor_fork.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/tests/test_rollout_controller_actor_fork.py b/tests/test_rollout_controller_actor_fork.py
+new file mode 100644
+--- /dev/null	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
++++ b/tests/test_rollout_controller_actor_fork.py	(revision 4577b219e3e92aa3ba285385691ec5175c50fe84)
+@@ -0,0 +1,1199 @@
++# SPDX-License-Identifier: Apache-2.0
++
++"""Step-0 actor-GPU inference fork: lifecycle and reclaim state machine.
++
++The forked vLLM engines run on the actor GPUs during the first rollout, are
++appended to ``self.workers`` so round-robin dispatch serves them, then
++reclaimed: in-flight requests are evicted, their partial tokens surface as
++continuation descriptors, and reclaim re-submits continuations to surviving
++engines before tearing the fork down.
++
++These tests exercise only the branch logic via a minimal recording stand-in
++(no cluster / no real scheduler), mirroring ``test_rollout_controller_proxy_pause``.
++"""
++
++import threading
++
++import pytest
++import torch
++
++from areal.infra.controller.fork_coordinator import (
++    ForkCoordinator,
++    NoOpForkCoordinator,
++)
++from areal.infra.controller.rollout_controller import (
++    _FORK_TASK_ABANDONED,
++    FORK_CONTINUATION_KEY,
++    FORK_CONTINUE_FIELD,
++    RolloutController,
++    _RemoteRolloutTaskInput,
++)
++from areal.infra.workflow_executor import (
++    WorkflowExecutor,
++    _RolloutResult,
++    _RolloutTaskInput,
++)
++from areal.trainer.rl_trainer import PPOTrainer
++from areal.utils.fork_constants import FORK_COMPLETE_KEY, FORK_MERGE_KEY
++from areal.utils.fork_continuation import ForkContinuationWorkflow
++from areal.workflow.rlvr import RLVRWorkflow
++
++
++class _RecordingDispatcher:
++    def __init__(self, calls):
++        self._calls = calls
++
++    def pause(self):
++        self._calls.append("dispatcher.pause")
++
++    def resume(self):
++        self._calls.append("dispatcher.resume")
++
++    def submit_task_input(self, task_input):
++        self._calls.append(f"dispatcher.submit:{task_input.task_id}")
++
++
++class _FakeWorker:
++    def __init__(self, wid):
++        self.id = wid
++
++
++class _RecordingController:
++    """Minimal stand-in exercising the fork lifecycle + reclaim branches."""
++
++    def __init__(self, surviving_workers, fork_workers):
++        self.calls: list[str] = []
++        self.workers = list(surviving_workers)
++        self._current_worker_idx = 0
++        self.fork_workers = list(fork_workers)
++        self._fork_started = True
++        self._fork_role = "actor-fork"
++        self._fork_worker_ids = {w.id for w in fork_workers}
++        self._task_worker_map: dict[int, str] = {}
++        self._task_input_map: dict[int, _RemoteRolloutTaskInput] = {}
++        self._fork = ForkCoordinator(host=self)
++        self._worker_engine_names: dict[str, str] = {}
++        self._task_worker_map_lock = threading.Lock()
++        self._pending_futures: dict[int, object] = {}
++        self._futures_lock = threading.Lock()
++
++        class _Cfg:
++            request_timeout = 60.0
++            pause_grace_period = 0.0
++
++        self.config = _Cfg()
++
++        class _Dispatcher(_RecordingDispatcher):
++            pass
++
++        self.dispatcher = _Dispatcher(self.calls)
++
++        class _Scheduler:
++            def delete_workers(self_inner, role=None):
++                self.calls.append(f"scheduler.delete_workers:{role}")
++
++        self.scheduler = _Scheduler()
++
++    # ---- methods under test, bound from RolloutController ----
++    _fork_engine_name = RolloutController._fork_engine_name
++
++    def _fork_collective_rpc(self, method, *args, **kwargs):
++        self.calls.append(f"fork.{method}")
++        if method == "evict":
++            # Simulate the real evict: fork agenerate loops break, return
++            # partial descriptors; coroutines deposit them and pop their
++            # _task_worker_map entries.
++            fork_tids = [
++                tid
++                for tid, wid in list(self._task_worker_map.items())
++                if wid in self._fork_worker_ids
++            ]
++            for tid in fork_tids:
++                self._task_worker_map.pop(tid, None)
++                self._task_input_map.pop(tid, None)
++                self._fork._fork_continuations[tid] = {
++                    FORK_CONTINUATION_KEY: [
++                        {
++                            "prompt_ids": [1, 2],
++                            "partial_ids": [3],
++                            "partial_logprobs": [0.1],
++                            "partial_versions": [0],
++                            "rid": f"rid-{tid}",
++                        }
++                    ]
++                }
++
++    def _fork_collective_rpc_async(self, method, *args, **kwargs):
++        self.calls.append(f"fork_async.{method}")
++
++    def submit(self, **kwargs):
++        self.calls.append(f"controller.submit:{kwargs['task_id']}")
++        assert kwargs.get("priority") is True, (
++            "fork re-submits (continuation / restart) must be priority "
++            "(bypass staleness)"
++        )
++        if FORK_CONTINUE_FIELD in kwargs["data"]:
++            return
++        # Full restart of a lost fork task: the original input is replayed
++        # untouched (no continuation fields).
++        assert FORK_MERGE_KEY not in kwargs["data"]
++
++    # Bound under the original method name (mirrors _fork_engine_name above)
++    # so ``controller.reclaim_and_teardown_actor_fork()`` resolves.
++    reclaim_and_teardown_actor_fork = RolloutController.reclaim_and_teardown_actor_fork
++
++
++def test_reclaim_skips_when_not_started():
++    """Test that reclaim is a no-op when no fork engines are active."""
++    controller = _RecordingController(
++        surviving_workers=[_FakeWorker("rollout/0")], fork_workers=[]
++    )
++    controller._fork_started = False
++
++    controller.reclaim_and_teardown_actor_fork()
++
++    assert controller.calls == []
++
++
++def test_reclaim_evicts_and_resubmits_continuations():
++    """Test that reclaim evicts fork, collects partials, and re-submits
++    continuations to surviving engines; surviving engines are never paused.
++
++    Two in-flight tasks sit on fork engines; reclaim must:
++    pause dispatcher -> fork evict -> (settle) -> remove fork workers ->
++    destroy + delete -> re-submit continuations (with __continue__) to
++    surviving -> resume dispatcher. No pause_generation on surviving.
++    """
++    surviving = [_FakeWorker("rollout/0"), _FakeWorker("rollout/1")]
++    fork = [_FakeWorker("actor-fork/0"), _FakeWorker("actor-fork/1")]
++    controller = _RecordingController(surviving, fork)
++
++    # Two in-flight tasks on fork engines.
++    t0 = _RemoteRolloutTaskInput(
++        task_id=0,
++        data={"messages": "a"},
++        workflow="wf",
++        workflow_kwargs={},
++        should_accept_fn=None,
++        group_size=1,
++    )
++    t1 = _RemoteRolloutTaskInput(
++        task_id=1,
++        data={"messages": "b"},
++        workflow="wf",
++        workflow_kwargs={},
++        should_accept_fn=None,
++        group_size=1,
++    )
++    controller._task_worker_map = {0: "actor-fork/0", 1: "actor-fork/1"}
++    controller._task_input_map = {0: t0, 1: t1}
++
++    class _Gen:
++        def __init__(self):
++            self._n = 100
++
++        def next(self):
++            self._n += 1
++            return self._n
++
++    controller._task_id_generator = _Gen()
++
++    controller.reclaim_and_teardown_actor_fork()
++
++    # 1. dispatcher paused first.
++    assert controller.calls[0] == "dispatcher.pause"
++    # 2. fork evict (not pause_generation) — aborts in-flight, deposits partials.
++    #    (_fork_collective_rpc appends "fork.evict"; `in` is exact membership.)
++    assert "fork.evict" in controller.calls
++    # 3. fork engines destroyed + fork workers deleted.
++    assert "fork.destroy" in controller.calls
++    assert "scheduler.delete_workers:actor-fork" in controller.calls
++    # 4. continuations re-submitted to surviving engines (with __continue__).
++    assert any(c.startswith("controller.submit:") for c in controller.calls)
++    # 5. dispatcher resumed last.
++    assert controller.calls[-1] == "dispatcher.resume"
++    # 6. fork workers removed from the dispatch pool.
++    assert all(w.id.startswith("rollout") for w in controller.workers)
++    # 7. fork state cleared.
++    assert controller._fork_started is False
++    assert controller.fork_workers == []
++    # 8. surviving engines never pause_generation (point 3: only fork interrupted).
++    assert not any(c == "fork.pause_generation" for c in controller.calls)
++
++
++def test_reclaim_preserves_original_data_in_continuation():
++    """Test that re-submitted continuations carry the original task data
++    (for reward kwargs) plus the per-sample partials under __continue__."""
++    surviving = [_FakeWorker("rollout/0")]
++    fork = [_FakeWorker("actor-fork/0")]
++    controller = _RecordingController(surviving, fork)
++
++    orig = _RemoteRolloutTaskInput(
++        task_id=5,
++        data={"messages": "hello"},
++        workflow="my.wf",
++        workflow_kwargs={"k": 1},
++        should_accept_fn=None,
++        group_size=2,
++    )
++    controller._task_worker_map = {5: "actor-fork/0"}
++    controller._task_input_map = {5: orig}
++
++    submitted: list[dict] = []
++
++    def capture_submit(**kwargs):
++        submitted.append(kwargs)
++        controller.calls.append(f"controller.submit:{kwargs['task_id']}")
++
++    controller.submit = capture_submit
++
++    class _Gen:
++        def __init__(self):
++            self._n = 99
++
++        def next(self):
++            self._n += 1
++            return self._n
++
++    controller._task_id_generator = _Gen()
++
++    controller.reclaim_and_teardown_actor_fork()
++
++    assert len(submitted) == 1
++    sub = submitted[0]
++    # Original data preserved (reward kwargs), and __continue__ injected.
++    assert sub["data"]["messages"] == "hello"
++    assert FORK_CONTINUE_FIELD in sub["data"]
++    # group_size matches the number of per-sample partials.
++    assert sub["group_size"] == len(sub["data"][FORK_CONTINUE_FIELD])
++
++
++# ---------------------------------------------------------------------------
++# Helpers for the Bug B (partial-evict re-merge) and bug#7 (group_size == 1)
++# determinism tests. These construct the exact descriptors / trajectory dicts
++# the fork salvage path exchanges, so the count-consistency and list->dict
++# unpack contracts are checked without a cluster (the two NPU runs only ever
++# hit the all-in-flight case, so these paths are otherwise unexercised).
++# ---------------------------------------------------------------------------
++
++N_SAMPLES = 8
++
++
++def _fake_traj(n_rollouts: int, seqlen: int = 16, rid_prefix: str = "r") -> dict:
++    """Minimal trajectory dict with the keys ``concat_padded_tensors`` merges.
++
++    All fake trajectories share the same key set so concat does not reject them
++    (concat_padded_tensors requires consistent keys across inputs).
++    """
++    return {
++        "input_ids": torch.arange(n_rollouts * seqlen, dtype=torch.long).reshape(
++            n_rollouts, seqlen
++        ),
++        "attention_mask": torch.ones((n_rollouts, seqlen), dtype=torch.long),
++        "token_logprobs": torch.zeros((n_rollouts, seqlen)),
++        "rids": [f"{rid_prefix}-{i}" for i in range(n_rollouts)],
++    }
++
++
++def _descriptor(rid: str = "rid-x", partial_len: int = 3) -> dict:
++    """One per-sample continuation descriptor (as surfaced by the fork engine
++    when an in-flight rollout is aborted mid-generation)."""
++    return {
++        "prompt_ids": [1, 2],
++        "partial_ids": list(range(partial_len)),
++        "partial_logprobs": [0.1 * i for i in range(partial_len)],
++        "partial_versions": [0] * partial_len,
++        "rid": rid,
++    }
++
++
++class _NoOpLogger:
++    """Logger stand-in for the static ForkContinuationWorkflow helpers."""
++
++    def info(self, *args, **kwargs):
++        pass
++
++
++class _RecordingBase:
++    """Stand-in for RLVRWorkflow: records the ``cont`` handed to the resume
++    path so route_continuation's group_size == 1 list->dict unpack is observable
++    without running a real engine."""
++
++    def __init__(self):
++        self.received_cont = None
++        self.received_data = None
++        self.calls = 0
++
++    async def _arun_episode_continue(self, engine, data, cont):
++        self.received_cont = cont
++        self.received_data = data
++        self.calls += 1
++        return {"input_ids": torch.zeros((1, 4), dtype=torch.long)}
++
++
++# ---------------------------------------------------------------------------
++# Bug B: partial-evict re-merge (K completed parked + (8-K) continued -> 8)
++# ---------------------------------------------------------------------------
++
++
++def test_on_task_evicted_parks_complete_group_for_remerge():
++    """Test that on_task_evicted parks the already-complete half of a
++    partially-evicted group and pops the task maps, so reclaim can later
++    re-merge it with the continuation. Bug B deposit step."""
++    # Arrange: one fork task, K=3 of its 8 rollouts already complete at evict.
++    controller = _RecordingController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[_FakeWorker("actor-fork/0")],
++    )
++    tid = 10
++    controller._task_worker_map = {tid: "actor-fork/0"}
++    controller._task_input_map = {
++        tid: _RemoteRolloutTaskInput(
++            task_id=tid,
++            data={"messages": "p"},
++            workflow="wf",
++            workflow_kwargs={},
++            should_accept_fn=None,
++            group_size=N_SAMPLES,
++        )
++    }
++    k_complete = 3
++    traj = {
++        FORK_CONTINUATION_KEY: [
++            _descriptor(f"rid-{tid}-{i}") for i in range(N_SAMPLES - k_complete)
++        ],
++        FORK_COMPLETE_KEY: _fake_traj(k_complete, rid_prefix="done"),
++    }
++
++    # Act
++    controller._fork.on_task_evicted(tid, _FakeWorker("actor-fork/0"), traj)
++
++    # Assert: completed half parked (localized -> local tensor dict).
++    assert tid in controller._fork._fork_complete_groups
++    assert (
++        controller._fork._fork_complete_groups[tid]["input_ids"].shape[0] == k_complete
++    )
++    # Descriptor deposited for reclaim to re-submit.
++    assert tid in controller._fork._fork_continuations
++    # Task popped from worker/input maps so reclaim's settle sees it done.
++    assert tid not in controller._task_worker_map
++    assert tid not in controller._task_input_map
++
++
++@pytest.mark.parametrize("k_complete", range(1, N_SAMPLES))
++def test_try_remerge_partial_evict_count_is_n_samples(k_complete):
++    """Test that re-merging K parked completed + (8-K) continued yields exactly
++    8 rollouts for every K in 1..7. Bug B count-consistency guard: a merged
++    block of != 8 silently misaligns reward_norm's positional 8-slicer for every
++    subsequent prompt in the batch (wrong advantages, no crash). K=7 is the
++    bug#7 (group_size == 1) re-merge shape: a 7-group concat with a 1-single."""
++    # Arrange
++    controller = _RecordingController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[_FakeWorker("actor-fork/0")],
++    )
++    fork_tid = 42
++    controller._fork._fork_complete_groups[fork_tid] = _fake_traj(
++        k_complete, rid_prefix="done"
++    )
++    pending = _RemoteRolloutTaskInput(
++        task_id=999,
++        data={FORK_MERGE_KEY: fork_tid, "messages": "p"},
++        workflow="wf",
++        workflow_kwargs={},
++        should_accept_fn=None,
++        group_size=N_SAMPLES - k_complete,
++    )
++    continued = _fake_traj(N_SAMPLES - k_complete, rid_prefix="cont")
++
++    # Act
++    merged = controller._fork.try_remerge(pending, continued)
++
++    # Assert: exactly one full n_samples group (no silent misalignment).
++    assert merged["input_ids"].shape[0] == N_SAMPLES
++    assert len(merged["rids"]) == N_SAMPLES
++    # Parked complete half consumed (not double-merged on a second completion).
++    assert fork_tid not in controller._fork._fork_complete_groups
++
++
++def test_try_remerge_without_merge_key_is_noop():
++    """Test that a normal (non-continuation) task without FORK_MERGE_KEY is
++    returned unchanged -- re-merge never fires on regular surviving-engine
++    trajectories."""
++    controller = _RecordingController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[],
++    )
++    pending = _RemoteRolloutTaskInput(
++        task_id=7,
++        data={"messages": "plain"},
++        workflow="wf",
++        workflow_kwargs={},
++        should_accept_fn=None,
++        group_size=N_SAMPLES,
++    )
++    traj = _fake_traj(N_SAMPLES)
++
++    merged = controller._fork.try_remerge(pending, traj)
++
++    assert merged is traj
++
++
++def test_try_remerge_all_in_flight_no_complete_group_is_noop():
++    """Test that an all-in-flight continuation (8/8 evicted, no completed half
++    parked) is accepted as-is -- the continued result is already a full group.
++    This is the path both NPU runs actually exercised (112 + 120 continuations);
++    it must stay a no-op so re-merge never double-concats a full group."""
++    controller = _RecordingController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[],
++    )
++    fork_tid = 5
++    # FORK_MERGE_KEY present (it IS a continuation) but no completed half parked.
++    pending = _RemoteRolloutTaskInput(
++        task_id=999,
++        data={FORK_MERGE_KEY: fork_tid, "messages": "p"},
++        workflow="wf",
++        workflow_kwargs={},
++        should_accept_fn=None,
++        group_size=N_SAMPLES,
++    )
++    traj = _fake_traj(N_SAMPLES)
++
++    merged = controller._fork.try_remerge(pending, traj)
++
++    # No complete group to pop -> accept the 8-rollout continuation as-is.
++    assert merged is traj
++    assert merged["input_ids"].shape[0] == N_SAMPLES
++
++
++@pytest.mark.parametrize("k_complete", range(1, N_SAMPLES))
++def test_surface_group_descriptor_partial_evict_surfaces_both(k_complete):
++    """Test that a partially-evicted group surfaces BOTH the (8-K) in-flight
++    descriptors AND the K completed rollouts (merged into one group) so the
++    controller can park + re-merge them. Bug B surfacing step (runs on the fork
++    engine inside GroupedRolloutWorkflow.gather)."""
++    # Arrange: K completed trajectories + (8-K) abort descriptors.
++    complete_results = [
++        _fake_traj(1, rid_prefix=f"done-{i}") for i in range(k_complete)
++    ]
++    descriptor_results = [
++        {FORK_CONTINUATION_KEY: _descriptor(f"rid-{i}")}
++        for i in range(N_SAMPLES - k_complete)
++    ]
++    results = complete_results + descriptor_results
++
++    out = ForkContinuationWorkflow.surface_group_descriptor(results, _NoOpLogger())
++
++    assert out is not None
++    # (8-K) in-flight descriptors surfaced for continuation re-submit.
++    assert len(out[FORK_CONTINUATION_KEY]) == N_SAMPLES - k_complete
++    # K completed rollouts merged into one group for parking.
++    assert out[FORK_COMPLETE_KEY]["input_ids"].shape[0] == k_complete
++
++
++def test_surface_group_descriptor_all_complete_returns_none():
++    """Test that a group with no in-flight descriptors (all 8 completed -> path
++    A) returns None so the normal merge path runs (no spurious descriptor)."""
++    results = [_fake_traj(1, rid_prefix=f"done-{i}") for i in range(N_SAMPLES)]
++    assert (
++        ForkContinuationWorkflow.surface_group_descriptor(results, _NoOpLogger())
++        is None
++    )
++
++
++def test_surface_group_descriptor_all_in_flight_no_complete():
++    """Test that an all-in-flight group (8/8 descriptors, 0 completed) surfaces
++    the 8 descriptors with FORK_COMPLETE_KEY=None -- nothing to park/re-merge."""
++    results = [
++        {FORK_CONTINUATION_KEY: _descriptor(f"rid-{i}")} for i in range(N_SAMPLES)
++    ]
++    out = ForkContinuationWorkflow.surface_group_descriptor(results, _NoOpLogger())
++    assert out is not None
++    assert len(out[FORK_CONTINUATION_KEY]) == N_SAMPLES
++    assert out[FORK_COMPLETE_KEY] is None
++
++
++# ---------------------------------------------------------------------------
++# bug#7: group_size == 1 continuation. The per-sample list arrives UNWRAPPED at
++# RLVRWorkflow because the engine's _resolve_workflow only wraps
++# GroupedRolloutWorkflow for group_size > 1. route_continuation must unpack the
++# 1-element list to a dict before calling _arun_episode_continue, else
++# cont["prompt_ids"] raises TypeError and the rollout is silently dropped.
++# The group_size == 8 path (wrapped, each sample gets a dict) never exercises
++# this list branch -- both NPU runs only ran the dict branch (232 continuations).
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_route_continuation_group_size_one_unwraps_list():
++    """Test that a group_size == 1 continuation (a 1-element list, unwrapped by
++    the engine) is unpacked to the sole dict before _arun_episode_continue --
++    the bug#7 fix. Without it, _arun_episode_continue receives a list and
++    cont["prompt_ids"] raises TypeError, silently dropping the rollout."""
++    sole = _descriptor("rid-single")
++    data = {FORK_CONTINUE_FIELD: [sole]}  # 1-element list (group_size == 1)
++    base = _RecordingBase()
++
++    handled, _result = await ForkContinuationWorkflow.route_continuation(
++        base, engine=None, data=data
++    )
++
++    assert handled is True
++    assert base.calls == 1
++    # _arun_episode_continue received the DICT, not the list.
++    assert base.received_cont is sole
++    assert isinstance(base.received_cont, dict)
++
++
++@pytest.mark.asyncio
++async def test_route_continuation_dict_passes_through():
++    """Test that an already-unwrapped dict continuation (group_size > 1, each
++    sample injected by arun_one_with_continue) is routed unchanged. This is the
++    path both NPU runs exercised -- it must keep working alongside the fix."""
++    cont = _descriptor("rid-wrapped")
++    data = {FORK_CONTINUE_FIELD: cont}
++    base = _RecordingBase()
++
++    handled, _ = await ForkContinuationWorkflow.route_continuation(
++        base, engine=None, data=data
++    )
++
++    assert handled is True
++    assert base.calls == 1
++    assert base.received_cont is cont
++
++
++@pytest.mark.asyncio
++async def test_route_continuation_empty_list_not_handled():
++    """Test that an empty continuation list is treated as no continuation (cont
++    becomes None) so normal generation proceeds rather than indexing into []."""
++    data = {FORK_CONTINUE_FIELD: []}
++    base = _RecordingBase()
++
++    handled, result = await ForkContinuationWorkflow.route_continuation(
++        base, engine=None, data=data
++    )
++
++    assert handled is False
++    assert result is None
++    assert base.calls == 0
++
++
++@pytest.mark.asyncio
++async def test_route_continuation_no_field_not_handled():
++    """Test that data without FORK_CONTINUE_FIELD is not a continuation --
++    normal generation runs (the common case for every non-fork rollout)."""
++    base = _RecordingBase()
++
++    handled, result = await ForkContinuationWorkflow.route_continuation(
++        base, engine=None, data={"messages": "plain"}
++    )
++
++    assert handled is False
++    assert result is None
++    assert base.calls == 0
++
++
++# ---------------------------------------------------------------------------
++# post_process_result hook (Stage 1 composition refactor): the controller
++# callback's per-task fork salvage is now one call on the fork strategy.
++# NoOpForkCoordinator (feature off) is identity; ForkCoordinator (feature on)
++# deposits descriptors, re-merges, localizes.
++# ---------------------------------------------------------------------------
++
++
++def test_noop_post_process_result_is_identity():
++    """Test that NoOpForkCoordinator.post_process_result is identity for any
++    input (normal traj / None / descriptor) -- zero fork overhead in the hot
++    path when the feature is off. (A descriptor never reaches a NoOp controller
++    in practice -- no fork engines -> no eviction -- but identity is the
++    contract.)"""
++    noop = NoOpForkCoordinator()
++    traj = _fake_traj(N_SAMPLES)
++    assert noop.post_process_result(None, _FakeWorker("rollout/0"), 1, traj) is traj
++    assert noop.post_process_result(None, _FakeWorker("rollout/0"), 1, None) is None
++    desc = {FORK_CONTINUATION_KEY: [_descriptor("rid")]}
++    assert noop.post_process_result(None, _FakeWorker("rollout/0"), 1, desc) is desc
++
++
++def test_noop_lifecycle_methods_are_noop():
++    """Test that NoOpForkCoordinator's reclaim/destroy surface is inert."""
++    noop = NoOpForkCoordinator()
++    assert noop.pop_continuation(1) is None
++    assert noop.pop_completed_task_ids() == {}
++    noop.clear_continuations()  # must not raise
++    noop.clear_completed_task_ids()  # must not raise
++    noop.clear_complete_groups()  # must not raise
++    assert noop.is_fork_worker("any-worker") is False
++
++
++def test_post_process_result_descriptor_deposits_and_returns_none():
++    """Test that post_process_result deposits an evicted descriptor (parks the
++    complete half via on_task_evicted + pops the task maps) and returns None so
++    the controller rejects and reclaim re-submits a continuation."""
++    controller = _RecordingController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[_FakeWorker("actor-fork/0")],
++    )
++    tid = 10
++    controller._task_worker_map = {tid: "actor-fork/0"}
++    controller._task_input_map = {
++        tid: _RemoteRolloutTaskInput(
++            task_id=tid,
++            data={"messages": "p"},
++            workflow="wf",
++            workflow_kwargs={},
++            should_accept_fn=None,
++            group_size=N_SAMPLES,
++        )
++    }
++    descriptor = {
++        FORK_CONTINUATION_KEY: [_descriptor(f"rid-{tid}-{i}") for i in range(5)],
++        FORK_COMPLETE_KEY: _fake_traj(3, rid_prefix="done"),
++    }
++
++    out = controller._fork.post_process_result(
++        pending_task=controller._task_input_map[tid],
++        worker=_FakeWorker("actor-fork/0"),
++        task_id=tid,
++        traj=descriptor,
++    )
++
++    # Returns None -> controller rejects (reclaim re-submits a continuation).
++    assert out is None
++    # Complete half parked for re-merge; task maps popped inside on_task_evicted.
++    assert tid in controller._fork._fork_complete_groups
++    assert controller._fork._fork_complete_groups[tid]["input_ids"].shape[0] == 3
++    assert tid not in controller._task_worker_map
++    assert tid not in controller._task_input_map
++
++
++def test_post_process_result_none_returns_none():
++    """Test that a None result (failed/empty rollout) returns None for reject,
++    with no salvage side effects."""
++    controller = _RecordingController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[],
++    )
++    out = controller._fork.post_process_result(
++        pending_task=None,
++        worker=_FakeWorker("rollout/0"),
++        task_id=1,
++        traj=None,
++    )
++    assert out is None
++
++
++def test_post_process_result_normal_traj_is_identity_when_no_fork():
++    """Test that a normal trajectory on a surviving engine (no FORK_MERGE_KEY,
++    worker not a fork worker) is returned unchanged -- try_remerge +
++    localize_if_fork are no-ops when the feature has no fork workers."""
++    controller = _RecordingController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[],
++    )
++    traj = _fake_traj(N_SAMPLES)
++    pending = _RemoteRolloutTaskInput(
++        task_id=1,
++        data={"messages": "plain"},
++        workflow="wf",
++        workflow_kwargs={},
++        should_accept_fn=None,
++        group_size=N_SAMPLES,
++    )
++
++    out = controller._fork.post_process_result(
++        pending_task=pending,
++        worker=_FakeWorker("rollout/0"),
++        task_id=1,
++        traj=traj,
++    )
++
++    assert out is traj
++
++
++# ---------------------------------------------------------------------------
++# Descriptor short-circuit in WorkflowExecutor._execute_workflow: a fork-eviction
++# descriptor returned by arun_episode must bypass check_trajectory_format +
++# should_accept_fn + dump (which would reject/raise on the non-trajectory shape
++# and silently lose the partial). Otherwise, with a non-None dynamic_filter_fn,
++# the descriptor is rejected at the engine -> controller sees None -> the
++# continuation is never deposited -> batch short + in-flight rollouts lost.
++# ---------------------------------------------------------------------------
++
++
++class _FakeWorkflow:
++    """Workflow whose arun_episode returns a fixed result (descriptor or traj)."""
++
++    def __init__(self, result):
++        self._result = result
++
++    async def arun_episode(self, engine, data):
++        return self._result
++
++
++class _FakeWorkflowExecutor:
++    """Minimal stand-in for WorkflowExecutor -- only the attributes the
++    _execute_workflow descriptor short-circuit + normal-reject path touch
++    (staleness_manager, inference_engine, config). Binds the real
++    _create_workflow_task so the production closure (with the short-circuit)
++    runs against the fake self."""
++
++    def __init__(self):
++        self.inference_engine = None
++
++        class _M:
++            def on_rollout_accepted(self):
++                pass
++
++            def on_rollout_rejected(self):
++                pass
++
++        self.staleness_manager = _M()
++
++        class _Cfg:
++            check_trajectory_format = False
++            dump_to_file = False
++            enable_rollout_tracing = False
++
++        self.config = _Cfg()
++
++
++_FakeWorkflowExecutor._create_workflow_task = WorkflowExecutor._create_workflow_task
++
++
++@pytest.mark.asyncio
++async def test_descriptor_bypasses_should_accept_fn():
++    """Test that a fork-eviction continuation descriptor returned by arun_episode
++    is NOT run through should_accept_fn (which would reject it on its
++    non-trajectory shape and silently lose the partial). The descriptor must
++    pass through as-is so the controller's post_process_result can deposit it
++    for reclaim. Regression guard for the workflow_executor short-circuit."""
++    descriptor = {
++        FORK_CONTINUATION_KEY: [
++            {
++                "rid": "r1",
++                "prompt_ids": [1],
++                "partial_ids": [2],
++                "partial_logprobs": [0.1],
++                "partial_versions": [0],
++            }
++        ],
++        FORK_COMPLETE_KEY: None,
++    }
++
++    def reject_everything(traj):
++        # A should_accept_fn that rejects ALL normal trajectories. Without the
++        # short-circuit, the descriptor would be rejected here -> returned None
++        # -> lost (never deposited for reclaim).
++        return False
++
++    pending = _RolloutTaskInput(
++        task_id=42,
++        data={"messages": "p"},
++        workflow=_FakeWorkflow(descriptor),
++        should_accept_fn=reject_everything,
++        is_eval=False,
++    )
++
++    fake = _FakeWorkflowExecutor()
++    closure = fake._create_workflow_task(pending)
++    result = await closure()
++
++    # Descriptor passes through (NOT rejected by should_accept_fn).
++    assert result is not None
++    assert isinstance(result, _RolloutResult)
++    assert result.trajectory is descriptor
++    assert result.task_id == 42
++
++
++@pytest.mark.asyncio
++async def test_normal_trajectory_still_goes_through_should_accept_fn():
++    """Test that a normal (non-descriptor) trajectory still goes through
++    should_accept_fn as before -- the descriptor short-circuit does NOT bypass
++    filtering for real trajectories. A rejected normal trajectory returns None."""
++    traj = _fake_traj(N_SAMPLES)
++
++    def reject_everything(_traj):
++        return False
++
++    pending = _RolloutTaskInput(
++        task_id=7,
++        data={"messages": "p"},
++        workflow=_FakeWorkflow(traj),
++        should_accept_fn=reject_everything,
++        is_eval=False,
++    )
++
++    fake = _FakeWorkflowExecutor()
++    closure = fake._create_workflow_task(pending)
++    result = await closure()
++
++    # Normal trajectory rejected by should_accept_fn -> None (no short-circuit).
++    assert result is None
++
++
++# ---------------------------------------------------------------------------
++# _workflow_supports_fork guard: fork only supports single-turn tensor-dict
++# workflows with _arun_episode_continue (RLVRWorkflow). Agent / multi-turn
++# workflows (OpenAIProxyWorkflow, online mode) are disabled. Prevents the fork
++# from running with an incompatible workflow (salvage would break on
++# InteractionWithTokenLogpReward; agent.run doesn't return on evict so the fork
++# engine can't be torn down).
++# ---------------------------------------------------------------------------
++
++
++def test_workflow_supports_fork_rlvr():
++    """Test that RLVRWorkflow (single-turn tensor-dict with _arun_episode_continue)
++    supports fork -- both as a class and as a string import path."""
++    assert PPOTrainer._workflow_supports_fork(RLVRWorkflow) is True
++    assert (
++        PPOTrainer._workflow_supports_fork("areal.workflow.rlvr.RLVRWorkflow") is True
++    )
++
++
++def test_workflow_supports_fork_agent_workflow():
++    """Test that an agent/multi-turn workflow (no _arun_episode_continue, like
++    OpenAIProxyWorkflow) does NOT support fork."""
++
++    class _FakeAgentWorkflow:
++        """Simulates OpenAIProxyWorkflow: has arun_episode but no
++        _arun_episode_continue (multi-turn agent.run)."""
++
++        async def arun_episode(self, engine, data):
++            return None
++
++    assert PPOTrainer._workflow_supports_fork(_FakeAgentWorkflow) is False
++
++
++def test_workflow_supports_fork_online_mode():
++    """Test that online agent mode (workflow=None) does not support fork."""
++    assert PPOTrainer._workflow_supports_fork(None) is False
++
++
++def test_workflow_supports_fork_unresolvable_string():
++    """Test that an unresolvable workflow string fails safe (no fork)."""
++    assert PPOTrainer._workflow_supports_fork("nonexistent.module.Workflow") is False
++
++
++def test_workflow_supports_fork_callable():
++    """Test that a bare callable (function-style workflow) has no
++    _arun_episode_continue -> does not support fork."""
++
++    async def _fn_workflow(engine, data):
++        return None
++
++    assert PPOTrainer._workflow_supports_fork(_fn_workflow) is False
++
++
++# ---------------------------------------------------------------------------
++# Reclaim snapshot accounting: descriptor vs completed-normally vs lost.
++#
++# ``fork_snapshot`` is the PRE-evict in-flight list. After settle, each task is
++# in exactly one bucket:
++#   (a) yielded a continuation descriptor  -> re-submitted to a surviving engine
++#   (b) completed normally on the fork engine before evict took effect
++#       (path A) -> already accepted (localize_if_fork records the task id)
++#   (c) yielded neither -> truly lost (settle timeout / workflow failure)
++# The old `snapshot - descriptors` count misreported (b) as "lost partial"
++# (e.g. a sample that hit max_tokens exactly before the abort lands returns a
++# normal "length" trajectory, remaining == 0). These tests pin the 3-way split
++# and that only (a) is re-submitted.
++# ---------------------------------------------------------------------------
++
++
++def test_localize_if_fork_records_completed_task():
++    """Test that accepting a fork trajectory records its task id AND accepted
++    rollout count (path A), and that pop_completed_task_ids consumes the record
++    exactly once."""
++    controller = _RecordingController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[_FakeWorker("actor-fork/0")],
++    )
++    traj = _fake_traj(3)
++
++    out = controller._fork.localize_if_fork(_FakeWorker("actor-fork/0"), 7, traj)
++
++    # RTensor.localize returns a localized copy (dict comprehension), not the
++    # same object; content is preserved.
++    assert out["rids"] == traj["rids"]
++    # task_id -> accepted rollout count (3 rows), not a task-only record.
++    assert controller._fork.pop_completed_task_ids() == {7: 3}
++    # Popped (consumed exactly once), not merely read.
++    assert controller._fork.pop_completed_task_ids() == {}
++
++
++def test_localize_if_fork_ignores_surviving_worker():
++    """Test that normal trajectories from surviving engines are not recorded as
++    fork completions (they are never in the fork snapshot)."""
++    controller = _RecordingController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[_FakeWorker("actor-fork/0")],
++    )
++    traj = _fake_traj(1)
++
++    out = controller._fork.localize_if_fork(_FakeWorker("rollout/0"), 8, traj)
++
++    assert out is traj
++    assert controller._fork.pop_completed_task_ids() == {}
++
++
++class _RecordingLogger:
++    """Captures reclaim's log lines so the classification is assertable."""
++
++    def __init__(self):
++        self.messages: list[tuple[str, str]] = []
++
++    def info(self, msg):
++        self.messages.append(("info", msg))
++
++    def warning(self, msg):
++        self.messages.append(("warning", msg))
++
++    def error(self, msg):
++        self.messages.append(("error", msg))
++
++
++class _MixedEvictController(_RecordingController):
++    """Simulates one evict with four in-flight fork tasks:
++    tid=0 -> descriptor only (all in-flight, interrupted);
++    tid=1 -> completed normally before evict took effect (path A, 4 rollouts);
++    tid=2 -> nothing at all (lost);
++    tid=3 -> partial evict: 5 in-flight (descriptor) + 3 completed (parked).
++    """
++
++    def _fork_collective_rpc(self, method, *args, **kwargs):
++        self.calls.append(f"fork.{method}")
++        if method != "evict":
++            return
++        for tid, wid in list(self._task_worker_map.items()):
++            self._task_worker_map.pop(tid, None)
++            self._task_input_map.pop(tid, None)
++            if tid == 0:
++                self._fork._fork_continuations[tid] = {
++                    FORK_CONTINUATION_KEY: [_descriptor(f"rid-{tid}")]
++                }
++            elif tid == 1:
++                # Normal-path accept: localize_if_fork records id + rollout count.
++                self._fork.localize_if_fork(_FakeWorker(wid), tid, _fake_traj(4))
++            elif tid == 3:
++                self._fork._fork_continuations[tid] = {
++                    FORK_CONTINUATION_KEY: [
++                        _descriptor(f"rid-{tid}-{i}") for i in range(5)
++                    ],
++                    FORK_COMPLETE_KEY: _fake_traj(3, rid_prefix="done"),
++                }
++            # tid == 2: no descriptor, not accepted -> truly lost (no future was
++            # force-resolved in this simulation, so it is not restarted).
++
++
++def test_reclaim_classifies_snapshot_and_resubmits_only_descriptors(monkeypatch):
++    """Test that reclaim splits the pre-evict snapshot into descriptor /
++    completed-normally / lost and reports the split in ROLLOUTS (group_size per
++    task), not just task counts. Re-submits ONLY descriptor tasks; path-A
++    completions must not be reported as lost."""
++    controller = _MixedEvictController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[_FakeWorker("actor-fork/0")],
++    )
++    # task_id -> group_size (n_samples rollouts of one prompt).
++    group_sizes = {0: 1, 1: 4, 2: 2, 3: 8}
++    controller._task_worker_map = {tid: "actor-fork/0" for tid in group_sizes}
++    controller._task_input_map = {
++        tid: _RemoteRolloutTaskInput(
++            task_id=tid,
++            data={"messages": f"p{tid}"},
++            workflow="wf",
++            workflow_kwargs={},
++            should_accept_fn=None,
++            group_size=group_size,
++        )
++        for tid, group_size in group_sizes.items()
++    }
++
++    class _Gen:
++        def __init__(self):
++            self._n = 100
++
++        def next(self):
++            self._n += 1
++            return self._n
++
++    controller._task_id_generator = _Gen()
++
++    submitted: list[dict] = []
++
++    def capture_submit(**kwargs):
++        submitted.append(kwargs)
++        controller.calls.append(f"controller.submit:{kwargs['task_id']}")
++
++    controller.submit = capture_submit
++
++    recorder = _RecordingLogger()
++    monkeypatch.setattr("areal.infra.controller.rollout_controller.logger", recorder)
++
++    controller.reclaim_and_teardown_actor_fork()
++
++    # Only descriptor tasks (0 all-in-flight, 3 partially evicted) are
++    # re-submitted; task 1 completed normally, task 2 is lost (no future was
++    # force-resolved in this simulation, so no restart either).
++    assert len(submitted) == 2
++    assert [s["data"][FORK_MERGE_KEY] for s in submitted] == [0, 3]
++    assert all(FORK_CONTINUE_FIELD in s["data"] for s in submitted)
++    # group_size = number of interrupted rollouts per descriptor task.
++    assert [s["group_size"] for s in submitted] == [1, 5]
++
++    infos = [msg for kind, msg in recorder.messages if kind == "info"]
++    warnings = [msg for kind, msg in recorder.messages if kind == "warning"]
++    # Per-task rollout accounting.
++    assert any(
++        "task_id=0 rollouts=1: 1 interrupted" in m and "0 lost" in m for m in infos
++    )
++    assert any("task_id=1 rollouts=4: 4 completed on fork" in m for m in infos)
++    assert any("task_id=2 rollouts=2: 2 lost" in m for m in infos)
++    assert any(
++        "task_id=3 rollouts=8: 5 interrupted" in m
++        and "3 completed on fork (parked for re-merge)" in m
++        and "0 lost" in m
++        for m in infos
++    )
++    # Aggregate in rollouts: 1+4+2+8 = 15 = 4 accepted + 3 parked + 6
++    # interrupted + 2 lost.
++    assert any(
++        "rollout accounting across 4 fork task(s) (15 rollouts): "
++        "4 completed (accepted) + 3 parked for re-merge + 6 interrupted "
++        "(re-submitted as continuations) + 2 lost" in m
++        for m in infos
++    )
++    # Only whole-task losses get the warning (task 2).
++    assert any("1/4 fork task(s) yielded neither" in m for m in warnings)
++    assert any("[2]" in m for m in warnings)
++    # Window accounting consumed (pop) -- a later reclaim cannot double-count.
++    assert controller._fork._fork_completed_task_ids == {}
++
++
++# ---------------------------------------------------------------------------
++# Settle timeout -> full restart
++#
++# A task that fails to settle is abandoned (its future is resolved with the
++# _FORK_TASK_ABANDONED sentinel, so its coroutine rejects without fetching a
++# result) and its original input is re-submitted as a brand-new group.
++# ---------------------------------------------------------------------------
++
++
++class _FakeClock:
++    """Deterministic clock: ``sleep`` advances ``perf_counter``."""
++
++    def __init__(self):
++        self.now = 0.0
++
++    def perf_counter(self):
++        return self.now
++
++    def sleep(self, seconds):
++        self.now += seconds
++
++
++class _FakeFuture:
++    """Minimal asyncio-future stand-in for the settle-timeout resolve."""
++
++    def __init__(self):
++        self.resolved = False
++        self.value = None
++
++    def done(self):
++        return self.resolved
++
++    def set_result(self, value):
++        self.resolved = True
++        self.value = value
++
++    def get_loop(self):
++        return self
++
++    def call_soon_threadsafe(self, cb, *args):
++        cb(*args)
++
++
++class _HungTaskController(_RecordingController):
++    """Evict settles tid=0 with a descriptor and leaves tid=1 hung: the fork
++    request never returns (the 34/38/42/43 failure mode), so its task stays in
++    ``_task_worker_map`` until the settle timeout."""
++
++    def _fork_collective_rpc(self, method, *args, **kwargs):
++        self.calls.append(f"fork.{method}")
++        if method != "evict":
++            return
++        self._task_worker_map.pop(0, None)
++        self._task_input_map.pop(0, None)
++        self._fork._fork_continuations[0] = {
++            FORK_CONTINUATION_KEY: [_descriptor("rid-0")]
++        }
++
++
++def test_reclaim_restarts_settle_timeout_task(monkeypatch):
++    """A fork task that never settles is abandoned (sentinel future) and its
++    original input is re-submitted as a full restart with a new task id."""
++    controller = _HungTaskController(
++        surviving_workers=[_FakeWorker("rollout/0")],
++        fork_workers=[_FakeWorker("actor-fork/0")],
++    )
++    controller._task_worker_map = {0: "actor-fork/0", 1: "actor-fork/0"}
++    controller._task_input_map = {
++        tid: _RemoteRolloutTaskInput(
++            task_id=tid,
++            data={"messages": f"p{tid}"},
++            workflow="wf",
++            workflow_kwargs={"k": tid},
++            should_accept_fn=None,
++            group_size=8,
++        )
++        for tid in (0, 1)
++    }
++    future = _FakeFuture()
++    controller._pending_futures[1] = future
++
++    class _Gen:
++        def __init__(self):
++            self._n = 100
++
++        def next(self):
++            self._n += 1
++            return self._n
++
++    controller._task_id_generator = _Gen()
++
++    submitted: list[dict] = []
++    controller.submit = lambda **kw: submitted.append(kw)
++
++    recorder = _RecordingLogger()
++    monkeypatch.setattr("areal.infra.controller.rollout_controller.logger", recorder)
++    monkeypatch.setattr("areal.infra.controller.rollout_controller.time", _FakeClock())
++
++    controller.reclaim_and_teardown_actor_fork()
++
++    # task 0 -> continuation; task 1 -> full restart.
++    assert len(submitted) == 2
++    continuation, restart = submitted
++    assert FORK_CONTINUE_FIELD in continuation["data"]
++    assert FORK_CONTINUE_FIELD not in restart["data"]
++    assert restart["data"] == {"messages": "p1"}  # original input
++    assert restart["workflow"] == "wf"
++    assert restart["workflow_kwargs"] == {"k": 1}
++    assert restart["group_size"] == 8  # original group size, not partial count
++    assert restart["priority"] is True
++    assert restart["task_id"] != 1  # new id
++
++    # The stuck future was resolved with the sentinel: its coroutine rejects
++    # without fetching, so the restart cannot be duplicated.
++    assert future.resolved
++    assert future.value is _FORK_TASK_ABANDONED
++
++    infos = [msg for kind, msg in recorder.messages if kind == "info"]
++    warnings = [msg for kind, msg in recorder.messages if kind == "warning"]
++    assert any("did not settle within 30.0s" in m for m in warnings)
++    assert any(
++        "task_id=1 rollouts=8: 8 lost" in m and "full restart" in m for m in infos
++    )
++    assert any("re-submitted 1 continuation + 1 restart task(s)" in m for m in infos)
