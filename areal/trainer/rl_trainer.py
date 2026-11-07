@@ -150,6 +150,10 @@ class PPOTrainer:
         teacher_configs = config.teacher.teachers if config.teacher is not None else []
         self._should_offload_teacher = any(t.offload for t in teacher_configs)
 
+        # Step-0 actor-GPU inference fork (separation-deployment utilization):
+        # resolve topology + preconditions in one place (see _init_actor_gpu_fork).
+        self._init_actor_gpu_fork()
+
         # Validate config before proceeding with weight initialization
         self._validate_cfg()
 
@@ -497,6 +501,180 @@ class PPOTrainer:
         self._config_perf_tracer()
         self._apply_initial_offload_policy()
 
+    def _init_actor_gpu_fork(self) -> None:
+        """Resolve step-0 actor-GPU fork topology + preconditions.
+
+        Only fires on the first step of a fresh run, in single-controller
+        separation mode with a Megatron actor + vLLM rollout + Ray scheduler.
+        Each fork instance mirrors ONE surviving rollout vLLM server =
+        ``vllm.data_parallel_size * tp * pp`` GPUs (in the inference EP scenario,
+        EP size = data_parallel_size * tp == one instance). The number of fork
+        instances is ``actor_world_size // instance_gpus``; auto-disabled (with a
+        warning) if that division is not exact (RayScheduler grouped GPU fork
+        constraint) or any other precondition fails.
+
+        Sets ``_actor_gpu_fork_step0`` (False if disabled). When enabled also
+        sets ``_actor_fork_instance_gpus`` / ``_actor_fork_replicas`` /
+        ``_rollout_server_args`` (the latter is filled later in ``_init_rollout``).
+        """
+        config = self.config
+        self._actor_gpu_fork_step0 = bool(config.rollout.enable_actor_gpu_rollout)
+        if not self._actor_gpu_fork_step0:
+            return
+
+        # Resolve the exact per-instance GPU count the surviving vLLM servers
+        # use (mirror build_args: vllm-config tp/pp override the allocation).
+        _vllm_cfg = config.vllm
+        _fork_tp = _vllm_cfg.tensor_parallel_size or self.rollout_alloc.parallel.tp_size
+        _fork_pp = (
+            _vllm_cfg.pipeline_parallel_size or self.rollout_alloc.parallel.pp_size
+        )
+        self._actor_fork_instance_gpus = (
+            _vllm_cfg.data_parallel_size * _fork_tp * _fork_pp
+        )
+        self._actor_fork_replicas: int = 0
+        self._rollout_server_args: dict[str, Any] | None = None
+
+        actor_world_size = self.actor_alloc.parallel.world_size
+        preconditions_ok = (
+            is_single_controller()
+            and self.actor_alloc.backend == "megatron"
+            and self.rollout_alloc.backend == "vllm"
+            and config.scheduler.type == "ray"
+            and not self._should_offload_rollout  # separation, not colocate
+            and actor_world_size % self._actor_fork_instance_gpus == 0
+        )
+        if not preconditions_ok:
+            logger.warning(
+                "enable_actor_gpu_rollout conditions not met"
+                "(single-controller + megatron actor + vllm rollout + ray "
+                "scheduler + separation + actor world_size divisible by rollout "
+                f"instance size={self._actor_fork_instance_gpus}, "
+                f"actor_world_size={actor_world_size}); disabling step0 fork."
+            )
+            self._actor_gpu_fork_step0 = False
+            return
+
+        self._actor_fork_replicas = actor_world_size // self._actor_fork_instance_gpus
+        logger.info(
+            "Step-0 actor-GPU fork enabled: instance_gpus="
+            f"{self._actor_fork_instance_gpus}, "
+            f"replicas={self._actor_fork_replicas}"
+        )
+
+    @staticmethod
+    def _workflow_supports_fork(workflow: WorkflowLike | None) -> bool:
+        """Whether the rollout workflow supports the step-0 actor-GPU fork.
+
+        Fork requires a single-turn tensor-dict workflow with
+        ``_arun_episode_continue`` (e.g. :class:`RLVRWorkflow`): the salvage
+        (``concat_padded_tensors``) assumes tensor-dict trajectories, the
+        continuation is single-turn, and on evict ``arun_episode`` returns (so
+        the fork engine can be torn down before the actor resumes training).
+        Agent / multi-turn workflows (:class:`OpenAIProxyWorkflow`,
+        :class:`AgentWorkflow`, online mode) are incompatible -- they produce
+        ``InteractionWithTokenLogpReward`` trajectories, run a multi-turn
+        ``agent.run`` that does NOT return on evict (so the fork engine cannot
+        be torn down while the actor needs the GPU), and have no
+        ``_arun_episode_continue``.
+        """
+        if workflow is None:
+            return False  # online agent mode (workflow resolved from agent config)
+        resolved = workflow
+        if isinstance(workflow, str):
+            from areal.utils.dynamic_import import import_from_string
+
+            try:
+                resolved = import_from_string(workflow)
+            except (ValueError, ImportError, AttributeError):
+                return False  # cannot resolve -> fail-safe: don't risk fork
+        return hasattr(resolved, "_arun_episode_continue")
+
+    def _should_use_step0_fork(
+        self,
+        global_step: int,
+        start_step: int,
+        streaming_batch_count: int,
+        workflow: WorkflowLike | None,
+    ) -> bool:
+        """Whether this step should serve its rollout from the step-0 fork.
+
+        The fork is a one-shot optimization for the first rollout of a fresh
+        run, so every guard below disables it rather than degrading it:
+
+        * ``start_step == 0`` -- a resumed run starts mid-training, where the
+          actor GPUs are not idle for a full rollout window;
+        * ``streaming_batch_count == 1`` -- the fork engines are torn down
+          right after the first ``prepare_batch``; a multi-chunk streaming step
+          would leave the remaining chunks running on a torn-down fork;
+        * ``max_head_offpolicyness > 0`` -- evicted/abandoned fork tasks are
+          re-submitted at the current (step-0) version while training advances;
+          with zero off-policy tolerance those results could never be consumed;
+        * the workflow must support fork (single-turn tensor-dict with
+          ``_arun_episode_continue``) -- see :meth:`_workflow_supports_fork`.
+        """
+        if not self._actor_gpu_fork_step0:
+            return False
+        if global_step != start_step or start_step != 0:
+            return False
+        if streaming_batch_count != 1:
+            logger.warning(
+                "[step0-fork] disabling step-0 fork: streaming rollout "
+                f"(streaming_batch_count={streaming_batch_count}) is not supported."
+            )
+            return False
+        if self.config.rollout.max_head_offpolicyness <= 0:
+            logger.warning(
+                "[step0-fork] disabling step-0 fork: rollout.max_head_offpolicyness "
+                "must be > 0 (fork salvage is re-submitted while training advances)."
+            )
+            return False
+        if not self._workflow_supports_fork(workflow):
+            logger.warning(
+                "[step0-fork] disabling step-0 fork: workflow does not support "
+                "fork (requires single-turn tensor-dict workflow with "
+                "_arun_episode_continue, e.g. RLVRWorkflow). Agent/multi-turn "
+                "workflows are incompatible."
+            )
+            return False
+        return True
+
+    def _start_step0_fork(self, global_step: int) -> None:
+        """Offload the actor and fork vLLM engines onto its now-free GPUs."""
+        logger.info(
+            f"[step0-fork] global_step={global_step}: offloading actor "
+            f"(role={self.actor.worker_role}) to free GPUs for fork engines"
+        )
+        self._offload_model(self.actor, role="actor")
+        logger.info(
+            "[step0-fork] starting fork vLLM engines on actor GPUs "
+            f"(instance_gpus={self._actor_fork_instance_gpus}, "
+            f"replicas={self._actor_fork_replicas})"
+        )
+        self.rollout.start_actor_fork_engines(
+            actor_role=self.actor.worker_role,
+            fork_instance_gpus=self._actor_fork_instance_gpus,
+            fork_replicas=self._actor_fork_replicas,
+            server_args=self._rollout_server_args,
+        )
+
+    def _reclaim_step0_fork(self, rollout_batch: list[dict[str, Any]]) -> None:
+        """Reclaim fork-engine requests and onload the actor before training.
+
+        Fork-generated trajectories were already materialized at fetch time in
+        ``RolloutController._create_submit_callback`` (localize before popping
+        ``_task_worker_map``), so their lazy RTensor shards no longer reference
+        the fork workers -- safe to tear down now.
+        """
+        logger.info(
+            f"[step0-fork] prepare_batch collected {len(rollout_batch)} "
+            "trajectories; reclaiming fork engines"
+        )
+        self.rollout.reclaim_and_teardown_actor_fork()
+        logger.info("[step0-fork] onloading actor back for training")
+        self._onload_model(self.actor, role="actor")
+        logger.info("[step0-fork] actor onloaded; resuming normal training")
+
     @staticmethod
     def _is_colocation(strategy: SchedulingStrategy | None) -> bool:
         if strategy is None:
@@ -788,6 +966,16 @@ class PPOTrainer:
                 break
             epoch = global_step // steps_per_epoch
             step = global_step % steps_per_epoch
+            # Step-0 only: offload the actor (releases optimizer+weights to
+            # CPU via release_memory_occupation when TMS is off) and fork vLLM
+            # engines onto the actor GPUs so they also serve the first rollout.
+            # Teardown happens right after prepare_batch collects the batch.
+            # See _should_use_step0_fork for the guards.
+            is_step0_fork = self._should_use_step0_fork(
+                global_step, start_step, streaming_batch_count, workflow
+            )
+            if is_step0_fork:
+                self._start_step0_fork(global_step)
 
             # Keep every chunk for the full-batch critic update and cleanup.
             accumulated_rollout_batch: list[dict[str, Any]] = []
@@ -813,6 +1001,12 @@ class PPOTrainer:
                         group_size=config.gconfig.n_samples,
                         dynamic_bs=self.config.dynamic_bs,
                     )
+                # Reclaim in-flight requests from the fork engines (abort +
+                # redispatch to surviving engines), tear them down, and onload
+                # the actor back before training needs it (compute_logp below).
+                if is_step0_fork:
+                    self._reclaim_step0_fork(rollout_batch)
+
                 if self._should_offload_rollout:
                     self._offload_rollout()
 
@@ -1320,6 +1514,13 @@ class PPOTrainer:
                 train_data_parallel_size=self.actor_alloc.parallel.dp_size
             )
             return engine
+
+        # Cache server_args so the step-0 actor-GPU fork can reuse the same
+        # vLLM launch configuration (model path, parallelism, mem util, ...).
+        # Only the (non-eval) rollout call; eval-rollout reuses the same vllm
+        # config but we keep the canonical one.
+        if not is_eval:
+            self._rollout_server_args = server_args
 
         # Single-controller mode - no engine instantiation needed
         if config._version == "v2":

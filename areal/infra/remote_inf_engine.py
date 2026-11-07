@@ -48,6 +48,8 @@ from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.fork_constants import FORK_CONTINUE_FIELD
+from areal.utils.fork_continuation import ForkContinuationWorkflow
 from areal.utils.network import (
     find_free_ports,
     format_hostport,
@@ -84,9 +86,40 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
 
-        results = await asyncio.gather(
-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
+        # Fork-continuation re-entry: the controller injects FORK_CONTINUE_FIELD
+        # as a list of per-sample partials. Distribute the i-th partial to the
+        # i-th sample so all samples of one input resume on the same surviving
+        # engine (rid affinity is preserved per-sample inside the workflow).
+        # Isolated in ForkContinuationWorkflow; this branch is inert for normal
+        # tasks (no FORK_CONTINUE_FIELD in data).
+        cont_list = data.get(FORK_CONTINUE_FIELD) if isinstance(data, dict) else None
+        if cont_list is not None:
+            results = await asyncio.gather(
+                *[
+                    ForkContinuationWorkflow.arun_one_with_continue(
+                        self.workflow, engine, data, cont_list[i]
+                    )
+                    for i in range(self.group_size)
+                ]
+            )
+        else:
+            results = await asyncio.gather(
+                *[
+                    self.workflow.arun_episode(engine, data)
+                    for _ in range(self.group_size)
+                ]
+            )
+
+        # Fork-teardown eviction: if any sample returned a continuation
+        # descriptor (evicted mid-generation), surface the group's descriptors +
+        # already-complete rollouts for the controller to re-merge into one full
+        # n_samples group. Isolated in ForkContinuationWorkflow; returns None
+        # when no descriptors, so the normal merge below runs.
+        surfaced = ForkContinuationWorkflow.surface_group_descriptor(
+            results, self.logger
         )
+        if surfaced is not None:
+            return surfaced
 
         valid_results = [r for r in results if r is not None]
 
@@ -379,6 +412,12 @@ class RemoteInfEngine(InferenceEngine):
         self.server_idx = 0
 
         self._version = 0
+
+        # Fork-teardown eviction flag (step-0 actor-GPU fork only). When set,
+        # in-flight agenerate loops break out and return their accumulated
+        # partial tokens (stop_reason="abort") so the controller can resume
+        # generation on a surviving engine instead of losing the partial work.
+        self._evicting = False
 
         self.lock = Lock()
         # Serialize Awex init so concurrent updates do not double-init the remote engine.
@@ -1042,8 +1081,20 @@ class RemoteInfEngine(InferenceEngine):
                 len(req.input_ids),
             )
 
+            # Fork-teardown eviction: stop continuing on this (doomed) server.
+            # Return the accumulated partial tokens so the controller can resume
+            # generation on a surviving engine (reusing this same prefix). Under
+            # normal operation _evicting is always False, so this is inert.
+            if self._evicting:
+                self.logger.info(
+                    f"[step0-fork] rid={req.rid}: evicted mid-generation, "
+                    f"returning partial tokens={len(accumulated_output_tokens)} "
+                    f"remaining={ori_max_new_tokens - len(accumulated_output_tokens)}"
+                )
+                break
+
         # Final abort handling
-        if stop_reason == "abort":
+        if stop_reason == "abort" and not self._evicting:
             # If stop_reason is "abort", the only reason we exit the loop is
             # len(accumulated_output_tokens) >= gconfig.max_new_tokens
             # so the actual reason is length
@@ -1455,6 +1506,24 @@ class RemoteInfEngine(InferenceEngine):
     def resume(self):
         """Resume request submission for async rollout."""
         return self.workflow_executor.resume()
+
+    def evict(self):
+        """Evict in-flight generation on a fork engine (step-0 teardown).
+
+        Sets the eviction flag and aborts in-flight vLLM requests
+        (``pause_generation``). Each in-flight ``agenerate`` loop, once it
+        receives the abort response and accumulates the partial tokens, breaks
+        out and returns a ``ModelResponse`` with ``stop_reason="abort"`` plus
+        the partial output. The controller then resumes those partials on a
+        surviving engine. Inert on non-fork engines (``_evicting`` is only set
+        here, which is only called on actor-GPU fork engines).
+        """
+        self._evicting = True
+        self.logger.info(
+            "[step0-fork] fork engine evict: flag set, aborting in-flight vLLM "
+            "requests (partial tokens will be returned for continuation)"
+        )
+        self.pause_generation()
 
     def offload(self) -> None:
         """Offload model memory on all servers."""

@@ -617,6 +617,11 @@ class RemotevLLMEngine(InferenceEngine):
     def continue_generation(self):
         return self._engine.continue_generation()
 
+    def evict(self):
+        # Step-0 fork-teardown eviction: delegate to the wrapped RemoteInfEngine,
+        # which sets the eviction flag and aborts in-flight vLLM requests.
+        return self._engine.evict()
+
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
         return self._engine.launch_server(server_args)
 

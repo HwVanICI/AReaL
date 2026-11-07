@@ -38,6 +38,7 @@ from areal.experimental.openai.types import (
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import cycle_dataloader
+from areal.utils.fork_constants import FORK_CONTINUATION_KEY
 from areal.utils.perf_tracer import trace_perf, trace_session_event
 from logging import Logger
 
@@ -291,6 +292,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
         # Unbounded deques for producer/consumer pattern
         self._pending_inputs: deque[TInput] = deque()
+        # Priority queue: tasks here bypass the staleness capacity gate (still
+        # respect pause + runner queue size). Pulled before _pending_inputs.
+        self._pending_priority_inputs: deque[TInput] = deque()
         self._pending_results: dict[int, TimedResult[TResult]] = {}
         self._active_task_ids: set[int] = set()
 
@@ -376,11 +380,22 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         self.logger.info(f"Submit rollout. {self._rollout_stats()}")
                 except TaskQueueFullError:
                     with self._input_cv:
-                        self._pending_inputs.appendleft(task_input)
+                        # Preserve priority on push-back so a priority task
+                        # does not get demoted behind normal inputs.
+                        if getattr(task_input, "priority", False):
+                            self._pending_priority_inputs.appendleft(task_input)
+                        else:
+                            self._pending_inputs.appendleft(task_input)
                         self._input_cv.wait_for(
                             lambda: (
                                 self._shutdown_event.is_set()
                                 or self._has_runner_capacity()
+                                or (
+                                    getattr(task_input, "priority", False)
+                                    and not self.runner.paused.is_set()
+                                    and self.runner.get_input_queue_size()
+                                    < self.runner.max_queue_size
+                                )
                             )
                         )
                     # Allow other threads to make progress before retrying
@@ -438,7 +453,17 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         with self._input_cv:
             while not self._shutdown_event.is_set():
                 self._check_thread_exception()
-                # There is capacity and pending inputs
+                # Priority tasks first: bypass the staleness capacity gate
+                # (still respect pause + runner input queue size so the runner
+                # is not overfed). Used for step-0 fork continuation re-submits
+                # so they run at version 0 instead of being starved by overlap.
+                if (
+                    self._pending_priority_inputs
+                    and not self.runner.paused.is_set()
+                    and self.runner.get_input_queue_size() < self.runner.max_queue_size
+                ):
+                    return self._pending_priority_inputs.popleft()
+                # Normal path: staleness capacity + pending inputs
                 if (
                     not self.runner.paused.is_set()
                     and self.staleness_manager.get_capacity() > 0
@@ -532,11 +557,16 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         Parameters
         ----------
         task_input : TInput
-            Task input to be processed.
+            Task input to be processed. If it has a truthy ``priority``
+            attribute, it is enqueued to the priority deque and bypasses the
+            staleness capacity gate.
         """
         self._check_thread_exception()
         with self._input_cv:
-            self._pending_inputs.append(task_input)
+            if getattr(task_input, "priority", False):
+                self._pending_priority_inputs.append(task_input)
+            else:
+                self._pending_inputs.append(task_input)
             self.staleness_manager.on_rollout_enqueued()
             if self.enable_tracing:
                 self.logger.info(f"Enqueue rollout. {self._rollout_stats()}")
@@ -1151,6 +1181,27 @@ class WorkflowExecutor:
                 traj = await pending_task.workflow.arun_episode(
                     self.inference_engine, pending_task.data
                 )
+
+                # Fork-eviction continuation descriptor: not a training trajectory.
+                # Bypass format check + should_accept_fn + dump (which would reject
+                # or raise on the non-trajectory shape, silently losing the partial).
+                # Pass through as-is; the controller's post_process_result routes it
+                # to on_task_evicted (deposit) for reclaim to re-submit as a
+                # continuation. Engine-side staleness is weakened in controller-managed
+                # mode; the controller re-accounts it as rejected via on_task_evicted.
+                if (
+                    traj is not None
+                    and isinstance(traj, dict)
+                    and FORK_CONTINUATION_KEY in traj
+                ):
+                    manager.on_rollout_accepted()
+                    stats_tracker.get("rollout").scalar(accepted=1)
+                    trace_session_event(
+                        "mark_finalized",
+                        task_id=task_id,
+                        status="accepted",
+                    )
+                    return _RolloutResult(task_id=task_id, trajectory=traj)
 
                 # Trajectory format checking
                 if self.config.check_trajectory_format and traj is not None:

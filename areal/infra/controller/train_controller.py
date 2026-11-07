@@ -251,6 +251,15 @@ class TrainController:
     def cpu_group(self):
         return None
 
+    @property
+    def worker_role(self) -> str:
+        """The role name this controller's workers were created under.
+
+        Exposed so the trainer can fork engines onto these workers (e.g.
+        the step-0 actor-GPU inference fork targets the actor role).
+        """
+        return self._worker_role
+
     def initialize(
         self,
         role: str,
