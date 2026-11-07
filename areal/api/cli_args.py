@@ -2432,6 +2432,21 @@ class InferenceEngineConfig:
             "Currently only used by the RolloutController."
         },
     )
+    enable_actor_gpu_rollout: bool = field(
+        default=False,
+        metadata={
+            "help": "Step-0 only (separation deployment, single-controller): after the actor is "
+            "scheduled, offload actor GPU memory and fork vLLM rollout engines onto the actor "
+            "GPUs so they also serve inference during the first rollout. In-flight requests on "
+            "fork engines are aborted and redispatched (async) to surviving engines before "
+            "teardown. Megatron actor + vLLM rollout + Ray only. Each fork instance mirrors one "
+            "rollout vLLM server (the launch command's data_parallel_size x "
+            "tensor_parallel_size x pipeline_parallel_size GPUs; in the inference EP scenario "
+            "EP size = data_parallel_size x tensor_parallel_size == one instance). The number of "
+            "fork instances is actor_world_size // instance_gpus. Auto-disabled if that division "
+            "is not exact."
+        },
+    )
     use_lora: bool = field(
         default=False,
         metadata={"help": "Whether to use LoRA. Should be same as actors LORA option."},
