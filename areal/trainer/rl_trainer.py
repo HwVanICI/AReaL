@@ -464,7 +464,7 @@ class PPOTrainer:
             current_platform.device_type == "npu"
             and config.vllm.quantization == "ascend"
         ):
-            self.weight_update_meta.online_quantization = "ascend"
+            self.weight_update_meta.ascend_online_quantization = True
 
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
 
@@ -502,7 +502,7 @@ class PPOTrainer:
 
         if (
             config.vllm.load_format == "dummy"
-            and self.weight_update_meta.online_quantization == "ascend"
+            and self.weight_update_meta.ascend_online_quantization
             and self.recover_info is None
         ):
             initial_version = self.actor.get_version()
@@ -1563,7 +1563,9 @@ class PPOTrainer:
             if self.config.actor.dtype != "bfloat16":
                 raise ValueError("Online Ascend FP8 rollout requires a BF16 actor")
             if self.config.vllm.dtype != "bfloat16":
-                raise ValueError("Online Ascend FP8 rollout requires vllm.dtype=bfloat16")
+                raise ValueError(
+                    "Online Ascend FP8 rollout requires vllm.dtype=bfloat16"
+                )
             if (
                 actor_backend == "megatron"
                 and self.config.actor.megatron.fp8_config is not None

@@ -30,9 +30,7 @@ class AwexMegatronWriterAdapter:
         self.hf_config = engine.hf_config
         self.model = engine.model
         self.engine_name = "mcore"
-        self.enable_ascend_mxfp8 = (
-            getattr(meta, "online_quantization", None) == "ascend"
-        )
+        self.enable_ascend_mxfp8 = getattr(meta, "ascend_online_quantization", False)
         self.global_step = -1
 
         self.meta_server_addr = meta.meta_server_addr or ""

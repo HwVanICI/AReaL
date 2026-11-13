@@ -128,6 +128,10 @@ from areal.utils.data import (
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
+from areal.utils.mxfp8 import (
+    iter_ascend_mxfp8_payloads,
+    merge_ascend_mxfp8_descriptions,
+)
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
@@ -1391,7 +1395,7 @@ class FSDPEngine(TrainEngine):
 
         bucket_meta = (
             dataclasses.replace(meta, is_last_bucket=is_last_bucket)
-            if meta.online_quantization == "ascend"
+            if meta.ascend_online_quantization
             else meta
         )
 
@@ -1533,7 +1537,11 @@ class FSDPEngine(TrainEngine):
                 self.weight_update_groups = [pg]
                 self.weight_update_group = pg
 
-                fut.result()
+                description = fut.result()
+                if meta.ascend_online_quantization:
+                    self._ascend_mxfp8_description = merge_ascend_mxfp8_descriptions(
+                        [description]
+                    )
                 self.logger.info(f"Weight update group '{group_name}' initialized.")
 
     def _init_per_pp_weight_update_groups(
@@ -1617,7 +1625,7 @@ class FSDPEngine(TrainEngine):
         )
 
         main_rank = dist.get_rank() == 0
-        ascend_online = meta.online_quantization == "ascend"
+        ascend_online = meta.ascend_online_quantization
         if ascend_online:
             meta.pp_rank = 0
             meta.pp_world_size = 1
@@ -1685,8 +1693,16 @@ class FSDPEngine(TrainEngine):
                     named_tensors = []
                     buffer_size = 0
 
+                if ascend_online:
+                    named_tensors.extend(
+                        iter_ascend_mxfp8_payloads(
+                            [(name, tensor)], self._ascend_mxfp8_description
+                        )
+                    )
+                    del tensor
+                else:
+                    named_tensors.append((name, tensor))
                 buffer_size += tensor_size
-                named_tensors.append((name, tensor))
 
             if pending_bucket:
                 self._wait_pending_weight_update_bucket(pending_bucket)

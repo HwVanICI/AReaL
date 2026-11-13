@@ -86,6 +86,7 @@ class UpdateGroupRequest(OpenAIBaseModel):
     world_size: int
     backend: str
     group_name: str
+    ascend_online_quantization: bool = False
 
 
 class UpdateWeightsFromXcclRequest(OpenAIBaseModel):
@@ -101,7 +102,7 @@ class UpdateWeightBucketRequest(OpenAIBaseModel):
     shapes: list[list[int]] | None = None
     group_name: str | None = None
     is_last_bucket: bool = False
-    online_quantization: str | None = None
+    ascend_online_quantization: bool = False
     version: int | None = None
     pp_rank: int = 0
     pp_world_size: int = 1
@@ -311,14 +312,12 @@ async def _handle_ascend_mxfp8_xccl(
                     request.group_name,
                     request.version,
                     restore,
-                    "ascend",
+                    True,
                 ),
             )
         except Exception as exc:
             transaction["status"] = "FAILED"
-            return to_json_response(
-                False, f"Ascend weight bucket failed: {exc}"
-            )
+            return to_json_response(False, f"Ascend weight bucket failed: {exc}")
         if not all(result[0] for result in ret_list):
             transaction["status"] = "FAILED"
             return build_response(ret_list)
@@ -327,10 +326,7 @@ async def _handle_ascend_mxfp8_xccl(
         if request.is_last_bucket:
             transaction["completed_stages"].add(request.pp_rank)
 
-        if (
-            len(transaction["completed_stages"])
-            == transaction["pp_world_size"]
-        ):
+        if len(transaction["completed_stages"]) == transaction["pp_world_size"]:
             try:
                 finalize_results = await llm.collective_rpc(
                     "areal_finalize_mxfp8_update",
@@ -355,8 +351,8 @@ async def areal_update_weight_xccl(
 ):
     logger.info("API server starts areal_update_weight_xccl")
     llm = raw_request.app.state.engine_client
-    use_online_quantization = request.online_quantization == "ascend"
-    if not use_online_quantization:
+    use_ascend_online_quantization = request.ascend_online_quantization
+    if not use_ascend_online_quantization:
         await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
         await llm.reset_mm_cache()
         try:
@@ -365,9 +361,7 @@ async def areal_update_weight_xccl(
             await llm.resume_generation()
         return build_response(ret_list)
 
-    return await _handle_ascend_mxfp8_xccl(
-        request=request, raw_request=raw_request
-    )
+    return await _handle_ascend_mxfp8_xccl(request=request, raw_request=raw_request)
 
 
 @router.post("/areal_update_weights_lora_xccl")
@@ -409,8 +403,14 @@ async def areal_init_weights_update_group(
             request.world_size,
             request.backend,
             request.group_name,
+            request.ascend_online_quantization,
         ),
     )
+    if request.ascend_online_quantization and all(ret[0] for ret in ret_list):
+        from areal.utils.mxfp8 import merge_ascend_mxfp8_descriptions
+
+        description = merge_ascend_mxfp8_descriptions(ret[1] for ret in ret_list)
+        return JSONResponse({"success": True, "ascend_mxfp8": description})
     return build_response(ret_list)
 
 

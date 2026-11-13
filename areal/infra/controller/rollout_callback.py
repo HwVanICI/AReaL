@@ -100,7 +100,7 @@ class RolloutCallback:
         http_future.add_done_callback(on_done)
         return result_future
 
-    def init_weights_update_group(self, meta: WeightUpdateMeta) -> Future[None]:
+    def init_weights_update_group(self, meta: WeightUpdateMeta) -> Future[dict | None]:
         """Callback to controller to initialize weight update group on inference side.
 
         This method is NON-BLOCKING. It starts the HTTP request in a background
@@ -114,10 +114,17 @@ class RolloutCallback:
 
         Returns
         -------
-        Future[None]
-            Future that completes when controller finishes initialization
+        Future[dict | None]
+            Ascend MXFP8 description, or None for other initialization paths.
         """
         payload = {"meta": serialize_value(meta)}
+        if meta.ascend_online_quantization:
+
+            def initialize():
+                response = self._post("/callback/init_weights_group", payload)
+                return response["ascend_mxfp8"]
+
+            return get_executor().submit(initialize)
         return self._post_nowait_void("/callback/init_weights_group", payload)
 
     def update_weights_from_distributed(

@@ -38,12 +38,8 @@ def _assume_weight_is_owned_by_local_pp_stage(monkeypatch):
         "is_pp_missing_parameter",
         lambda _name, _model: False,
     )
-    monkeypatch.setattr(
-        ascend_mxfp8, "AscendW8A8MXFP8DynamicLinearMethod", _Scheme
-    )
-    monkeypatch.setattr(
-        ascend_mxfp8, "AscendW8A8MXFP8DynamicFusedMoEMethod", _Scheme
-    )
+    monkeypatch.setattr(ascend_mxfp8, "AscendW8A8MXFP8DynamicLinearMethod", _Scheme)
+    monkeypatch.setattr(ascend_mxfp8, "AscendW8A8MXFP8DynamicFusedMoEMethod", _Scheme)
 
 
 class _Scheme:
@@ -192,15 +188,19 @@ def test_vllm_ascend_bucket_uses_atomic_request_metadata():
         type="xccl",
         nccl_group_name="weight-update",
         is_last_bucket=True,
-        online_quantization="ascend",
+        ascend_online_quantization=True,
         version=7,
         pp_rank=1,
         pp_world_size=2,
     )
-    requests = VLLMBackend().build_distributed_weight_update_requests(
-        meta,
-        [ParamSpec(name="model.weight", shape=(2, 2), dtype="bfloat16")],
-    ).requests
+    requests = (
+        VLLMBackend()
+        .build_distributed_weight_update_requests(
+            meta,
+            [ParamSpec(name="model.weight", shape=(2, 2), dtype="bfloat16")],
+        )
+        .requests
+    )
 
     assert len(requests) == 1
     request = requests[0]
@@ -211,7 +211,7 @@ def test_vllm_ascend_bucket_uses_atomic_request_metadata():
         "shapes": [(2, 2)],
         "group_name": "weight-update",
         "is_last_bucket": True,
-        "online_quantization": "ascend",
+        "ascend_online_quantization": True,
         "version": 7,
         "pp_rank": 1,
         "pp_world_size": 2,
@@ -263,6 +263,7 @@ def test_fsdp_ascend_sends_completion_metadata_only_with_final_bucket(
     engine._cpu_group = object()
     engine.config = SimpleNamespace(use_lora=False, dtype="bfloat16")
     engine.rollout_engine = _Rollout()
+    engine._ascend_mxfp8_description = {"group_size": 32, "weights": {}}
     tensors = [
         ("model.first", torch.ones(2, 2, dtype=torch.bfloat16)),
         ("model.last", torch.ones(2, 2, dtype=torch.bfloat16)),
@@ -281,7 +282,7 @@ def test_fsdp_ascend_sends_completion_metadata_only_with_final_bucket(
 
     meta = WeightUpdateMeta(
         type="xccl",
-        online_quantization="ascend",
+        ascend_online_quantization=True,
         version=7,
         weight_chunked_mem_mb=0,
     )
@@ -307,26 +308,10 @@ def test_load_mxfp8_weights_maps_packed_linear_weight_and_scale(monkeypatch):
         model=model,
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(dtype=torch.bfloat16),
-            quant_config=SimpleNamespace(
-                quant_description={"group_size": 32}
-            ),
+            quant_config=SimpleNamespace(quant_description={"group_size": 32}),
         ),
     )
 
-    def _npu_dynamic_mx_quant(tensor, **_kwargs):
-        return (
-            tensor.to(torch.float8_e4m3fn),
-            torch.ones(8, 1, 1, dtype=torch.uint8),
-        )
-
-    monkeypatch.setattr(
-        torch_npu,
-        "npu_dynamic_mx_quant",
-        _npu_dynamic_mx_quant,
-    )
-    monkeypatch.setattr(
-        torch_npu, "float8_e4m3fn", torch.float8_e4m3fn
-    )
     monkeypatch.setattr(ascend_mxfp8, "LinearBase", _Linear)
     monkeypatch.setattr(ascend_mxfp8, "FusedMoE", ())
 
@@ -335,7 +320,8 @@ def test_load_mxfp8_weights_maps_packed_linear_weight_and_scale(monkeypatch):
     norm_weight = torch.ones(32, dtype=torch.bfloat16)
     ascend_mxfp8.load_mxfp8_weights(
         [
-            (weight_name, torch.ones(8, 32, dtype=torch.bfloat16)),
+            (weight_name, torch.ones(8, 32).to(torch.float8_e4m3fn).view(torch.uint8)),
+            (weight_name + "_scale", torch.ones(8, 1, dtype=torch.uint8)),
             (norm_name, norm_weight),
         ],
         runner,
@@ -349,30 +335,16 @@ def test_load_mxfp8_weights_maps_packed_linear_weight_and_scale(monkeypatch):
     assert loaded[norm_name] is norm_weight
 
 
-def test_load_mxfp8_weights_quantizes_moe_weights_and_scales(monkeypatch):
+def test_load_mxfp8_weights_decodes_moe_weights_and_scales(monkeypatch):
     model = _MoEModel()
     runner = SimpleNamespace(
         model=model,
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(dtype=torch.bfloat16),
-            quant_config=SimpleNamespace(
-                quant_description={"group_size": 32}
-            ),
+            quant_config=SimpleNamespace(quant_description={"group_size": 32}),
         ),
     )
 
-    def _npu_dynamic_mx_quant(tensor, *, axis, dst_type):
-        scale_shape = (*tensor.shape[:-1], 1, 1)
-        return tensor.to(dst_type), torch.ones(scale_shape, dtype=torch.uint8)
-
-    monkeypatch.setattr(
-        torch_npu,
-        "npu_dynamic_mx_quant",
-        _npu_dynamic_mx_quant,
-    )
-    monkeypatch.setattr(
-        torch_npu, "float8_e4m3fn", torch.float8_e4m3fn
-    )
     monkeypatch.setattr(ascend_mxfp8, "LinearBase", _Linear)
     monkeypatch.setattr(ascend_mxfp8, "FusedMoE", _MoE)
 
@@ -380,8 +352,10 @@ def test_load_mxfp8_weights_quantizes_moe_weights_and_scales(monkeypatch):
     down = "model.layers.0.mlp.experts.0.down_proj.weight"
     ascend_mxfp8.load_mxfp8_weights(
         [
-            (gate, torch.ones(3, 32, dtype=torch.bfloat16)),
-            (down, torch.ones(5, 32, dtype=torch.bfloat16)),
+            (gate, torch.ones(3, 32).to(torch.float8_e4m3fn).view(torch.uint8)),
+            (gate + "_scale", torch.ones(3, 1, dtype=torch.uint8)),
+            (down, torch.ones(5, 32).to(torch.float8_e4m3fn).view(torch.uint8)),
+            (down + "_scale", torch.ones(5, 1, dtype=torch.uint8)),
         ],
         runner,
         restore=True,
@@ -407,9 +381,7 @@ def test_load_mxfp8_weights_skips_remote_pp_weight(monkeypatch):
         model=model,
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(dtype=torch.bfloat16),
-            quant_config=SimpleNamespace(
-                quant_description={"group_size": 32}
-            ),
+            quant_config=SimpleNamespace(quant_description={"group_size": 32}),
         ),
     )
 
@@ -432,17 +404,13 @@ def test_worker_restores_once_and_finalizes_once(monkeypatch):
     worker.model_runner = SimpleNamespace(
         model=_Model(),
         device=torch.device("cpu"),
-        vllm_config=SimpleNamespace(
-            model_config=SimpleNamespace(dtype=torch.bfloat16)
-        ),
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
     )
     worker.weight_update_groups = {"pp0": object(), "pp1": object()}
     restore_flags = []
     process_count = 0
 
-    monkeypatch.setattr(
-        ascend_mxfp8, "is_ascend_mxfp8", lambda _runner: True
-    )
+    monkeypatch.setattr(ascend_mxfp8, "is_ascend_mxfp8", lambda _runner: True)
     monkeypatch.setattr(
         vllm_worker_extension,
         "set_current_vllm_config",
@@ -475,7 +443,7 @@ def test_worker_restores_once_and_finalizes_once(monkeypatch):
         "pp0",
         1,
         True,
-        "ascend",
+        True,
     )
     worker.areal_update_weight_xccl(
         [],
@@ -484,14 +452,12 @@ def test_worker_restores_once_and_finalizes_once(monkeypatch):
         "pp1",
         1,
         False,
-        "ascend",
+        True,
     )
     assert process_count == 0
 
     worker.areal_finalize_mxfp8_update(1)
-    worker.areal_update_weight_xccl(
-        [], [], [], "pp0", 2, True, "ascend"
-    )
+    worker.areal_update_weight_xccl([], [], [], "pp0", 2, True, True)
 
     assert restore_flags == [True, False, True]
     assert process_count == 1
@@ -522,7 +488,7 @@ def test_server_finalizes_mxfp8_only_after_all_pp_stages_complete():
                 dtypes=[],
                 shapes=[],
                 group_name=f"pp{pp_rank}",
-                online_quantization="ascend",
+                ascend_online_quantization=True,
                 version=3,
                 pp_rank=pp_rank,
                 pp_world_size=pp_world_size,
@@ -531,8 +497,7 @@ def test_server_finalizes_mxfp8_only_after_all_pp_stages_complete():
             await areal_vllm_server.areal_update_weight_xccl(request, raw_request)
             if index < len(buckets) - 1:
                 assert not any(
-                    call[0] == "areal_finalize_mxfp8_update"
-                    for call in llm.calls
+                    call[0] == "areal_finalize_mxfp8_update" for call in llm.calls
                 )
 
     _run_with_generation_paused(_run())
@@ -540,8 +505,6 @@ def test_server_finalizes_mxfp8_only_after_all_pp_stages_complete():
     finalize_calls = [
         call for call in llm.calls if call[0] == "areal_finalize_mxfp8_update"
     ]
-    load_calls = [
-        call for call in llm.calls if call[0] == "areal_update_weight_xccl"
-    ]
+    load_calls = [call for call in llm.calls if call[0] == "areal_update_weight_xccl"]
     assert [call[1][5] for call in load_calls] == [True, False, False, False]
     assert finalize_calls == [("areal_finalize_mxfp8_update", (3,))]

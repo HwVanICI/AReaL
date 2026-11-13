@@ -184,6 +184,12 @@ vLLM-Ascend 预量化 checkpoint。 量化描述可以将归一化权重等非 M
 `W8A8_MXFP8`。当前在线 rollout 路径尚未处理 `FLOAT` FusedMoE 的权重重载布局生命周期， 因此不支持混用 `FLOAT` FusedMoE
 权重。
 
+使用 `actor.weight_update_mode: xccl` 时，Megatron 和 FSDP 在 XCCL 初始化阶段从已初始化的 vLLM
+模型获取一次量化描述， AReaL 不自行读取量化 JSON。actor 按原有流程集齐完整 HF 矩阵，量化选中的权重，再广播 FP8 字节视图和 uint8 scale；
+FLOAT 权重保留原 dtype。原有 bucket 流水保持不变，actor 保存的是量化后的 bucket 输出，而非完整 FP8 模型副本。 接收端使用 vLLM 原生
+loader 切分并加载 weight/scale，全部 bucket 和训练 PP stage 完成后统一转换推理布局。 推理侧 K 分片及偏移必须按 32 个元素对齐，当前
+MoE scale 布局还要求本地 K 能被 64 整除；N 分片无需按 32 对齐。
+
 使用 `actor.weight_update_mode: awex` 时，当前在线 MXFP8 路径要求使用 Megatron actor。原有 AWEX converter
 先将 actor 的 BF16 参数转换为逻辑矩阵，训练侧再量化为 FP8 权重和 uint8 E8M0 scale。AWEX
 沿用原有的重分片、通信与共卡流程，直接写入推理模型的权重和 scale，接收完成后统一执行 post-load。FP8 权重通过 uint8

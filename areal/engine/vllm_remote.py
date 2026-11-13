@@ -220,7 +220,7 @@ class VLLMBackend:
             "group_name": meta.nccl_group_name,
         }
 
-        if meta.online_quantization == "ascend":
+        if meta.ascend_online_quantization:
             if meta.version is None:
                 raise ValueError("Ascend online weight update requires version")
             return WeightUpdateRequests(
@@ -230,7 +230,7 @@ class VLLMBackend:
                         payload={
                             **base_payload,
                             "is_last_bucket": meta.is_last_bucket,
-                            "online_quantization": meta.online_quantization,
+                            "ascend_online_quantization": meta.ascend_online_quantization,
                             "version": meta.version,
                             "pp_rank": meta.pp_rank,
                             "pp_world_size": meta.pp_world_size,
@@ -290,6 +290,8 @@ class VLLMBackend:
             else current_platform.communication_backend,
             "group_name": meta.nccl_group_name,
         }
+        if meta.ascend_online_quantization:
+            payload["ascend_online_quantization"] = True
         return HttpRequest(endpoint="/areal_init_weights_update_group", payload=payload)
 
     def build_awex_init_request(
@@ -519,7 +521,7 @@ class RemotevLLMEngine(InferenceEngine):
 
     def init_weights_update_group(
         self, meta: WeightUpdateMeta, xccl_group_ranks: list[int] | None = None
-    ) -> Future[None]:
+    ) -> Future[dict | None]:
         """Initialize the weight update process group."""
         return self._engine.init_weights_update_group(
             meta, xccl_group_ranks=xccl_group_ranks

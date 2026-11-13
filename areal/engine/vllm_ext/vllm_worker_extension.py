@@ -196,26 +196,22 @@ class VLLMWorkerExtension:
         group_name: str | None = None,
         version: int | None = None,
         restore: bool = False,
-        online_quantization: str | None = None,
+        ascend_online_quantization: bool = False,
     ):
         logger.info("start update weights by nccl or hccl", flush=True)
         names = names if names is not None else self.areal_weight_meta_names
         dtypes = dtypes if dtypes is not None else self.areal_weight_meta_dtypes
         shapes = shapes if shapes is not None else self.areal_weight_meta_shapes
         group_name = (
-            group_name
-            if group_name is not None
-            else self.areal_weight_meta_group_name
+            group_name if group_name is not None else self.areal_weight_meta_group_name
         )
-        use_ascend_mxfp8 = online_quantization == "ascend"
+        use_ascend_mxfp8 = ascend_online_quantization
         if not use_ascend_mxfp8:
             undo_moe_postprocess_for_reload(self.model_runner.model)
         try:
             group = self.weight_update_groups[group_name]
         except KeyError:
-            raise KeyError(
-                f"Weight update group named `{group_name}` not found"
-            )
+            raise KeyError(f"Weight update group named `{group_name}` not found")
         try:
             if use_ascend_mxfp8:
                 from areal.engine.vllm_ext import ascend_mxfp8
@@ -243,9 +239,7 @@ class VLLMWorkerExtension:
             if use_ascend_mxfp8:
                 if version is None:
                     raise RuntimeError("Ascend online weight update requires version")
-                active_version = getattr(
-                    self, "areal_active_mxfp8_version", None
-                )
+                active_version = getattr(self, "areal_active_mxfp8_version", None)
                 if restore:
                     if active_version is not None:
                         raise RuntimeError(
@@ -256,9 +250,7 @@ class VLLMWorkerExtension:
                     raise RuntimeError(
                         f"Cannot load MXFP8 bucket for inactive version {version}"
                     )
-                if restore and not ascend_mxfp8.is_ascend_mxfp8(
-                    self.model_runner
-                ):
+                if restore and not ascend_mxfp8.is_ascend_mxfp8(self.model_runner):
                     raise RuntimeError(
                         "Ascend online quantization was requested for a non-MXFP8 worker"
                     )
@@ -271,10 +263,7 @@ class VLLMWorkerExtension:
                 if restore:
                     self.areal_active_mxfp8_version = version
 
-            if (
-                not use_ascend_mxfp8
-                and current_platform.device_type == "npu"
-            ):
+            if not use_ascend_mxfp8 and current_platform.device_type == "npu":
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     process_weights_after_loading(
                         self.model_runner.model,
@@ -294,9 +283,7 @@ class VLLMWorkerExtension:
     def areal_finalize_mxfp8_update(self, version: int):
         try:
             if getattr(self, "areal_active_mxfp8_version", None) != version:
-                raise RuntimeError(
-                    f"Cannot finalize unknown MXFP8 version {version}"
-                )
+                raise RuntimeError(f"Cannot finalize unknown MXFP8 version {version}")
             from areal.engine.vllm_ext import ascend_mxfp8
 
             with set_current_vllm_config(self.model_runner.vllm_config):
@@ -462,6 +449,7 @@ class VLLMWorkerExtension:
         world_size: int,
         backend: str,
         group_name: str,
+        ascend_online_quantization: bool = False,
     ):
         if not hasattr(self, "weight_update_groups"):
             self.weight_update_groups: dict[str, dist.ProcessGroup] = {}
@@ -487,6 +475,16 @@ class VLLMWorkerExtension:
                 timeout=DIST_GROUP_DEFAULT_TIMEOUT,
             )
             self.weight_update_groups[group_name] = group
+            if ascend_online_quantization:
+                from areal.engine.vllm_ext.ascend_mxfp8 import (
+                    get_ascend_mxfp8_description,
+                )
+
+                if not hasattr(self, "_areal_ascend_mxfp8_description"):
+                    self._areal_ascend_mxfp8_description = get_ascend_mxfp8_description(
+                        self.model_runner
+                    )
+                return True, self._areal_ascend_mxfp8_description
             return True, "Success"
         except Exception as e:
             error_msg = f"Failed to init group! {e}."

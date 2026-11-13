@@ -13,6 +13,7 @@ import math
 import os
 import re
 import struct
+from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
@@ -172,6 +173,10 @@ from areal.utils.data import (
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
 from areal.utils.lock import DistributedLock
+from areal.utils.mxfp8 import (
+    iter_ascend_mxfp8_payloads,
+    merge_ascend_mxfp8_descriptions,
+)
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
@@ -2210,7 +2215,7 @@ class MegatronEngine(TrainEngine):
 
         bucket_meta = (
             dataclasses.replace(meta, is_last_bucket=is_last_bucket)
-            if meta.online_quantization == "ascend"
+            if meta.ascend_online_quantization
             else meta
         )
         fut = self.rollout_engine.update_weights_from_distributed(
@@ -2250,7 +2255,7 @@ class MegatronEngine(TrainEngine):
     ) -> None:
         """Commit a PP stage that produced no final payload bucket."""
         if (
-            meta.online_quantization != "ascend"
+            not meta.ascend_online_quantization
             or not self.is_pipeline_parallel_head()
             or stage_finished
         ):
@@ -2261,9 +2266,7 @@ class MegatronEngine(TrainEngine):
                 meta,
                 is_last_bucket=True,
             )
-            self.rollout_engine.update_weights_from_distributed(
-                stage_meta, []
-            ).result()
+            self.rollout_engine.update_weights_from_distributed(stage_meta, []).result()
         finally:
             self.engine_lock.release()
 
@@ -2340,16 +2343,17 @@ class MegatronEngine(TrainEngine):
             self._update_bucket_weights_from_distributed(meta, converted_named_tensors)
             buffer_size = 0
 
+        converted = convert_to_hf(
+            self.tf_config,
+            self.hf_config.model_type,
+            name,
+            param,
+            quantization_config=self.quantization_config,
+            fp8_direct_convert=self.fp8_direct_convert,
+            hf_config=self.hf_config,
+        )
         converted_named_tensors.extend(
-            convert_to_hf(
-                self.tf_config,
-                self.hf_config.model_type,
-                name,
-                param,
-                quantization_config=self.quantization_config,
-                fp8_direct_convert=self.fp8_direct_convert,
-                hf_config=self.hf_config,
-            )
+            self._prepare_ascend_mxfp8_weights(meta, converted)
         )
         buffer_size += param_size
         return buffer_size
@@ -2410,27 +2414,36 @@ class MegatronEngine(TrainEngine):
         if not self.is_pipeline_parallel_head():
             return False
 
-        gathered_params = sum(gathered_params, [])
+        gathered_params = deque(sum(gathered_params, []))
+        del params
 
         converted_hf_tensors = []
-        for name, param in gathered_params:
-            converted_hf_tensors.extend(
-                convert_to_hf(
-                    self.tf_config,
-                    self.hf_config.model_type,
-                    name,
-                    param,
-                    quantization_config=self.quantization_config,
-                    fp8_direct_convert=self.fp8_direct_convert,
-                    hf_config=self.hf_config,
-                )
+        while gathered_params:
+            name, param = gathered_params.popleft()
+            converted = convert_to_hf(
+                self.tf_config,
+                self.hf_config.model_type,
+                name,
+                param,
+                quantization_config=self.quantization_config,
+                fp8_direct_convert=self.fp8_direct_convert,
+                hf_config=self.hf_config,
             )
+            converted_hf_tensors.extend(
+                self._prepare_ascend_mxfp8_weights(meta, converted)
+            )
+            del param, converted
 
         sent_payload = bool(converted_hf_tensors)
         self._update_bucket_weights_from_distributed(
             meta, converted_hf_tensors, is_last_bucket=is_last_bucket
         )
         return sent_payload
+
+    def _prepare_ascend_mxfp8_weights(self, meta, weights):
+        if not meta.ascend_online_quantization:
+            return weights
+        return list(iter_ascend_mxfp8_payloads(weights, self._ascend_mxfp8_description))
 
     def _impl_update_expert_weight_from_distributed(
         self,
@@ -2473,7 +2486,7 @@ class MegatronEngine(TrainEngine):
             self.bridge_cls == "megatron-bridge"
             and self.mcore_config.use_bridge_for_update_weights
             and not self.quantization_config
-            and meta.online_quantization != "ascend"
+            and not meta.ascend_online_quantization
         )
 
         # NOTE: Processes launched with torchrun will set the following env var to True,
@@ -2600,7 +2613,11 @@ class MegatronEngine(TrainEngine):
                         timeout=DIST_GROUP_DEFAULT_TIMEOUT,
                     )
 
-                    fut.result()
+                    description = fut.result()
+                    if meta.ascend_online_quantization:
+                        self._ascend_mxfp8_description = (
+                            merge_ascend_mxfp8_descriptions([description])
+                        )
                 finally:
                     self.engine_lock.release()
             else:
@@ -2614,7 +2631,7 @@ class MegatronEngine(TrainEngine):
         meta.nccl_master_port = self.weight_update_master_port
         meta.nccl_group_name = self.weight_update_group_name
 
-        ascend_online = meta.online_quantization == "ascend"
+        ascend_online = meta.ascend_online_quantization
         if ascend_online:
             meta.pp_rank = mpu.get_pipeline_model_parallel_rank()
             meta.pp_world_size = mpu.get_pipeline_model_parallel_world_size()
@@ -2630,7 +2647,7 @@ class MegatronEngine(TrainEngine):
             self.bridge_cls == "megatron-bridge"
             and self.mcore_config.use_bridge_for_update_weights
             and not self.quantization_config
-            and meta.online_quantization != "ascend"
+            and not meta.ascend_online_quantization
         )
         if self.config.use_lora:
             assert use_bridge
@@ -2942,9 +2959,7 @@ class MegatronEngine(TrainEngine):
                     "num_layers_at_start_in_bf16": (
                         fp8_config.num_layers_at_start_in_bf16
                     ),
-                    "num_layers_at_end_in_bf16": (
-                        fp8_config.num_layers_at_end_in_bf16
-                    ),
+                    "num_layers_at_end_in_bf16": (fp8_config.num_layers_at_end_in_bf16),
                     "transformer_impl": "transformer_engine",
                 }
             )

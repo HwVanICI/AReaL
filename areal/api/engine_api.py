@@ -634,7 +634,7 @@ class InferenceEngine(abc.ABC):
 
     def init_weights_update_group(
         self, meta: WeightUpdateMeta, rank_ids: list[int] | None = None
-    ) -> Future[None]:
+    ) -> Future[dict | None]:
         """Initialize the weight update process group for distributed weight updates.
 
         This method should be called before performing any weight updates to ensure
@@ -658,8 +658,8 @@ class InferenceEngine(abc.ABC):
 
         Returns
         -------
-        Future[None]
-            A future object representing the asynchronous initialization operation.
+        Future[dict | None]
+            Ascend MXFP8 description, or None for other initialization paths.
         """
         raise NotImplementedError()
 

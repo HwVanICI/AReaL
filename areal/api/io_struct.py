@@ -207,11 +207,11 @@ class WeightUpdateMeta:
 
     version: int | None = None
 
-    # Internal per-bucket metadata used by online rollout quantization.
+    # Internal metadata used by Ascend online rollout quantization.
     # ``is_last_bucket`` is local to the current sender/pp_rank. A complete
     # update is committed only after every sender reports its last bucket.
     is_last_bucket: bool = False
-    online_quantization: str | None = None
+    ascend_online_quantization: bool = False
     pp_rank: int = 0
     pp_world_size: int = 1
 

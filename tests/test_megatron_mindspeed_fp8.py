@@ -189,12 +189,8 @@ def test_megatron_ascend_marks_dense_or_expert_final_bucket(
         "broadcast",
         lambda *_args, **_kwargs: _Handle(),
     )
-    monkeypatch.setattr(
-        megatron_engine.dist, "get_rank", lambda: 1
-    )
-    monkeypatch.setattr(
-        megatron_engine.dist, "barrier", lambda *_args, **_kwargs: None
-    )
+    monkeypatch.setattr(megatron_engine.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(megatron_engine.dist, "barrier", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         megatron_engine.mpu, "get_pipeline_model_parallel_rank", lambda: 1
     )
@@ -203,13 +199,9 @@ def test_megatron_ascend_marks_dense_or_expert_final_bucket(
         "get_pipeline_model_parallel_world_size",
         lambda: 2,
     )
-    monkeypatch.setattr(
-        megatron_engine.current_platform, "synchronize", lambda: None
-    )
+    monkeypatch.setattr(megatron_engine.current_platform, "synchronize", lambda: None)
 
-    meta = WeightUpdateMeta(
-        type="xccl", online_quantization="ascend", version=11
-    )
+    meta = WeightUpdateMeta(type="xccl", ascend_online_quantization=True, version=11)
     engine._update_weights_from_distributed(meta)
 
     assert [bucket[0] for bucket in captured] == expected_last_flags

@@ -13,7 +13,6 @@ from vllm_ascend.quantization.methods.w8a8_mxfp8 import (
 from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
 
 from areal.infra.platforms import current_platform
-from areal.utils.mxfp8 import quantize_mxfp8_tensor
 
 
 def is_ascend_mxfp8(model_runner) -> bool:
@@ -193,6 +192,82 @@ def iter_mxfp8_modules(
             yield name, module, scheme
 
 
+def _validate_loading_shapes(name, module, weight_name, scale_name, *, moe=False):
+    original = getattr(module, "_mxfp8_original_shapes", {})
+    if getattr(module, "_mxfp8_transformed", False) and not original:
+        raise ValueError(f"Ascend MXFP8 {name}: missing original loading shapes")
+    weight = getattr(module, weight_name)
+    scale = getattr(module, scale_name)
+    shape = tuple(original.get(weight_name, weight.shape))
+    scale_shape = tuple(original.get(scale_name, scale.shape))
+    k = shape[-1]
+    # Row-parallel shards start at tp_rank * local K. N shards and EP do not
+    # divide quantization groups. Use actual local shapes, not config guesses.
+    offset = k * getattr(module, "tp_rank", 0)
+    if k <= 0 or k % 32 or offset % 32 or (moe and k % 64):
+        alignment = 64 if moe else 32
+        raise ValueError(
+            f"Ascend MXFP8 {name}: local K={k}, offset={offset}; "
+            f"requires K divisible by {alignment} and aligned 32-element groups"
+        )
+    if (
+        weight.dtype != torch.float8_e4m3fn
+        or scale.dtype != torch.uint8
+        or scale_shape != (*shape[:-1], k // 32)
+    ):
+        raise ValueError(
+            f"Ascend MXFP8 {name}: incompatible weight/scale loading shapes"
+        )
+
+
+def get_ascend_mxfp8_description(model_runner) -> dict:
+    """Describe actual initialized modules in HF names, without reading JSON."""
+    if not is_ascend_mxfp8(model_runner):
+        raise ValueError("Ascend MXFP8 transfer requires an initialized MXFP8 model")
+    model = model_runner.model
+    quantized = {name for name, _, _ in iter_mxfp8_modules(model)}
+    packed = getattr(model, "packed_modules_mapping", {})
+    policies = {}
+    described = set()
+    for name, module in model.named_modules():
+        if isinstance(module, LinearBase):
+            parent, _, leaf = name.rpartition(".")
+            names = [
+                f"{parent + '.' if parent else ''}{part}.weight"
+                for part in packed.get(leaf, [leaf])
+            ]
+            scheme = "W8A8_MXFP8" if name in quantized else "FLOAT"
+            if name in quantized:
+                _validate_loading_shapes(name, module, "weight", "weight_scale")
+                described.add(name)
+            policies.update(dict.fromkeys(names, scheme))
+        elif isinstance(module, FusedMoE) and name in quantized:
+            for weight_name in ("w13_weight", "w2_weight"):
+                _validate_loading_shapes(
+                    name, module, weight_name, weight_name + "_scale", moe=True
+                )
+            # The model's loader mapping supplies canonical expert names and
+            # global expert IDs, including experts not owned by this EP rank.
+            mapping = model.get_expert_mapping()
+            parent, _, leaf = name.rpartition(".")
+            expert_names = [
+                f"{parent + '.' if parent else ''}{source}weight"
+                for target, source, _, _ in mapping
+                if target in {leaf + ".w13_", leaf + ".w2_"}
+            ]
+            if not expert_names:
+                raise ValueError(
+                    f"Cannot map initialized MXFP8 experts {name} to HF names"
+                )
+            policies.update(dict.fromkeys(expert_names, "W8A8_MXFP8"))
+            described.add(name)
+    if described != quantized:
+        raise ValueError(
+            f"Cannot describe MXFP8 modules: {sorted(quantized - described)}"
+        )
+    return {"group_size": 32, "weights": policies}
+
+
 def restore_mxfp8_weights_for_loading(model) -> None:
     for _, module, scheme in iter_mxfp8_modules(model):
         scheme.restore_weights_for_rl_loading(module)
@@ -203,10 +278,25 @@ def process_mxfp8_weights_after_loading(model) -> None:
         module.quant_method.process_weights_after_loading(module)
 
 
-def _quantize_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], model, group_size: int
+def _decode_mxfp8_weights(
+    weights: Iterable[tuple[str, torch.Tensor]], model
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    for name, tensor in weights:
+    weights = dict(weights)
+    consumed_scales = set()
+    for name in weights:
+        if (
+            name.endswith(".weight_scale")
+            and name.removesuffix("_scale") not in weights
+        ):
+            raise ValueError(f"Orphan Ascend MXFP8 scale {name}")
+    # Senders place each FP8 weight before its scale in the same bucket.
+    # Metadata and broadcast calls preserve this order, and the receiver
+    # appends tensors in metadata order, even with asynchronous sends.
+    # dict preserves insertion order, so loading a weight records its scale
+    # in consumed_scales before the loop reaches that scale entry.
+    for name, tensor in weights.items():
+        if name in consumed_scales:
+            continue
         # Every rollout worker receives every actor bucket. Pipeline-parallel
         # workers must discard weights owned by another vLLM stage before module
         # resolution, matching vLLM's native load_weights behavior.
@@ -214,32 +304,27 @@ def _quantize_weights(
             continue
         target_parameters = _get_mxfp8_parameters(model, name)
         if target_parameters is None:
+            if name.endswith(".weight_scale") or tensor.dtype == torch.uint8:
+                raise ValueError(f"Unexpected Ascend MXFP8 payload {name}")
             yield name, tensor
             continue
-        if tensor.dtype != torch.bfloat16:
-            raise RuntimeError(
-                f"Online Ascend MXFP8 expects BF16 actor tensor {name}, "
-                f"got {tensor.dtype}"
+        if tensor.dtype != torch.uint8 or tensor.ndim != 2 or tensor.shape[-1] % 32:
+            raise ValueError(
+                f"Ascend MXFP8 {name}: expected aligned uint8 weight bytes"
             )
-        if tensor.ndim < 2 or tensor.shape[-1] % group_size != 0:
-            raise RuntimeError(
-                f"Online Ascend MXFP8 weight {name} must have a last dimension "
-                f"divisible by {group_size}, got shape {tuple(tensor.shape)}"
-            )
-        fp8_weight, weight_scale = quantize_mxfp8_tensor(tensor, name)
-
         target_weight, target_scale, target_kind = target_parameters
         scale_name = f"{name}_scale"
-        expected_scale_shape = (
-            *tensor.shape[:-1],
-            tensor.shape[-1] // group_size,
-        )
-        if weight_scale.numel() != tensor.numel() // group_size:
-            raise RuntimeError(
-                f"MXFP8 scale {scale_name} has shape {tuple(weight_scale.shape)}, "
-                f"expected {expected_scale_shape}"
+        weight_scale = weights.get(scale_name)
+        if (
+            weight_scale is None
+            or weight_scale.dtype != torch.uint8
+            or tuple(weight_scale.shape) != (tensor.shape[0], tensor.shape[1] // 32)
+        ):
+            raise ValueError(
+                f"Ascend MXFP8 {name}: missing or incompatible uint8 scale"
             )
-        weight_scale = weight_scale.reshape(expected_scale_shape)
+        consumed_scales.add(scale_name)
+        fp8_weight = tensor.view(torch.float8_e4m3fn)
         _validate_target_tensor(name, fp8_weight, target_weight, target_kind)
         _validate_target_tensor(scale_name, weight_scale, target_scale, target_kind)
         yield name, fp8_weight
@@ -253,12 +338,7 @@ def load_mxfp8_weights(
     restore: bool,
 ):
     model = model_runner.model
-    quant_config = model_runner.vllm_config.quant_config
-    quant_description = quant_config.quant_description
-    group_size = quant_description.get("group_size", 32)
     if restore:
         restore_mxfp8_weights_for_loading(model)
 
-    return model.load_weights(
-        _quantize_weights(weights, model, group_size=group_size)
-    )
+    return model.load_weights(_decode_mxfp8_weights(weights, model))

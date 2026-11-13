@@ -107,7 +107,7 @@ def test_raw_metadata_projects_weight_scale_without_quantization(
     )
     raw = _raw_metadata(name, tp, n=6 if dim == 0 else 7, dim=dim)
     monkeypatch.setattr(
-        receiver_module,
+        sys.modules["areal.utils.mxfp8"],
         "quantize_mxfp8_tensor",
         lambda *args: pytest.fail("metadata must not quantize"),
     )
@@ -166,7 +166,7 @@ def test_actor_matrix_contract_checked_before_metadata_and_quantization(
     """Both initial metadata and real update tensors must satisfy the contract."""
     name = "model.layers.0.attention.dense.weight"
     monkeypatch.setattr(
-        receiver_module,
+        sys.modules["areal.utils.mxfp8"],
         "quantize_mxfp8_tensor",
         lambda *args: pytest.fail("must reject before calling the native quantizer"),
     )
@@ -294,7 +294,7 @@ def test_writer_filters_wire_requests_after_original_converter(
 
     monkeypatch.setattr(receiver_module, "_original_convert_parameters", convert)
     monkeypatch.setattr(
-        receiver_module,
+        sys.modules["areal.utils.mxfp8"],
         "quantize_mxfp8_tensor",
         lambda tensor, name: (
             tensor.to(torch.float8_e4m3fn),
@@ -399,7 +399,7 @@ def test_writer_discovers_quantization_before_collecting_training_metadata(
     [
         ("cuda", {"enable_ascend_mxfp8": True}),
         ("npu", {"enable_ascend_mxfp8": False}),
-        ("npu", {"online_quantization": "ascend"}),
+        ("npu", {"ascend_online_quantization": True}),
     ],
 )
 def test_writer_requires_ascend_flag_and_npu(
@@ -700,12 +700,10 @@ def test_shared_module_iterator_drives_restore_and_post_load(mxfp8_module):
 
 
 @pytest.mark.parametrize("k", [48, 64, 96])
-def test_shared_quantizer_preserves_xccl_scale_validation(mxfp8_module, monkeypatch, k):
-    """Common quantization retains XCCL's existing alignment and strict scale checks."""
-    model = torch.nn.Module()
-    model.linear = mxfp8_module.LinearBase()
-    model.linear.weight = _parameter((2, k), torch.float8_e4m3fn)
-    model.linear.weight_scale = _parameter((2, (k + 31) // 32), torch.uint8)
+def test_shared_quantizer_supports_xccl_wire_layout(mxfp8_module, monkeypatch, k):
+    """Sender quantization crops native pair padding into contiguous wire scales."""
+    from areal.utils.mxfp8 import quantize_mxfp8_for_transfer
+
     source = torch.ones((2, k), dtype=torch.bfloat16)
     native_scale = torch.arange(2 * ((k + 63) // 64) * 2, dtype=torch.uint8).reshape(
         2, -1, 2
@@ -718,23 +716,19 @@ def test_shared_quantizer_preserves_xccl_scale_validation(mxfp8_module, monkeypa
 
     monkeypatch.setattr(mxfp8_module.torch_npu, "npu_dynamic_mx_quant", quantize)
     monkeypatch.setitem(sys.modules, "torch_npu", mxfp8_module.torch_npu)
-    weights = [("linear.weight", source)]
     if k == 48:
-        with pytest.raises(RuntimeError, match="divisible by 32"):
-            list(mxfp8_module._quantize_weights(weights, model, group_size=32))
+        with pytest.raises(ValueError, match="divisible by 32"):
+            quantize_mxfp8_for_transfer("linear.weight", source)
         assert not calls
-    elif k == 96:
-        with pytest.raises(RuntimeError, match="MXFP8 scale linear.weight_scale"):
-            list(mxfp8_module._quantize_weights(weights, model, group_size=32))
-        assert calls == [(-1, torch.float8_e4m3fn)]
     else:
-        loaded = dict(mxfp8_module._quantize_weights(weights, model, group_size=32))
+        wire, scale = quantize_mxfp8_for_transfer("linear.weight", source)
         assert calls == [(-1, torch.float8_e4m3fn)]
+        assert scale.is_contiguous()
         torch.testing.assert_close(
-            loaded["linear.weight"].float(), source.float(), rtol=0, atol=0
+            wire.view(torch.float8_e4m3fn).float(), source.float(), rtol=0, atol=0
         )
         torch.testing.assert_close(
-            loaded["linear.weight_scale"], native_scale.reshape(2, 2), rtol=0, atol=0
+            scale, native_scale.reshape(2, -1)[:, : k // 32], rtol=0, atol=0
         )
 
 
@@ -759,7 +753,7 @@ def test_shared_quantizer_rejects_invalid_dtypes(
         ),
     )
     with pytest.raises(RuntimeError, match=error):
-        mxfp8_module.quantize_mxfp8_tensor(
+        sys.modules["areal.utils.mxfp8"].quantize_mxfp8_tensor(
             torch.ones((2, 64), dtype=torch.bfloat16), "local.weight"
         )
 
@@ -1273,7 +1267,9 @@ def test_sender_trims_paired_padding_without_changing_fp8_bits(
     fp8 = tensor.to(torch.float8_e4m3fn)
     scale = torch.tensor([[[1, 2], [3, 99]], [[4, 5], [6, 99]]], dtype=torch.uint8)
     monkeypatch.setattr(
-        receiver_module, "quantize_mxfp8_tensor", lambda *args: (fp8, scale)
+        sys.modules["areal.utils.mxfp8"],
+        "quantize_mxfp8_tensor",
+        lambda *args: (fp8, scale),
     )
     wire, logical = receiver_module._quantize_for_transfer("local.weight", tensor)
     assert wire.data_ptr() == fp8.data_ptr()
@@ -1288,7 +1284,7 @@ def test_sender_trims_paired_padding_without_changing_fp8_bits(
 @pytest.mark.parametrize("k", [48, 80])
 def test_direct_transfer_rejects_partial_groups(receiver_module, k):
     """This path refuses partial groups even if the quantizer can pad them."""
-    with pytest.raises(ValueError, match="32-element K groups"):
+    with pytest.raises(ValueError, match="divisible by 32"):
         receiver_module._quantize_for_transfer(
             "local.weight", torch.empty(7, k, dtype=torch.bfloat16)
         )
@@ -1500,7 +1496,9 @@ def test_native_npu_matmul_tail_layout_compatibility(
     x = torch.randn((16, k), device="npu", dtype=torch.bfloat16)
     weight = torch.randn((32, k), device="npu", dtype=torch.bfloat16)
     qx, sx = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch_npu.float8_e4m3fn)
-    qw, sw = receiver_module.quantize_mxfp8_tensor(weight, "test.weight")
+    qw, sw = sys.modules["areal.utils.mxfp8"].quantize_mxfp8_tensor(
+        weight, "test.weight"
+    )
     sw = sw.reshape(32, -1)[:, : (k + 31) // 32]
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(qw, requires_grad=False)

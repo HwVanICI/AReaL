@@ -1076,7 +1076,7 @@ class RemoteInfEngine(InferenceEngine):
 
     def init_weights_update_group(
         self, meta: WeightUpdateMeta, xccl_group_ranks: list[int] | None = None
-    ) -> Future[None]:
+    ) -> Future[dict | None]:
         """Initialize the weight update process group for distributed weight updates.
 
         Parameters
@@ -1094,8 +1094,8 @@ class RemoteInfEngine(InferenceEngine):
 
         Returns
         -------
-        Future[None]
-            A future object representing the asynchronous initialization operation
+        Future[dict | None]
+            Ascend MXFP8 description, or None for other initialization paths.
         """
         assert meta.type == "xccl"
 
@@ -1649,6 +1649,12 @@ def _init_weights_update_group_remote(
             for _r in results:
                 if isinstance(_r, Exception):
                     raise _r
+            if meta.ascend_online_quantization:
+                from areal.utils.mxfp8 import merge_ascend_mxfp8_descriptions
+
+                return merge_ascend_mxfp8_descriptions(
+                    (result.get("ascend_mxfp8") for result in results), replicas=True
+                )
 
     return uvloop.run(_fn())
 

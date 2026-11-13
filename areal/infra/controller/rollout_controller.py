@@ -567,8 +567,10 @@ class RolloutController:
         def init_weights_group():
             payload = request.get_json() or {}
             meta = deserialize_value(payload.get("meta"))
-            self._callback_loop.run_until_complete(self.init_weights_update_group(meta))
-            return jsonify({"status": "ok"})
+            description = self._callback_loop.run_until_complete(
+                self.init_weights_update_group(meta)
+            )
+            return jsonify({"status": "ok", "ascend_mxfp8": description})
 
         @app.route("/callback/update_weights_xccl", methods=["POST"])
         def update_weights():
@@ -1072,7 +1074,7 @@ class RolloutController:
             req=req,
         )
 
-    async def init_weights_update_group(self, meta: WeightUpdateMeta) -> None:
+    async def init_weights_update_group(self, meta: WeightUpdateMeta) -> dict | None:
         tasks = [
             self.scheduler.async_call_engine(
                 worker_id=worker.id,
@@ -1083,7 +1085,11 @@ class RolloutController:
             )
             for rank, worker in enumerate(self.workers)
         ]
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
+        if meta.ascend_online_quantization:
+            from areal.utils.mxfp8 import merge_ascend_mxfp8_descriptions
+
+            return merge_ascend_mxfp8_descriptions(results, replicas=True)
 
     async def update_weights_from_distributed(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]

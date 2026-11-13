@@ -788,7 +788,7 @@ def _run_awex_integration(
                 ),
             )
             if online_mxfp8:
-                update_meta.online_quantization = "ascend"
+                update_meta.ascend_online_quantization = True
             if device_backend == "npu":
                 update_meta.weights_exchange_ipc_backend = "cpu"
             if comm_backend == "file":

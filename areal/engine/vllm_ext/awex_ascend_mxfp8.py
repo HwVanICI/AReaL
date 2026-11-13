@@ -9,7 +9,7 @@ import math
 import torch
 
 from areal.infra.platforms import current_platform
-from areal.utils.mxfp8 import quantize_mxfp8_tensor
+from areal.utils.mxfp8 import quantize_mxfp8_for_transfer
 
 _original_get_model_param_info = None
 _original_initialize = None
@@ -171,13 +171,7 @@ def _ascend_mxfp8_collect_model_param_raw_info(self, convert_params=False, **kwa
 def _quantize_for_transfer(
     name: str, tensor: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _validate_bf16_matrix(name, tensor.shape, tensor.dtype)
-    n, k = tensor.shape
-    weight, scale = quantize_mxfp8_tensor(tensor.contiguous(), name)
-    if weight.shape != tensor.shape or tuple(scale.shape) != (n, (k + 63) // 64, 2):
-        raise RuntimeError(f"AWEX MXFP8 {name}: quantizer returned incompatible shapes")
-    # view reinterprets FP8 bits. It is never a numeric conversion to integers.
-    return weight.view(torch.uint8), scale.reshape(n, -1)[:, : k // 32]
+    return quantize_mxfp8_for_transfer(name, tensor)
 
 
 @torch.no_grad()

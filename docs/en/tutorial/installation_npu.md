@@ -202,6 +202,17 @@ quantization description may keep non-MoE weights such as normalization weights 
 `FLOAT` FusedMoE weights is not supported because their reload layout lifecycle is not
 handled by this path.
 
+With `actor.weight_update_mode: xccl`, Megatron and FSDP obtain the quantization
+description from the initialized vLLM model once during XCCL initialization; AReaL does
+not independently read the quantization JSON. The actor gathers full HF matrices and
+quantizes the selected weights before broadcasting FP8 byte views and uint8 scales.
+FLOAT weights retain their dtype. The existing bucket pipeline is preserved; the actor
+holds quantized bucket outputs rather than a complete FP8 model copy. Each receiver uses
+vLLM's native loader to shard weight/scale pairs, then finalizes the local model after
+all buckets and training PP stages complete. Inference K shards and offsets must align
+to 32 elements; MoE local K must also be divisible by 64 for the current scale layout. N
+shards do not require alignment to 32.
+
 With `actor.weight_update_mode: awex`, the current online MXFP8 path requires a Megatron
 actor. The original AWEX converter produces logical matrices from the actor's BF16
 parameters, then the training side quantizes them into FP8 weights and uint8 E8M0
