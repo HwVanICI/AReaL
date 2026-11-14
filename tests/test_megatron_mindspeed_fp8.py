@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -8,7 +10,11 @@ import torch
 try:
     from areal.api.cli_args import FP8EngineConfig, MindSpeedEngineConfig
     from areal.api.io_struct import WeightUpdateMeta
-    from areal.engine import megatron_engine
+
+    # MindSpeed parses sys.argv during import and injects unknown arguments into
+    # TransformerConfig. Pytest flags such as -o become invalid field names.
+    with patch.object(sys, "argv", sys.argv[:1]):
+        from areal.engine import megatron_engine
 except ImportError as exc:
     pytest.skip(
         f"MindSpeed test dependencies are unavailable: {exc}",
