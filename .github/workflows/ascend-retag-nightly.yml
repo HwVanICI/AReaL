@@ -1,0 +1,101 @@
+name: Retag Ascend Nightly Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      accelerator:
+        description: Nightly image to retag
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - a2
+          - a3
+          - a5
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  retag:
+    if: github.repository == 'HwVanICI/AReaL'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: ascend-retag-nightly
+      cancel-in-progress: false
+    steps:
+      - name: Require admin for manual publishing
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              ...context.repo,
+              username: context.actor,
+            });
+            if (data.permission !== 'admin') {
+              core.setFailed('Repository admin permission is required to publish image tags.');
+            }
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Log in to Huawei SWR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ vars.SWR_REGISTRY }}
+          username: ${{ secrets.SWR_USERNAME }}
+          password: ${{ secrets.SWR_PASSWORD }}
+
+      - name: Publish and verify timestamped tags
+        shell: bash
+        env:
+          ACCELERATOR: ${{ inputs.accelerator }}
+          GHCR_IMAGE: ghcr.io/hwvanici/areal_npu
+          SWR_IMAGE: ${{ vars.SWR_IMAGE }}
+        run: |
+          set -euo pipefail
+
+          digest_of() {
+            skopeo inspect --raw "docker://$1" | sha256sum | awk '{print "sha256:" $1}'
+          }
+
+          accelerators=("$ACCELERATOR")
+          if [[ "$ACCELERATOR" == all ]]; then
+            accelerators=(a2 a3 a5)
+          fi
+
+          declare -A digests
+          for accelerator in "${accelerators[@]}"; do
+            nightly="${accelerator}-nightly"
+            digest=$(digest_of "${GHCR_IMAGE}:${nightly}")
+            swr_digest=$(digest_of "${SWR_IMAGE}:${nightly}")
+            if [[ "$digest" != "$swr_digest" ]]; then
+              echo "::error::${nightly} differs between GHCR (${digest}) and SWR (${swr_digest})."
+              exit 1
+            fi
+            digests[$accelerator]=$digest
+          done
+
+          timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+          for accelerator in "${accelerators[@]}"; do
+            digest=${digests[$accelerator]}
+            tag="${accelerator}-${timestamp}"
+            for image in "$SWR_IMAGE" "$GHCR_IMAGE"; do
+              target="${image}:${tag}"
+              skopeo copy --all --preserve-digests --retry-times 3 \
+                "docker://${image}@${digest}" "docker://${target}"
+              published=$(digest_of "$target")
+              if [[ "$published" != "$digest" ]]; then
+                echo "::error::${target} resolved to ${published}, expected ${digest}."
+                exit 1
+              fi
+              printf -- '- `%s` → `%s`\n' "$target" "$digest" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
