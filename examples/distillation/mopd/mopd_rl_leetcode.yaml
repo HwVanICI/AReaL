@@ -208,15 +208,15 @@ train_dataset:
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: /path/to/leetcode
+  path: examples/distillation/mopd/leetcode
   type: rl
 
 
 valid_dataset:
-  batch_size: 64
+  batch_size: 101 # size of validation set
   pin_memory: true
   num_workers: 4
-  path: /path/to/leetcode
+  path: examples/distillation/mopd/leetcode
   type: rl
 
 # Utilities
@@ -241,7 +241,7 @@ evaluator:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: 10
+  freq_epochs: null
   freq_steps: null
   freq_secs: null
 
