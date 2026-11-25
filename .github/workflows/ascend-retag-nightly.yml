@@ -3,16 +3,18 @@ name: Retag Ascend Nightly Image
 on:
   workflow_dispatch:
     inputs:
-      accelerator:
-        description: Nightly image to retag
-        type: choice
-        required: true
-        default: all
-        options:
-          - all
-          - a2
-          - a3
-          - a5
+      a2:
+        description: Retag A2
+        type: boolean
+        default: true
+      a3:
+        description: Retag A3
+        type: boolean
+        default: true
+      a5:
+        description: Retag A5
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -56,7 +58,9 @@ jobs:
       - name: Publish and verify timestamped tags
         shell: bash
         env:
-          ACCELERATOR: ${{ inputs.accelerator }}
+          SELECT_A2: ${{ inputs.a2 }}
+          SELECT_A3: ${{ inputs.a3 }}
+          SELECT_A5: ${{ inputs.a5 }}
           GHCR_IMAGE: ghcr.io/hwvanici/areal_npu
           SWR_IMAGE: ${{ vars.SWR_IMAGE }}
         run: |
@@ -66,9 +70,13 @@ jobs:
             skopeo inspect --raw "docker://$1" | sha256sum | awk '{print "sha256:" $1}'
           }
 
-          accelerators=("$ACCELERATOR")
-          if [[ "$ACCELERATOR" == all ]]; then
-            accelerators=(a2 a3 a5)
+          accelerators=()
+          [[ "$SELECT_A2" == true ]] && accelerators+=(a2)
+          [[ "$SELECT_A3" == true ]] && accelerators+=(a3)
+          [[ "$SELECT_A5" == true ]] && accelerators+=(a5)
+          if (( ${#accelerators[@]} == 0 )); then
+            echo "::error::Select at least one accelerator."
+            exit 1
           fi
 
           declare -A digests
